@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 # Instala dependencias del sistema (por ejemplo, para FFmpeg y PyAV)
 RUN apt-get update && apt-get install -y \
@@ -20,6 +20,9 @@ WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# Instala torch CPU-only primero (evita descargar la versión CUDA pesada)
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
 # Copia el archivo de requerimientos e instala las dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -31,4 +34,4 @@ COPY . .
 EXPOSE 8080
 
 # Comando para iniciar la aplicación
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
