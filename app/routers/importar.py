@@ -438,14 +438,7 @@ async def importar_empresas(
             break
 
     if excl_sheet:
-        await db.execute(
-            text("""
-            CREATE TABLE IF NOT EXISTS "semanaExcluida" (
-                id SERIAL PRIMARY KEY, trimestre TEXT NOT NULL,
-                semana INT NOT NULL, motivo TEXT, UNIQUE(trimestre, semana)
-            )
-        """)
-        )
+        # Table "semanaExcluida" is now managed by Prisma migrations
         for row in excl_sheet.iter_rows(
             min_row=2, max_row=excl_sheet.max_row, values_only=True
         ):

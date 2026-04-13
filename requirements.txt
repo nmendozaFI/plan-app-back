@@ -2,17 +2,12 @@
 fastapi
 uvicorn[standard]
 python-multipart
-
 asyncpg
 SQLAlchemy
-psycopg2-binary
- 
-# Claude
 anthropic
- 
-# Utilidades
 python-dotenv
 rich
 pandas
 openpyxl
 ortools
+pydantic
