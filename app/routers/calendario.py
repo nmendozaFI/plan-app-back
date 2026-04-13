@@ -92,6 +92,7 @@ async def generar_calendario(
             SELECT f."empresaId", e.nombre,
                    f."talleresEF", f."talleresIT", f."totalAsignado",
                    f."semaforoCalculado", f."scoreCalculado",
+                   f."esNueva",
                    e."esComodin", e."turnoPreferido"
             FROM frecuencia f
             JOIN empresa e ON e.id = f."empresaId"
@@ -745,6 +746,33 @@ def _ejecutar_solver(
         for s in SEMANAS:
             model.add(
                 sum(assign[(e, s, t_id)] for t_id in taller_ids) <= max_per_week
+            )
+    
+    # H7. Empresas nuevas: no programar en el primer mes (semanas 1-4)
+    # Permite onboarding, firma de convenio y preparación de voluntarios
+    empresas_nuevas = [e for e in empresa_ids if empresas[e].get("esNueva", False)]
+    if empresas_nuevas:
+        semanas_bloqueadas = [s for s in SEMANAS if s <= 4]
+        for e in empresas_nuevas:
+            for s in semanas_bloqueadas:
+                for t_id in taller_ids:
+                    model.add(assign[(e, s, t_id)] == 0)
+        
+        # Verificar que hay suficientes slots en semanas 5-13
+        semanas_disponibles_nuevas = [s for s in SEMANAS if s > 4]
+        slots_disponibles = len(semanas_disponibles_nuevas) * len(taller_ids)
+        talleres_nuevas = sum(empresas[e]["totalAsignado"] for e in empresas_nuevas)
+        
+        nombres_nuevas = [empresas[e]["nombre"] for e in empresas_nuevas]
+        warnings.append(
+            f"Empresas nuevas ({len(empresas_nuevas)}): {', '.join(nombres_nuevas)} "
+            f"→ programadas a partir de semana 5"
+        )
+        
+        if talleres_nuevas > slots_disponibles:
+            warnings.append(
+                f"⚠ Las empresas nuevas necesitan {talleres_nuevas} slots pero solo hay "
+                f"{slots_disponibles} disponibles en semanas 5-13. Riesgo de INFEASIBLE."
             )
 
     # ─── SOFT CONSTRAINTS ────────────────────────────────────
