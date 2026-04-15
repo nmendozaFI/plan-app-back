@@ -149,6 +149,8 @@ async def calcular_frecuencias(
                    ct."tipoParticipacion",
                    ct."escuelaPropia",
                    ct."frecuenciaSolicitada",
+                   ct."frecuenciaEF",
+                   ct."frecuenciaIT",
                    e.nombre,
                    e.tipo,
                    e.semaforo,
@@ -264,19 +266,47 @@ async def calcular_frecuencias(
                     f"{cfg['nombre']}: desviación {desv} en Q anterior → reducción -0.5"
                 )
 
-        # Frecuencia base
-        if cfg["frecuenciaSolicitada"] is not None:
+        # Frecuencia base — check for explicit EF/IT split first
+        explicit_ef = cfg.get("frecuenciaEF")
+        explicit_it = cfg.get("frecuenciaIT")
+
+        if explicit_ef is not None or explicit_it is not None:
+            # NEW format: use explicit EF/IT values from master import
+            ef = (explicit_ef or 0)
+            it = (explicit_it or 0)
+            freq_total = ef + it
+            # Apply performance adjustment proportionally
+            if ajuste != 0 and freq_total > 0:
+                adj_ef = int(ef * ajuste / freq_total) if ef > 0 else 0
+                adj_it = int(it * ajuste / freq_total) if it > 0 else 0
+                ef = max(0, ef + adj_ef)
+                it = max(0, it + adj_it)
+                freq_total = ef + it
+            freq_total = max(1, freq_total)
+            # Ensure at least 1 total if both would be 0
+            if ef == 0 and it == 0:
+                if cfg["tipoParticipacion"] == "EF":
+                    ef = 1
+                elif cfg["tipoParticipacion"] == "IT":
+                    it = 1
+                else:
+                    ef = 1
+                freq_total = ef + it
+        elif cfg["frecuenciaSolicitada"] is not None:
+            # OLD format: total only, split proportionally
             freq_total = cfg["frecuenciaSolicitada"]
+            freq_total = max(1, int(freq_total + ajuste))
+            ef, it = _repartir_ef_it(freq_total, cfg["tipoParticipacion"])
         else:
+            # No explicit frequency: calculate from score/semaforo
             freq_total = _calcular_frecuencia_base(
                 tipo=cfg["tipoParticipacion"],
                 semaforo=semaforo,
                 score=score,
                 escuela_propia=cfg["escuelaPropia"],
             )
-
-        freq_total = max(1, int(freq_total + ajuste))
-        ef, it = _repartir_ef_it(freq_total, cfg["tipoParticipacion"])
+            freq_total = max(1, int(freq_total + ajuste))
+            ef, it = _repartir_ef_it(freq_total, cfg["tipoParticipacion"])
 
         # ── Fix: solo_taller fuerza programa ──────────────────
         # Si la empresa tiene restricción solo_taller y ese taller

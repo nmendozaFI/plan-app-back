@@ -31,6 +31,8 @@ class ImportEmpresasResult(BaseModel):
     ciudades_creadas: list[str]
     empresa_ciudad_links: int
     config_trimestral_creadas: int
+    configs_actualizadas: int  # NEW: how many configs were updated vs created
+    trimestre_target: str      # NEW: which trimestre was targeted
     festivos_importados: int
     warnings: list[str]
 
@@ -96,11 +98,20 @@ HEADER_MAP = {
     "turno": "turnoPreferido",
     "activa": "activa",
     "notas": "notas",
-    # Frecuencia solicitada (anula el cálculo automático)
+    # Frecuencia solicitada — OLD format (single column = total)
     "frecuenciasolicitada": "frecuenciaSolicitada",
     "frecuencia": "frecuenciaSolicitada",
     "freq": "frecuenciaSolicitada",
     "talleres": "frecuenciaSolicitada",
+    # Frecuencia EF/IT — NEW format (split columns)
+    "frecuenciaef": "frecuenciaEF",
+    "freq_ef": "frecuenciaEF",
+    "tallersef": "frecuenciaEF",
+    "ef": "frecuenciaEF",
+    "frecuenciait": "frecuenciaIT",
+    "freq_it": "frecuenciaIT",
+    "talleresit": "frecuenciaIT",
+    "it": "frecuenciaIT",
 }
 
 # Normalización empresas Q1
@@ -274,6 +285,42 @@ async def importar_empresas(
                 return default
             return row[idx]
 
+        # ── Detect format: NEW (EF/IT split) vs OLD (single frecuenciaSolicitada) ──
+        # New format: has frecuenciaEF and/or frecuenciaIT columns
+        # Old format: has frecuenciaSolicitada column only
+        has_ef_col = "frecuenciaEF" in col_map
+        has_it_col = "frecuenciaIT" in col_map
+        has_old_col = "frecuenciaSolicitada" in col_map
+
+        freq_ef_raw = _get("frecuenciaEF") if has_ef_col else None
+        freq_it_raw = _get("frecuenciaIT") if has_it_col else None
+        freq_old_raw = _get("frecuenciaSolicitada") if has_old_col else None
+
+        # Parse frequencies
+        freq_ef = _int(freq_ef_raw) if freq_ef_raw not in (None, "", 0) else None
+        freq_it = _int(freq_it_raw) if freq_it_raw not in (None, "", 0) else None
+        freq_total = None
+
+        if has_ef_col or has_it_col:
+            # NEW format: use EF/IT values
+            ef_val = freq_ef or 0
+            it_val = freq_it or 0
+            freq_total = ef_val + it_val if (ef_val > 0 or it_val > 0) else None
+        elif freq_old_raw not in (None, "", 0):
+            # OLD format: use frecuenciaSolicitada as total
+            freq_total = _int(freq_old_raw)
+            # Split proportionally based on tipo
+            tipo_val = _programa(_get("tipo"))
+            if tipo_val == "EF":
+                freq_ef = freq_total
+                freq_it = 0
+            elif tipo_val == "IT":
+                freq_ef = 0
+                freq_it = freq_total
+            else:  # AMBAS — split evenly
+                freq_ef = freq_total // 2
+                freq_it = freq_total - freq_ef
+
         empresas_data.append(
             {
                 "nombre": nombre,
@@ -290,8 +337,10 @@ async def importar_empresas(
                 "activa": _bool(_get("activa", "SI")),
                 "notas": _str(_get("notas")),
                 "ciudades": ciudades,
-                # None = el motor calcula; número = fuerza esa frecuencia
-                "frecuenciaSolicitada": _int(_get("frecuenciaSolicitada")) if _get("frecuenciaSolicitada") not in (None, "", 0) else None,
+                # Frequency fields
+                "frecuenciaSolicitada": freq_total,
+                "frecuenciaEF": freq_ef,
+                "frecuenciaIT": freq_it,
             }
         )
 
@@ -400,34 +449,86 @@ async def importar_empresas(
                 ec_count += 1
 
     # ── 4. Upsert configTrimestral ───────────────────────────
-    cfg_count = 0
+    cfg_created = 0
+    cfg_updated = 0
     for emp in empresas_data:
         if not emp["activa"]:
             continue
         eid = eid_map[emp["nombre"].upper()]
-        await db.execute(
+
+        # Determine tipoParticipacion from EF/IT frequencies
+        freq_ef = emp.get("frecuenciaEF") or 0
+        freq_it = emp.get("frecuenciaIT") or 0
+        if freq_ef > 0 and freq_it > 0:
+            tipo_calc = "AMBAS"
+        elif freq_ef > 0:
+            tipo_calc = "EF"
+        elif freq_it > 0:
+            tipo_calc = "IT"
+        else:
+            tipo_calc = emp["tipo"]  # Fallback to empresa.tipo
+
+        # Check if config exists
+        existing = await db.execute(
             text("""
-                INSERT INTO "configTrimestral" (
-                    "empresaId", trimestre, "tipoParticipacion",
-                    "escuelaPropia", "disponibilidadDias", "turnoPreferido",
-                    "frecuenciaSolicitada", "updatedAt"
-                ) VALUES (:eid, :tri, :tipo, false, 'L,M,X,J,V', :turno, :freq, NOW())
-                ON CONFLICT ("empresaId", trimestre)
-                DO UPDATE SET
-                    "tipoParticipacion" = EXCLUDED."tipoParticipacion",
-                    "turnoPreferido" = EXCLUDED."turnoPreferido",
-                    "frecuenciaSolicitada" = EXCLUDED."frecuenciaSolicitada",
-                    "updatedAt" = NOW()
+                SELECT id FROM "configTrimestral"
+                WHERE trimestre = :tri AND "empresaId" = :eid
             """),
-            {
-                "eid": eid,
-                "tri": trimestre,
-                "tipo": emp["tipo"],
-                "turno": emp["turnoPreferido"],
-                "freq": emp.get("frecuenciaSolicitada"),
-            },
+            {"tri": trimestre, "eid": eid},
         )
-        cfg_count += 1
+
+        if existing.first():
+            # Update existing config (preserve other fields, update freq/tipo/notas)
+            await db.execute(
+                text("""
+                    UPDATE "configTrimestral"
+                    SET "tipoParticipacion" = :tipo,
+                        "turnoPreferido" = :turno,
+                        "frecuenciaSolicitada" = :freq,
+                        "frecuenciaEF" = :freq_ef,
+                        "frecuenciaIT" = :freq_it,
+                        "notas" = COALESCE(:notas, "notas"),
+                        "updatedAt" = NOW()
+                    WHERE trimestre = :tri AND "empresaId" = :eid
+                """),
+                {
+                    "eid": eid,
+                    "tri": trimestre,
+                    "tipo": tipo_calc,
+                    "turno": emp["turnoPreferido"],
+                    "freq": emp.get("frecuenciaSolicitada"),
+                    "freq_ef": emp.get("frecuenciaEF"),
+                    "freq_it": emp.get("frecuenciaIT"),
+                    "notas": emp.get("notas"),
+                },
+            )
+            cfg_updated += 1
+        else:
+            # Create new config
+            await db.execute(
+                text("""
+                    INSERT INTO "configTrimestral" (
+                        "empresaId", trimestre, "tipoParticipacion",
+                        "escuelaPropia", "disponibilidadDias", "turnoPreferido",
+                        "frecuenciaSolicitada", "frecuenciaEF", "frecuenciaIT",
+                        "voluntariosDisponibles", "notas", "createdAt", "updatedAt"
+                    ) VALUES (
+                        :eid, :tri, :tipo, false, 'L,M,X,J,V', :turno,
+                        :freq, :freq_ef, :freq_it, 0, :notas, NOW(), NOW()
+                    )
+                """),
+                {
+                    "eid": eid,
+                    "tri": trimestre,
+                    "tipo": tipo_calc,
+                    "turno": emp["turnoPreferido"],
+                    "freq": emp.get("frecuenciaSolicitada"),
+                    "freq_ef": emp.get("frecuenciaEF"),
+                    "freq_it": emp.get("frecuenciaIT"),
+                    "notas": emp.get("notas"),
+                },
+            )
+            cfg_created += 1
 
     # ── 5. Festivos (dates-based) ──────────────────────────────
     from datetime import datetime, date, timedelta
@@ -582,7 +683,9 @@ async def importar_empresas(
         actualizadas=actualizadas,
         ciudades_creadas=ciudades_creadas,
         empresa_ciudad_links=ec_count,
-        config_trimestral_creadas=cfg_count,
+        config_trimestral_creadas=cfg_created,
+        configs_actualizadas=cfg_updated,
+        trimestre_target=trimestre,
         festivos_importados=festivo_count,
         warnings=warnings,
     )
