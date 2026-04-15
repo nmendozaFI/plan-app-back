@@ -8,7 +8,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import frecuencias, calendario, empresas, historico, health, importar, restricciones, talleres
+from app.routers import frecuencias, calendario, empresas, historico, health, importar, restricciones, talleres, config_trimestral, settings
 # ── App ──────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -23,7 +23,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["POST", "GET", "PUT", "DELETE"],
+    allow_methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -37,3 +37,5 @@ app.include_router(calendario.router,   prefix="/api/calendario",   tags=["Fase 
 app.include_router(importar.router, prefix="/api/importar", tags=["importar"])
 app.include_router(restricciones.router, prefix="/api/restricciones", tags=["restricciones"])
 app.include_router(talleres.router,      prefix="/api/talleres",      tags=["Talleres"])
+app.include_router(config_trimestral.router, prefix="/api/config-trimestral", tags=["Config Trimestral"])
+app.include_router(settings.router, prefix="/api/settings", tags=["Settings"])

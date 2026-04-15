@@ -16,7 +16,7 @@ Tablas Prisma (camelCase):
     "empresaCiudad", "solverLog"
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from pydantic import BaseModel
@@ -47,18 +47,22 @@ class SugerenciaContingencia(BaseModel):
 
 
 class SlotCalendario(BaseModel):
+    id: int | None = None
     semana: int
     dia: str
     horario: str
     turno: str
-    empresa_id: int
-    empresa_nombre: str
+    empresa_id: int | None  # nullable for vacancies
+    empresa_nombre: str | None  # nullable for vacancies
     programa: str
     taller_id: int
     taller_nombre: str
     ciudad_id: int | None
     ciudad: str | None
     tipo_asignacion: str
+    estado: str = "PLANIFICADO"  # PLANIFICADO | CONFIRMADO | OK | CANCELADO | VACANTE
+    confirmado: bool = False
+    notas: str | None = None
     sugerencias: list[SugerenciaContingencia] | None = None
 
 
@@ -73,6 +77,56 @@ class CalendarioOutput(BaseModel):
     inviolables_pct: float
     preferentes_pct: float
     warnings: list[str]
+
+
+class SlotUpdateInput(BaseModel):
+    """Input for updating a single slot."""
+    estado: str | None = None  # PLANIFICADO | CONFIRMADO | OK | CANCELADO | VACANTE
+    confirmado: bool | None = None
+    empresa_id: int | None = None  # Can be null to clear (make vacancy)
+    notas: str | None = None
+
+
+class SlotBatchUpdateItem(BaseModel):
+    """Single item in a batch update."""
+    slot_id: int
+    estado: str | None = None
+    confirmado: bool | None = None
+    empresa_id: int | None = None
+    notas: str | None = None
+
+
+class SlotBatchUpdateInput(BaseModel):
+    """Input for batch updating multiple slots."""
+    updates: list[SlotBatchUpdateItem]
+
+
+# ── Helpers ─────────────────────────────────────────────────
+
+def calcular_fecha_slot(trimestre: str, semana: int, dia: str) -> str:
+    """Returns formatted date string like '13 Abr 2026' for a slot."""
+    from datetime import date, timedelta
+
+    MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun",
+             "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+
+    year = int(trimestre[:4])
+    quarter = int(trimestre[-1])
+    month_start = {1: 1, 2: 4, 3: 7, 4: 10}[quarter]
+    first_day = date(year, month_start, 1)
+
+    # Find first Monday
+    days_until_monday = (7 - first_day.weekday()) % 7
+    if first_day.weekday() == 0:
+        first_monday = first_day
+    else:
+        first_monday = first_day + timedelta(days=days_until_monday)
+
+    week_start = first_monday + timedelta(weeks=semana - 1)
+    dia_offset = {"L": 0, "M": 1, "X": 2, "J": 3, "V": 4}
+    fecha = week_start + timedelta(days=dia_offset.get(dia, 0))
+
+    return f"{fecha.day} {MESES[fecha.month - 1]} {fecha.year}"
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -163,34 +217,50 @@ async def generar_calendario(
         dias_str = r["disponibilidadDias"] or "L,M,X,J,V"
         disponibilidad_map[r["empresaId"]] = [d.strip() for d in dias_str.split(",")]
 
-    # ── 6. Semanas excluidas → convertir absolutas a relativas (1-13) ──
-    semanas_excluidas: set[int] = set()
+    # ── 6. Festivos → días excluidos por semana ──────────────────
+    # Returns set of (semana_relativa, dia) tuples to exclude specific slots
+    dias_excluidos: set[tuple[int, str]] = set()
+    semanas_excluidas: set[int] = set()  # Keep for backward compat (weeks where ALL 5 days are excluded)
     try:
-        excl_result = await db.execute(
+        fest_result = await db.execute(
             text('''
-                SELECT semana, trimestre FROM "semanaExcluida"
+                SELECT semana, dia, motivo FROM festivo
                 WHERE trimestre = :trimestre
+                ORDER BY semana, dia
             '''),
             {"trimestre": trimestre},
         )
-        # Mapa: primer semana absoluta del trimestre según convención YYYY-Qn
-        # Q1=1, Q2=14, Q3=27, Q4=40  (13 semanas por trimestre)
-        Q_OFFSET = {"Q1": 1, "Q2": 14, "Q3": 27, "Q4": 40}
-        q_part = trimestre.split("-")[1] if "-" in trimestre else "Q1"
-        offset = Q_OFFSET.get(q_part, 1)
+        festivos_rows = [dict(r) for r in fest_result.mappings().all()]
 
-        for row in excl_result.mappings().all():
-            sem_abs = row["semana"]
-            sem_rel = sem_abs - offset + 1  # convertir a relativa 1-13
-            if 1 <= sem_rel <= 13:
-                semanas_excluidas.add(sem_rel)
+        for row in festivos_rows:
+            sem = row["semana"]
+            dia = row["dia"]
+            if 1 <= sem <= 13 and dia in ("L", "M", "X", "J", "V"):
+                dias_excluidos.add((sem, dia))
 
-        if semanas_excluidas:
-            warnings.append(
-                f"Semanas excluidas (relativas): {sorted(semanas_excluidas)}"
-            )
+        # Check if any week has ALL 5 days excluded (full week closure like summer)
+        from collections import Counter
+        dias_por_semana = Counter(sem for sem, _ in dias_excluidos)
+        for sem, count in dias_por_semana.items():
+            if count >= 5:
+                semanas_excluidas.add(sem)
+
+        if dias_excluidos:
+            # Format for warning: group by week
+            by_week: dict[int, list[str]] = {}
+            for sem, dia in sorted(dias_excluidos):
+                by_week.setdefault(sem, []).append(dia)
+            parts = []
+            for sem in sorted(by_week):
+                dias = by_week[sem]
+                if len(dias) >= 5:
+                    parts.append(f"S{sem} (completa)")
+                else:
+                    parts.append(f"S{sem}:{','.join(dias)}")
+            warnings.append(f"Días excluidos: {', '.join(parts)}")
+
     except Exception:
-        pass  # tabla puede no existir en entornos sin migración
+        pass  # table may not exist yet
 
     # ── 7. Ejecutar solver ───────────────────────────────────
     resultado = _ejecutar_solver(
@@ -199,6 +269,7 @@ async def generar_calendario(
         talleres=talleres,
         disponibilidad_map=disponibilidad_map,
         semanas_excluidas=semanas_excluidas,
+        dias_excluidos=dias_excluidos,
         params=params,
     )
 
@@ -229,19 +300,20 @@ async def generar_calendario(
     )
 
     for slot in slots_completos:
-        # No persistir slots vacantes (empresa_id=0) — solo existen en la respuesta JSON
-        if slot["empresa_id"] == 0:
-            continue
+        # Vacancies: empresa_id=0 -> store as NULL with estado='VACANTE'
+        is_vacancy = slot["empresa_id"] == 0
+        empresa_id = None if is_vacancy else slot["empresa_id"] 
+        estado = "VACANTE" if is_vacancy else "PLANIFICADO"
         tipo_bd = "CONTINGENCIA" if slot["tipo_asignacion"] == "HUECO" else slot["tipo_asignacion"]
         es_contingencia = slot["tipo_asignacion"] == "HUECO"
         await db.execute(
             text("""
                 INSERT INTO planificacion
                     (trimestre, semana, dia, horario, turno, "empresaId", "tallerId",
-                     "ciudadId", "tipoAsignacion", "esContingencia", "updatedAt")
+                     "ciudadId", "tipoAsignacion", "esContingencia", estado, confirmado, "updatedAt")
                 VALUES (
                     :tri, :sem, :dia, :horario, :turno, :eid, :tid,
-                    :cid, :tipo, :contingencia, NOW()
+                    :cid, :tipo, :contingencia, :estado, false, NOW()
                 )
             """),
             {
@@ -250,11 +322,12 @@ async def generar_calendario(
                 "dia": slot["dia"],
                 "horario": slot["horario"],
                 "turno": slot["turno"],
-                "eid": slot["empresa_id"],
+                "eid": empresa_id,
                 "tid": slot["taller_id"],
                 "cid": slot.get("ciudad_id"),
                 "tipo": tipo_bd,
                 "contingencia": es_contingencia,
+                "estado": estado,
             },
         )
 
@@ -269,10 +342,11 @@ async def obtener_calendario(
     trimestre: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Lee el calendario generado de un trimestre."""
+    """Lee el calendario generado de un trimestre (incluye vacantes)."""
     result = await db.execute(
         text("""
-            SELECT p.semana, p.dia, p.horario,
+            SELECT p.id,
+                   p.semana, p.dia, p.horario,
                    COALESCE(p.turno, t.turno) AS turno,
                    p."empresaId" AS empresa_id,
                    e.nombre AS empresa_nombre,
@@ -281,10 +355,13 @@ async def obtener_calendario(
                    t.nombre AS taller_nombre,
                    p."ciudadId" AS ciudad_id,
                    c.nombre AS ciudad,
-                   p."tipoAsignacion" AS tipo_asignacion
+                   p."tipoAsignacion" AS tipo_asignacion,
+                   p.estado,
+                   p.confirmado,
+                   p.notas
             FROM planificacion p
-            JOIN empresa e ON e.id = p."empresaId"
             JOIN taller t ON t.id = p."tallerId"
+            LEFT JOIN empresa e ON e.id = p."empresaId"
             LEFT JOIN ciudad c ON c.id = p."ciudadId"
             WHERE p.trimestre = :trimestre
             ORDER BY p.semana,
@@ -294,9 +371,22 @@ async def obtener_calendario(
         {"trimestre": trimestre},
     )
     rows = [dict(r) for r in result.mappings().all()]
+
+    # Compute summary stats
+    asignados = sum(1 for r in rows if r["estado"] != "VACANTE")
+    vacantes = sum(1 for r in rows if r["estado"] == "VACANTE")
+    confirmados = sum(1 for r in rows if r["confirmado"])
+    ok_count = sum(1 for r in rows if r["estado"] == "OK")
+    cancelados = sum(1 for r in rows if r["estado"] == "CANCELADO")
+
     return {
         "trimestre": trimestre,
         "total_slots": len(rows),
+        "asignados": asignados,
+        "vacantes": vacantes,
+        "confirmados": confirmados,
+        "ok": ok_count,
+        "cancelados": cancelados,
         "slots": rows,
     }
 
@@ -308,27 +398,29 @@ async def exportar_excel(
 ):
     """
     Genera Excel del calendario con TODOS los slots (asignados + vacantes).
-    Incluye columnas Estado/Confirmado para que el planificador pueda
-    ir completando manualmente y luego importar como histórico.
+    Lee estado, confirmado y notas directamente de la tabla planificacion.
     """
     from fastapi.responses import StreamingResponse
     from io import BytesIO
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-    # ── 1. Cargar asignaciones existentes ─────────────────────
+    # ── 1. Cargar TODOS los slots de planificacion ────────────
     result = await db.execute(
         text("""
-            SELECT p.semana, p.dia, p.horario,
+            SELECT p.id, p.semana, p.dia, p.horario,
                    COALESCE(p.turno, t.turno) AS turno,
                    e.nombre AS empresa,
                    t.nombre AS taller,
                    t.programa,
                    c.nombre AS ciudad,
-                   p."tipoAsignacion" AS tipo
+                   p."tipoAsignacion" AS tipo,
+                   p.estado,
+                   p.confirmado,
+                   p.notas
             FROM planificacion p
-            JOIN empresa e ON e.id = p."empresaId"
             JOIN taller t ON t.id = p."tallerId"
+            LEFT JOIN empresa e ON e.id = p."empresaId"
             LEFT JOIN ciudad c ON c.id = p."ciudadId"
             WHERE p.trimestre = :trimestre
             ORDER BY p.semana,
@@ -337,100 +429,49 @@ async def exportar_excel(
         """),
         {"trimestre": trimestre},
     )
-    assigned_rows = [dict(r) for r in result.mappings().all()]
+    db_rows = [dict(r) for r in result.mappings().all()]
 
-    # ── 2. Cargar catálogo de talleres para generar vacantes ──
-    talleres_result = await db.execute(
-        text("""
-            SELECT id, nombre, programa, "diaSemana", horario, turno
-            FROM taller WHERE activo = true
-            ORDER BY CASE "diaSemana" WHEN 'L' THEN 1 WHEN 'M' THEN 2 WHEN 'X' THEN 3 WHEN 'J' THEN 4 WHEN 'V' THEN 5 END,
-                     horario
-        """)
-    )
-    talleres = [dict(r) for r in talleres_result.mappings().all()]
+    if not db_rows:
+        raise HTTPException(status_code=404, detail=f"No hay slots para el trimestre {trimestre}")
 
-    # ── 3. Semanas excluidas ──────────────────────────────────
-    semanas_excluidas: set[int] = set()
-    try:
-        excl_result = await db.execute(
-            text('SELECT semana FROM "semanaExcluida" WHERE trimestre = :tri'),
-            {"tri": trimestre},
-        )
-        Q_OFFSET = {"Q1": 1, "Q2": 14, "Q3": 27, "Q4": 40}
-        q_part = trimestre.split("-")[1] if "-" in trimestre else "Q1"
-        offset = Q_OFFSET.get(q_part, 1)
-        for row in excl_result.mappings().all():
-            sem_rel = row["semana"] - offset + 1
-            if 1 <= sem_rel <= 13:
-                semanas_excluidas.add(sem_rel)
-    except Exception:
-        pass
-
-    SEMANAS = [s for s in range(1, 14) if s not in semanas_excluidas]
-
-    # ── 4. Índice de slots asignados ──────────────────────────
-    assigned_index: set[tuple] = set()
-    for r in assigned_rows:
-        assigned_index.add((r["semana"], r["dia"], r["horario"], r["programa"]))
-
-    # ── 5. Generar filas completas (asignados + vacantes) ─────
-    DIA_ORD = {"L": 1, "M": 2, "X": 3, "J": 4, "V": 5}
+    # ── 2. Construir filas para Excel ─────────────────────────
     all_rows: list[dict] = []
+    has_notas = False
 
-    for sem in SEMANAS:
-        for taller in talleres:
-            dia = taller["diaSemana"]
-            horario = taller["horario"]
-            programa = taller["programa"]
-            key = (sem, dia, horario, programa)
+    for row in db_rows:
+        estado = row["estado"] or "PLANIFICADO"
+        confirmado = row["confirmado"]
+        notas = row["notas"]
 
-            # Buscar si hay asignación
-            assigned = None
-            for r in assigned_rows:
-                if (r["semana"] == sem and r["dia"] == dia
-                        and r["horario"] == horario and r["programa"] == programa):
-                    assigned = r
-                    break
+        if notas:
+            has_notas = True
 
-            if assigned:
-                all_rows.append({
-                    "semana": sem,
-                    "dia": dia,
-                    "horario": horario,
-                    "turno": assigned["turno"],
-                    "empresa": assigned["empresa"],
-                    "taller": assigned["taller"],
-                    "programa": programa,
-                    "ciudad": assigned.get("ciudad", "MADRID"),
-                    "tipo": assigned["tipo"],
-                    "estado": "PLANIFICADO",
-                    "confirmado": "",
-                })
-            else:
-                all_rows.append({
-                    "semana": sem,
-                    "dia": dia,
-                    "horario": horario,
-                    "turno": taller.get("turno", ""),
-                    "empresa": "",
-                    "taller": taller["nombre"],
-                    "programa": programa,
-                    "ciudad": "",
-                    "tipo": "VACANTE",
-                    "estado": "VACANTE",
-                    "confirmado": "",
-                })
+        all_rows.append({
+            "semana": row["semana"],
+            "fecha": calcular_fecha_slot(trimestre, row["semana"], row["dia"]),
+            "dia": row["dia"],
+            "horario": row["horario"],
+            "turno": row["turno"] or "",
+            "empresa": row["empresa"] or "",
+            "taller": row["taller"],
+            "programa": row["programa"],
+            "ciudad": row["ciudad"] or "",
+            "tipo": row["tipo"] or "BASE",
+            "estado": estado,
+            "confirmado": "SÍ" if confirmado else "",
+            "notas": notas or "",
+        })
 
-    # Ordenar
-    all_rows.sort(key=lambda r: (
-        r["semana"],
-        DIA_ORD.get(r["dia"], 9),
-        r["horario"],
-        0 if r["programa"] == "EF" else 1,
-    ))
+    # ── 3. Contar estados para resumen ────────────────────────
+    estado_counts = {"OK": 0, "CONFIRMADO": 0, "PLANIFICADO": 0, "CANCELADO": 0, "VACANTE": 0}
+    for r in all_rows:
+        estado = r["estado"]
+        if estado in estado_counts:
+            estado_counts[estado] += 1
+        else:
+            estado_counts["PLANIFICADO"] += 1
 
-    # ── 6. Crear Excel con formato profesional ────────────────
+    # ── 4. Crear Excel con formato profesional ────────────────
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"Calendario {trimestre}"
@@ -445,19 +486,28 @@ async def exportar_excel(
         top=Side(style="thin", color="E2E8F0"),
         bottom=Side(style="thin", color="E2E8F0"),
     )
+    normal_font = Font(name="Arial", size=9)
+
+    # Estado-specific styles
     vacante_fill = PatternFill("solid", fgColor="FEF3C7")  # amarillo suave
     vacante_font = Font(name="Arial", size=9, color="92400E", italic=True)
-    normal_font = Font(name="Arial", size=9)
-    ef_fill = PatternFill("solid", fgColor="F1F5F9")  # gris muy claro
-    it_fill = PatternFill("solid", fgColor="EDE9FE")  # violeta muy claro
-    sem_font = Font(name="Arial", size=9, bold=True)
+    ok_fill = PatternFill("solid", fgColor="D1FAE5")  # verde suave
+    ok_font = Font(name="Arial", size=9, color="065F46")
+    cancelado_fill = PatternFill("solid", fgColor="FEE2E2")  # rojo suave
+    cancelado_font = Font(name="Arial", size=9, color="991B1B", strike=True)
+    confirmado_fill = PatternFill("solid", fgColor="DBEAFE")  # azul suave
+    confirmado_font = Font(name="Arial", size=9, color="1E40AF")
 
     # Headers
     headers = [
-        "Semana", "Día", "Horario", "Turno", "Empresa",
+        "Semana", "Fecha", "Día", "Horario", "Turno", "Empresa",
         "Taller", "Programa", "Ciudad", "Tipo", "Estado", "Confirmado",
     ]
-    col_widths = [8, 6, 14, 10, 25, 42, 10, 12, 12, 12, 14]
+    col_widths = [8, 14, 6, 14, 10, 25, 42, 10, 12, 12, 12, 14]
+
+    if has_notas:
+        headers.append("Notas")
+        col_widths.append(30)
 
     for col, (h, w) in enumerate(zip(headers, col_widths), 1):
         cell = ws.cell(row=1, column=col, value=h)
@@ -469,74 +519,93 @@ async def exportar_excel(
 
     # Freeze header
     ws.freeze_panes = "A2"
-    # Auto-filter
-    ws.auto_filter.ref = f"A1:K{len(all_rows) + 1}"
+    # Auto-filter (M with notas, L without — one more due to Fecha column)
+    last_col = "M" if has_notas else "L"
+    ws.auto_filter.ref = f"A1:{last_col}{len(all_rows) + 1}"
 
     # Data rows
-    prev_semana = None
     for i, row in enumerate(all_rows, 2):
-        is_vacante = row["tipo"] == "VACANTE"
-        is_new_semana = row["semana"] != prev_semana
-        prev_semana = row["semana"]
+        estado = row["estado"]
+        is_vacante = estado == "VACANTE"
+        is_ok = estado == "OK"
+        is_cancelado = estado == "CANCELADO"
+        is_confirmado = estado == "CONFIRMADO"
 
         values = [
-            row["semana"], row["dia"], row["horario"], row["turno"],
+            row["semana"], row["fecha"], row["dia"], row["horario"], row["turno"],
             row["empresa"], row["taller"], row["programa"],
             row["ciudad"], row["tipo"], row["estado"], row["confirmado"],
         ]
+        if has_notas:
+            values.append(row["notas"])
 
         for col, val in enumerate(values, 1):
             cell = ws.cell(row=i, column=col, value=val)
             cell.border = thin_border
             cell.alignment = Alignment(vertical="center")
 
+            # Apply estado-specific styling
             if is_vacante:
                 cell.fill = vacante_fill
                 cell.font = vacante_font
+            elif is_ok:
+                cell.fill = ok_fill
+                cell.font = ok_font
+            elif is_cancelado:
+                cell.fill = cancelado_fill
+                # Only strikethrough on empresa column (6 — after adding Fecha)
+                if col == 6:
+                    cell.font = cancelado_font
+                else:
+                    cell.font = Font(name="Arial", size=9, color="991B1B")
+            elif is_confirmado:
+                cell.fill = confirmado_fill
+                cell.font = confirmado_font
             else:
                 cell.font = normal_font
-                # Color sutil por programa
-                if row["programa"] == "IT":
-                    cell.fill = it_fill
 
-            # Semana en bold
+            # Semana column: center and bold
             if col == 1:
                 cell.font = Font(
                     name="Arial", size=9, bold=True,
-                    color="92400E" if is_vacante else "000000",
+                    color="92400E" if is_vacante else "065F46" if is_ok else "991B1B" if is_cancelado else "1E40AF" if is_confirmado else "000000",
                 )
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # ── 7. Hoja resumen ───────────────────────────────────────
+    # ── 5. Hoja resumen ───────────────────────────────────────
     ws_resumen = wb.create_sheet("Resumen")
     ws_resumen["A1"] = f"Calendario {trimestre}"
     ws_resumen["A1"].font = Font(name="Arial", bold=True, size=14)
 
+    total_slots = len(all_rows)
     resumen_data = [
-        ("Semanas disponibles", len(SEMANAS)),
-        ("Semanas excluidas", f"{sorted(semanas_excluidas)}" if semanas_excluidas else "Ninguna"),
-        ("Slots por semana", "20 (14 EF + 6 IT)"),
-        ("Total slots", len(all_rows)),
-        ("Asignados", sum(1 for r in all_rows if r["tipo"] != "VACANTE")),
-        ("Vacantes", sum(1 for r in all_rows if r["tipo"] == "VACANTE")),
+        ("Total slots", total_slots),
+        ("", ""),
+        ("ESTADOS", ""),
+        ("OK", estado_counts["OK"]),
+        ("Confirmados", estado_counts["CONFIRMADO"]),
+        ("Planificados", estado_counts["PLANIFICADO"]),
+        ("Cancelados", estado_counts["CANCELADO"]),
+        ("Vacantes", estado_counts["VACANTE"]),
         ("", ""),
         ("INSTRUCCIONES", ""),
         ("1. Columna 'Empresa'", "Completar vacantes con empresa asignada"),
-        ("2. Columna 'Estado'", "Cambiar a OK o CANCELADO según resultado"),
-        ("3. Columna 'Confirmado'", "Marcar SÍ cuando empresa confirme"),
+        ("2. Columna 'Estado'", "OK = completado, CANCELADO = no realizado"),
+        ("3. Columna 'Confirmado'", "SÍ = empresa confirmó asistencia"),
         ("4. Al cierre del trimestre", "Importar como histórico en el sistema"),
     ]
 
     for i, (label, value) in enumerate(resumen_data, 3):
         cell_a = ws_resumen.cell(row=i, column=1, value=label)
         cell_b = ws_resumen.cell(row=i, column=2, value=value)
-        cell_a.font = Font(name="Arial", size=10, bold=True if label else False)
+        is_header = label in ("ESTADOS", "INSTRUCCIONES")
+        cell_a.font = Font(name="Arial", size=10, bold=is_header or bool(label))
         cell_b.font = Font(name="Arial", size=10)
 
     ws_resumen.column_dimensions["A"].width = 30
     ws_resumen.column_dimensions["B"].width = 40
 
-    # ── 8. Devolver ───────────────────────────────────────────
+    # ── 6. Devolver ───────────────────────────────────────────
     buffer = BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -548,6 +617,805 @@ async def exportar_excel(
             "Content-Disposition": f"attachment; filename=calendario_{trimestre}.xlsx"
         },
     )
+
+
+# ── Slot Operations (Fase 3 — Operación) ────────────────────
+
+
+@router.patch("/{trimestre}/slots/{slot_id}")
+async def actualizar_slot(
+    trimestre: str,
+    slot_id: int,
+    body: SlotUpdateInput,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update a slot's estado, confirmado, empresaId, or notas.
+    Used for: confirming, cancelling, assigning company to vacancy, adding notes.
+    """
+    # Verify slot exists and belongs to this trimestre
+    check = await db.execute(
+        text('SELECT id, "empresaId", estado, semana FROM planificacion WHERE id = :id AND trimestre = :tri'),
+        {"id": slot_id, "tri": trimestre},
+    )
+    existing = check.mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Slot {slot_id} not found in {trimestre}")
+
+    # Build dynamic UPDATE
+    updates = []
+    params = {"id": slot_id}
+
+    # Handle empresa_id changes
+    new_empresa_id = body.empresa_id
+    if body.empresa_id is not None or (body.estado and body.estado == "VACANTE"):
+        # If clearing empresa (setting to vacancy)
+        if body.empresa_id is None and body.estado == "VACANTE":
+            updates.append('"empresaId" = NULL')
+        elif body.empresa_id is not None:
+            # Verify company doesn't already have a slot this week (H6 constraint)
+            week = existing["semana"]
+            conflict = await db.execute(
+                text('''
+                    SELECT id FROM planificacion
+                    WHERE trimestre = :tri AND semana = :week AND "empresaId" = :eid AND id != :slot_id
+                '''),
+                {"tri": trimestre, "week": week, "eid": body.empresa_id, "slot_id": slot_id},
+            )
+            if conflict.first():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Company {body.empresa_id} already has a slot in week {week}",
+                )
+            updates.append('"empresaId" = :empresa_id')
+            params["empresa_id"] = body.empresa_id
+
+    # Handle estado changes with auto-adjustments
+    if body.estado is not None:
+        new_estado = body.estado
+        # Auto-adjust: if assigning empresa to a VACANTE, change estado to PLANIFICADO
+        if body.empresa_id is not None and existing["estado"] == "VACANTE":
+            new_estado = "PLANIFICADO"
+        # Auto-adjust: if clearing empresa, change estado to VACANTE
+        if body.empresa_id is None and body.estado == "VACANTE":
+            new_estado = "VACANTE"
+        updates.append("estado = :estado")
+        params["estado"] = new_estado
+    elif body.empresa_id is not None and existing["estado"] == "VACANTE":
+        # Auto-transition from VACANTE to PLANIFICADO when assigning empresa
+        updates.append("estado = :estado")
+        params["estado"] = "PLANIFICADO"
+
+    if body.confirmado is not None:
+        updates.append("confirmado = :confirmado")
+        params["confirmado"] = body.confirmado
+
+    if body.notas is not None:
+        updates.append("notas = :notas")
+        params["notas"] = body.notas
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    updates.append('"updatedAt" = NOW()')
+    query = f"UPDATE planificacion SET {', '.join(updates)} WHERE id = :id"
+    await db.execute(text(query), params)
+    await db.commit()
+
+    # Return updated slot
+    result = await db.execute(
+        text("""
+            SELECT p.id, p.semana, p.dia, p.horario,
+                   COALESCE(p.turno, t.turno) AS turno,
+                   p."empresaId" AS empresa_id,
+                   e.nombre AS empresa_nombre,
+                   t.programa,
+                   p."tallerId" AS taller_id,
+                   t.nombre AS taller_nombre,
+                   p."ciudadId" AS ciudad_id,
+                   c.nombre AS ciudad,
+                   p."tipoAsignacion" AS tipo_asignacion,
+                   p.estado,
+                   p.confirmado,
+                   p.notas
+            FROM planificacion p
+            JOIN taller t ON t.id = p."tallerId"
+            LEFT JOIN empresa e ON e.id = p."empresaId"
+            LEFT JOIN ciudad c ON c.id = p."ciudadId"
+            WHERE p.id = :id
+        """),
+        {"id": slot_id},
+    )
+    row = result.mappings().first()
+    return {"slot": dict(row) if row else None}
+
+
+@router.patch("/{trimestre}/slots-batch")
+async def actualizar_slots_batch(
+    trimestre: str,
+    body: SlotBatchUpdateInput,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Batch update for confirming/cancelling multiple slots at once.
+    Returns: { updated: int, errors: list[str] }
+    """
+    updated = 0
+    errors = []
+
+    for item in body.updates:
+        try:
+            # Build dynamic UPDATE for each slot
+            check = await db.execute(
+                text('SELECT id FROM planificacion WHERE id = :id AND trimestre = :tri'),
+                {"id": item.slot_id, "tri": trimestre},
+            )
+            if not check.first():
+                errors.append(f"Slot {item.slot_id} not found")
+                continue
+
+            updates = []
+            params = {"id": item.slot_id}
+
+            if item.estado is not None:
+                updates.append("estado = :estado")
+                params["estado"] = item.estado
+
+            if item.confirmado is not None:
+                updates.append("confirmado = :confirmado")
+                params["confirmado"] = item.confirmado
+
+            if item.empresa_id is not None:
+                updates.append('"empresaId" = :empresa_id')
+                params["empresa_id"] = item.empresa_id
+
+            if item.notas is not None:
+                updates.append("notas = :notas")
+                params["notas"] = item.notas
+
+            if updates:
+                updates.append('"updatedAt" = NOW()')
+                query = f"UPDATE planificacion SET {', '.join(updates)} WHERE id = :id"
+                await db.execute(text(query), params)
+                updated += 1
+
+        except Exception as e:
+            errors.append(f"Slot {item.slot_id}: {str(e)}")
+
+    await db.commit()
+    return {"updated": updated, "errors": errors}
+
+
+@router.get("/{trimestre}/resumen")
+async def resumen_operacion(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns operational summary for the quarter.
+    """
+    # Overall stats
+    result = await db.execute(
+        text("""
+            SELECT
+                COUNT(*) AS total_slots,
+                SUM(CASE WHEN estado != 'VACANTE' THEN 1 ELSE 0 END) AS asignados,
+                SUM(CASE WHEN estado = 'VACANTE' THEN 1 ELSE 0 END) AS vacantes,
+                SUM(CASE WHEN confirmado = true THEN 1 ELSE 0 END) AS confirmados,
+                SUM(CASE WHEN estado = 'OK' THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN estado = 'CANCELADO' THEN 1 ELSE 0 END) AS cancelados
+            FROM planificacion
+            WHERE trimestre = :trimestre
+        """),
+        {"trimestre": trimestre},
+    )
+    totals = dict(result.mappings().first() or {})
+
+    # By week
+    by_week_result = await db.execute(
+        text("""
+            SELECT
+                semana,
+                COUNT(*) AS total,
+                SUM(CASE WHEN estado != 'VACANTE' THEN 1 ELSE 0 END) AS asignados,
+                SUM(CASE WHEN estado = 'VACANTE' THEN 1 ELSE 0 END) AS vacantes,
+                SUM(CASE WHEN confirmado = true THEN 1 ELSE 0 END) AS confirmados,
+                SUM(CASE WHEN estado = 'OK' THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN estado = 'CANCELADO' THEN 1 ELSE 0 END) AS cancelados
+            FROM planificacion
+            WHERE trimestre = :trimestre
+            GROUP BY semana
+            ORDER BY semana
+        """),
+        {"trimestre": trimestre},
+    )
+    by_week = [dict(r) for r in by_week_result.mappings().all()]
+
+    # By company
+    by_company_result = await db.execute(
+        text("""
+            SELECT
+                e.nombre AS empresa,
+                COUNT(*) AS total,
+                SUM(CASE WHEN p.confirmado = true THEN 1 ELSE 0 END) AS confirmados,
+                SUM(CASE WHEN p.estado = 'OK' THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN p.estado = 'CANCELADO' THEN 1 ELSE 0 END) AS cancelados
+            FROM planificacion p
+            JOIN empresa e ON e.id = p."empresaId"
+            WHERE p.trimestre = :trimestre AND p."empresaId" IS NOT NULL
+            GROUP BY e.nombre
+            ORDER BY total DESC
+        """),
+        {"trimestre": trimestre},
+    )
+    by_company = [dict(r) for r in by_company_result.mappings().all()]
+
+    # Progress percentage: slots with OK or CANCELADO (finished)
+    total = totals.get("total_slots") or 0
+    finished = (totals.get("ok") or 0) + (totals.get("cancelados") or 0)
+    progress_pct = round((finished / total) * 100, 1) if total > 0 else 0
+
+    return {
+        "trimestre": trimestre,
+        **totals,
+        "progress_pct": progress_pct,
+        "by_week": by_week,
+        "by_company": by_company,
+    }
+
+
+# ── Quarter Close (Auto-close) ──────────────────────────────
+
+
+class CerrarTrimestreInput(BaseModel):
+    confirmar: bool = False  # Si es False, hace dry run (preview)
+
+
+# ── Import Excel (re-import edited calendar) ────────────────
+
+
+class EmpresaCambiada(BaseModel):
+    """Detalle de una empresa que cambió en un slot."""
+    slot_id: int
+    semana: int
+    dia: str
+    taller_nombre: str
+    empresa_anterior: str | None
+    empresa_nueva: str
+
+
+class CambioDetalle(BaseModel):
+    """Detalle de un cambio detectado en un slot (estado, confirmado o empresa)."""
+    slot_id: int
+    semana: int
+    dia: str
+    taller_nombre: str
+    empresa_nombre: str | None
+    campo: str  # "estado" | "confirmado" | "empresa"
+    valor_anterior: str
+    valor_nuevo: str
+
+
+class ImportarExcelResult(BaseModel):
+    """Resultado de importar Excel editado."""
+    trimestre: str
+    total_procesados: int
+    actualizados: int
+    sin_cambios: int
+    errores: int
+    empresas_cambiadas: list[EmpresaCambiada]
+    cambios_detalle: list[CambioDetalle]
+    warnings: list[str]
+
+
+class ImportarExcelInput(BaseModel):
+    """Input for dry_run mode."""
+    dry_run: bool = False
+
+
+@router.post("/{trimestre}/importar-excel", response_model=ImportarExcelResult)
+async def importar_excel(
+    trimestre: str,
+    dry_run: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Importa un Excel editado de vuelta al calendario (planificacion).
+
+    Matching: trimestre + semana + taller_nombre (slot fijo)
+    Updates: empresa (por nombre), estado, confirmado
+
+    El Excel debe tener las mismas columnas que el exportado:
+    Semana, Día, Horario, Turno, Empresa, Taller, Programa, Ciudad, Tipo, Estado, Confirmado
+    """
+    from fastapi import UploadFile, File
+    raise HTTPException(
+        status_code=501,
+        detail="Use POST /{trimestre}/importar-excel-file with file upload",
+    )
+
+
+@router.post("/{trimestre}/importar-excel-file", response_model=ImportarExcelResult)
+async def importar_excel_file(
+    trimestre: str,
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Importa un Excel editado de vuelta al calendario (planificacion).
+
+    Matching: trimestre + semana + taller_nombre (slot fijo)
+    Updates: empresa (por nombre), estado, confirmado
+
+    Parámetros:
+    - file: Excel con el calendario editado
+    - dry_run: Si true, solo muestra qué cambiaría sin aplicar cambios
+
+    El Excel debe tener las mismas columnas que el exportado:
+    Semana, Día, Horario, Turno, Empresa, Taller, Programa, Ciudad, Tipo, Estado, Confirmado
+    """
+    import openpyxl
+    from io import BytesIO
+
+    warnings: list[str] = []
+    empresas_cambiadas: list[dict] = []
+    cambios_detalle: list[dict] = []
+    total_procesados = 0
+    actualizados = 0
+    sin_cambios = 0
+    errores = 0
+
+    # ── 1. Leer Excel ─────────────────────────────────────────
+    try:
+        content = await file.read()
+        wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al leer Excel: {str(e)}")
+
+    # ── 2. Validar headers ────────────────────────────────────
+    # Include "Fecha" for new format but don't require it (backward compat)
+    expected_headers = ["Semana", "Fecha", "Día", "Horario", "Turno", "Empresa",
+                        "Taller", "Programa", "Ciudad", "Tipo", "Estado", "Confirmado"]
+    actual_headers = [cell.value for cell in ws[1]]
+
+    # Normalize headers (strip whitespace, case-insensitive match)
+    actual_normalized = [str(h).strip().lower() if h else "" for h in actual_headers]
+    expected_normalized = [h.lower() for h in expected_headers]
+
+    # Find column indices
+    col_map = {}
+    for i, expected in enumerate(expected_normalized):
+        for j, actual in enumerate(actual_normalized):
+            if expected == actual:
+                col_map[expected_headers[i]] = j
+                break
+
+    required = ["Semana", "Taller", "Empresa", "Estado", "Confirmado"]
+    missing = [h for h in required if h not in col_map]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Columnas requeridas no encontradas: {', '.join(missing)}. "
+                   f"Headers encontrados: {actual_headers[:15]}",
+        )
+
+    # ── 3. Cargar mapa de empresas (nombre -> id) ─────────────
+    emp_result = await db.execute(
+        text("SELECT id, nombre FROM empresa WHERE activa = true")
+    )
+    empresas_db = {r["nombre"].strip().lower(): r["id"] for r in emp_result.mappings().all()}
+
+    # ── 4. Cargar slots existentes indexados ──────────────────
+    slots_result = await db.execute(
+        text("""
+            SELECT
+                p.id, p.semana, p.dia, p.horario,
+                p."empresaId" AS empresa_id,
+                e.nombre AS empresa_nombre,
+                t.nombre AS taller_nombre,
+                t.programa,
+                p.estado,
+                p.confirmado
+            FROM planificacion p
+            JOIN taller t ON t.id = p."tallerId"
+            LEFT JOIN empresa e ON e.id = p."empresaId"
+            WHERE p.trimestre = :tri
+        """),
+        {"tri": trimestre},
+    )
+    slots_db = [dict(r) for r in slots_result.mappings().all()]
+
+    if not slots_db:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No hay slots de planificacion para {trimestre}",
+        )
+
+    # Index: (semana, taller_nombre_lower) -> slot
+    slot_index: dict[tuple[int, str], dict] = {}
+    for s in slots_db:
+        key = (s["semana"], s["taller_nombre"].strip().lower())
+        slot_index[key] = s
+
+    # ── 5. Procesar filas del Excel ───────────────────────────
+    # Estado normalization map (handles typos)
+    ESTADO_NORMALIZE = {
+        "OK": "OK",
+        "CANCELADO": "CANCELADO",
+        "CONFIRMADO": "CONFIRMADO",
+        "CONFRIMADO": "CONFIRMADO",  # common typo
+        "CONFIRAMDO": "CONFIRMADO",  # another typo
+        "PLANIFICADO": "PLANIFICADO",
+        "PLANFICADO": "PLANIFICADO",  # typo
+        "VACANTE": "VACANTE",
+    }
+
+    updates_to_apply: list[dict] = []
+
+    for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        # Skip empty rows
+        if not row or all(cell is None for cell in row):
+            continue
+
+        total_procesados += 1
+
+        try:
+            # Extract values
+            semana_val = row[col_map["Semana"]]
+            taller_val = row[col_map["Taller"]]
+            empresa_val = row[col_map["Empresa"]]
+            estado_val = row[col_map["Estado"]]
+            confirmado_val = row[col_map["Confirmado"]]
+
+            # Parse semana
+            try:
+                semana = int(semana_val) if semana_val is not None else None
+            except (ValueError, TypeError):
+                warnings.append(f"Fila {row_num}: Semana inválida '{semana_val}'")
+                errores += 1
+                continue
+
+            if semana is None or not taller_val:
+                warnings.append(f"Fila {row_num}: Datos incompletos (semana o taller)")
+                errores += 1
+                continue
+
+            # Normalize taller name
+            taller_nombre = str(taller_val).strip().lower()
+
+            # Find matching slot
+            key = (semana, taller_nombre)
+            slot = slot_index.get(key)
+
+            if not slot:
+                warnings.append(f"Fila {row_num}: Slot no encontrado (S{semana}, {taller_val})")
+                errores += 1
+                continue
+
+            # ── Process empresa ───────────────────────────────
+            empresa_nueva = str(empresa_val).strip() if empresa_val else ""
+            empresa_nueva_id = None
+
+            if empresa_nueva:
+                empresa_nueva_lower = empresa_nueva.lower()
+                if empresa_nueva_lower in empresas_db:
+                    empresa_nueva_id = empresas_db[empresa_nueva_lower]
+                else:
+                    warnings.append(f"Fila {row_num}: Empresa '{empresa_nueva}' no encontrada")
+                    # Don't skip - we can still update estado/confirmado
+
+            # ── Process estado (with typo normalization) ──────
+            estado_nuevo = None
+            if estado_val:
+                estado_raw = str(estado_val).strip().upper()
+                estado_nuevo = ESTADO_NORMALIZE.get(estado_raw, estado_raw)
+                # Check if it's valid after normalization
+                if estado_nuevo not in ESTADO_NORMALIZE.values():
+                    warnings.append(f"Fila {row_num}: Estado '{estado_val}' inválido")
+                    estado_nuevo = None
+
+            # ── Process confirmado ────────────────────────────
+            confirmado_nuevo = None
+            if confirmado_val is not None:
+                confirmado_str = str(confirmado_val).strip().upper()
+                if confirmado_str in ("SÍ", "SI", "TRUE", "1", "YES", "X"):
+                    confirmado_nuevo = True
+                elif confirmado_str in ("NO", "FALSE", "0", ""):
+                    confirmado_nuevo = False
+
+            # ── Get and normalize DB values ───────────────────
+            empresa_anterior_id = slot["empresa_id"]
+            empresa_anterior_nombre = slot["empresa_nombre"]
+            # Normalize DB estado too (should already be uppercase but be safe)
+            estado_anterior_raw = slot["estado"]
+            estado_anterior = estado_anterior_raw.strip().upper() if estado_anterior_raw else "PLANIFICADO"
+            confirmado_anterior = bool(slot["confirmado"])  # Ensure boolean
+
+            # ── Check if anything changed ─────────────────────
+            changes = {}
+
+            # Empresa change
+            empresa_changed = False
+            if empresa_nueva_id is not None and empresa_nueva_id != empresa_anterior_id:
+                changes["empresa_id"] = empresa_nueva_id
+                empresa_changed = True
+            elif empresa_nueva == "" and empresa_anterior_id is not None:
+                # Clearing empresa (making vacancy)
+                changes["empresa_id"] = None
+                changes["estado"] = "VACANTE"
+                empresa_changed = True
+
+            # Estado change (compare normalized values)
+            if estado_nuevo is not None and estado_nuevo != estado_anterior:
+                # Auto-adjust: if empresa is being assigned to a VACANTE, estado becomes PLANIFICADO
+                if "empresa_id" in changes and changes["empresa_id"] is not None and estado_anterior == "VACANTE":
+                    if estado_nuevo == "VACANTE":
+                        estado_nuevo = "PLANIFICADO"
+                changes["estado"] = estado_nuevo
+
+            # Confirmado change (compare as booleans)
+            if confirmado_nuevo is not None and confirmado_nuevo != confirmado_anterior:
+                changes["confirmado"] = confirmado_nuevo
+
+            if not changes:
+                sin_cambios += 1
+                continue
+
+            # Record detailed changes for each field that changed
+            empresa_nombre_display = empresa_nueva or empresa_anterior_nombre or None
+
+            if "estado" in changes:
+                cambios_detalle.append({
+                    "slot_id": slot["id"],
+                    "semana": semana,
+                    "dia": slot["dia"],
+                    "taller_nombre": slot["taller_nombre"],
+                    "empresa_nombre": empresa_nombre_display,
+                    "campo": "estado",
+                    "valor_anterior": estado_anterior,
+                    "valor_nuevo": changes["estado"],
+                })
+
+            if "confirmado" in changes:
+                cambios_detalle.append({
+                    "slot_id": slot["id"],
+                    "semana": semana,
+                    "dia": slot["dia"],
+                    "taller_nombre": slot["taller_nombre"],
+                    "empresa_nombre": empresa_nombre_display,
+                    "campo": "confirmado",
+                    "valor_anterior": "SÍ" if confirmado_anterior else "NO",
+                    "valor_nuevo": "SÍ" if changes["confirmado"] else "NO",
+                })
+
+            if empresa_changed:
+                cambios_detalle.append({
+                    "slot_id": slot["id"],
+                    "semana": semana,
+                    "dia": slot["dia"],
+                    "taller_nombre": slot["taller_nombre"],
+                    "empresa_nombre": empresa_nueva or "(vacante)",
+                    "campo": "empresa",
+                    "valor_anterior": empresa_anterior_nombre or "(vacante)",
+                    "valor_nuevo": empresa_nueva or "(vacante)",
+                })
+                # Also record in empresas_cambiadas for backward compatibility
+                empresas_cambiadas.append({
+                    "slot_id": slot["id"],
+                    "semana": semana,
+                    "dia": slot["dia"],
+                    "taller_nombre": slot["taller_nombre"],
+                    "empresa_anterior": empresa_anterior_nombre,
+                    "empresa_nueva": empresa_nueva or "(vacante)",
+                })
+
+            updates_to_apply.append({
+                "slot_id": slot["id"],
+                "changes": changes,
+            })
+            actualizados += 1
+
+        except Exception as e:
+            warnings.append(f"Fila {row_num}: Error procesando: {str(e)}")
+            errores += 1
+
+    # ── 6. Apply changes (if not dry_run) ─────────────────────
+    if not dry_run and updates_to_apply:
+        for upd in updates_to_apply:
+            slot_id = upd["slot_id"]
+            changes = upd["changes"]
+
+            set_parts = []
+            params = {"id": slot_id}
+
+            if "empresa_id" in changes:
+                if changes["empresa_id"] is None:
+                    set_parts.append('"empresaId" = NULL')
+                else:
+                    set_parts.append('"empresaId" = :empresa_id')
+                    params["empresa_id"] = changes["empresa_id"]
+
+            if "estado" in changes:
+                set_parts.append("estado = :estado")
+                params["estado"] = changes["estado"]
+
+            if "confirmado" in changes:
+                set_parts.append("confirmado = :confirmado")
+                params["confirmado"] = changes["confirmado"]
+
+            set_parts.append('"updatedAt" = NOW()')
+
+            query = f"UPDATE planificacion SET {', '.join(set_parts)} WHERE id = :id"
+            await db.execute(text(query), params)
+
+        await db.commit()
+
+    wb.close()
+
+    return {
+        "trimestre": trimestre,
+        "total_procesados": total_procesados,
+        "actualizados": actualizados,  # Show count even in dry_run (preview)
+        "sin_cambios": sin_cambios,
+        "errores": errores,
+        "empresas_cambiadas": [EmpresaCambiada(**ec) for ec in empresas_cambiadas],
+        "cambios_detalle": [CambioDetalle(**cd) for cd in cambios_detalle],
+        "warnings": warnings[:50],  # Limitar warnings
+    }
+
+
+# ── Cerrar Trimestre ─────────────────────────────────────────
+
+
+class CerrarTrimestreResult(BaseModel):
+    trimestre: str
+    total_ok: int
+    total_cancelado: int
+    total_ignorado: int  # VACANTE + PLANIFICADO slots
+    preview: bool
+
+
+@router.post("/{trimestre}/cerrar", response_model=CerrarTrimestreResult)
+async def cerrar_trimestre(
+    trimestre: str,
+    body: CerrarTrimestreInput,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cierra el trimestre copiando los datos de planificacion a historicoTaller.
+
+    Logica:
+    1. Lee todos los slots de planificacion con estado OK o CANCELADO
+    2. Calcula la fecha real desde trimestre + semana + dia
+    3. Si confirmar=True, borra historicoTaller existente para ese trimestre
+       e inserta los nuevos registros
+    4. Si confirmar=False, solo devuelve un preview de lo que se cerraria
+
+    Solo se copian slots con estado OK o CANCELADO.
+    Slots VACANTE y PLANIFICADO se ignoran (no ejecutados).
+    """
+    from datetime import date, timedelta
+
+    # ── 1. Leer slots con estado final (OK o CANCELADO) ──────
+    result = await db.execute(
+        text("""
+            SELECT
+                p.id,
+                p."empresaId" AS empresa_id,
+                p."tallerId" AS taller_id,
+                p.semana,
+                p.dia,
+                p.estado,
+                c.nombre AS ciudad
+            FROM planificacion p
+            LEFT JOIN ciudad c ON c.id = p."ciudadId"
+            WHERE p.trimestre = :tri
+            AND p.estado IN ('OK', 'CANCELADO')
+            AND p."empresaId" IS NOT NULL
+        """),
+        {"tri": trimestre},
+    )
+    slots_finales = [dict(r) for r in result.mappings().all()]
+
+    # ── 2. Contar ignorados (VACANTE + PLANIFICADO) ──────────
+    ignorados_result = await db.execute(
+        text("""
+            SELECT COUNT(*) FROM planificacion
+            WHERE trimestre = :tri
+            AND (estado NOT IN ('OK', 'CANCELADO') OR "empresaId" IS NULL)
+        """),
+        {"tri": trimestre},
+    )
+    total_ignorado = ignorados_result.scalar() or 0
+
+    # ── 3. Separar OK y CANCELADO ────────────────────────────
+    slots_ok = [s for s in slots_finales if s["estado"] == "OK"]
+    slots_cancelado = [s for s in slots_finales if s["estado"] == "CANCELADO"]
+
+    total_ok = len(slots_ok)
+    total_cancelado = len(slots_cancelado)
+
+    # ── 4. Si no hay nada que cerrar, advertir ───────────────
+    if total_ok == 0 and total_cancelado == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No hay slots con estado OK o CANCELADO en {trimestre}. "
+                   "El trimestre parece no estar listo para cerrar.",
+        )
+
+    # ── 5. Si es preview, devolver sin modificar ─────────────
+    if not body.confirmar:
+        return {
+            "trimestre": trimestre,
+            "total_ok": total_ok,
+            "total_cancelado": total_cancelado,
+            "total_ignorado": total_ignorado,
+            "preview": True,
+        }
+
+    # ── 6. Calcular fechas y preparar inserts ────────────────
+    def calcular_fecha(trimestre: str, semana: int, dia: str) -> date:
+        """
+        Calcula la fecha real desde trimestre + semana + dia.
+        Q1: primer lunes de Enero, Q2: primer lunes de Abril, etc.
+        """
+        year = int(trimestre[:4])
+        quarter = int(trimestre[-1])
+        month_start = {1: 1, 2: 4, 3: 7, 4: 10}[quarter]
+        first_day = date(year, month_start, 1)
+        # Encontrar primer lunes
+        days_until_monday = (7 - first_day.weekday()) % 7
+        if days_until_monday == 0 and first_day.weekday() != 0:
+            days_until_monday = 7
+        first_monday = first_day + timedelta(days=days_until_monday)
+        # Si el primer dia del mes es lunes, usar ese
+        if first_day.weekday() == 0:
+            first_monday = first_day
+        # Offset por semana (semana 1 = primera semana)
+        week_start = first_monday + timedelta(weeks=semana - 1)
+        # Offset por dia
+        dia_offset = {"L": 0, "M": 1, "X": 2, "J": 3, "V": 4}
+        return week_start + timedelta(days=dia_offset.get(dia, 0))
+
+    # ── 7. Borrar historico existente para este trimestre ────
+    await db.execute(
+        text('DELETE FROM "historicoTaller" WHERE trimestre = :tri'),
+        {"tri": trimestre},
+    )
+
+    # ── 8. Insertar nuevos registros ─────────────────────────
+    for slot in slots_finales:
+        fecha = calcular_fecha(trimestre, slot["semana"], slot["dia"])
+        estado_db = "OK" if slot["estado"] == "OK" else "CANCELADO"
+
+        await db.execute(
+            text("""
+                INSERT INTO "historicoTaller" (
+                    "empresaId", "tallerId", fecha, estado, ciudad, trimestre, "createdAt"
+                )
+                VALUES (:eid, :tid, :fecha, :estado, :ciudad, :tri, NOW())
+            """),
+            {
+                "eid": slot["empresa_id"],
+                "tid": slot["taller_id"],
+                "fecha": fecha,
+                "estado": estado_db,
+                "ciudad": slot["ciudad"] or "MADRID",
+                "tri": trimestre,
+            },
+        )
+
+    await db.commit()
+
+    return {
+        "trimestre": trimestre,
+        "total_ok": total_ok,
+        "total_cancelado": total_cancelado,
+        "total_ignorado": total_ignorado,
+        "preview": False,
+    }
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -582,6 +1450,7 @@ def _ejecutar_solver(
     talleres: list[dict],
     disponibilidad_map: dict[int, list[str]],
     semanas_excluidas: set[int],
+    dias_excluidos: set[tuple[int, str]],
     params: CalendarioInput,
 ) -> dict:
     """
@@ -775,6 +1644,16 @@ def _ejecutar_solver(
                 f"{slots_disponibles} disponibles en semanas 5-13. Riesgo de INFEASIBLE."
             )
 
+    # H8. Festivos: excluir slots específicos por día+semana
+    # No empresa puede ser asignada a un slot cuyo día coincide con un festivo
+    if dias_excluidos:
+        for e in empresa_ids:
+            for s in SEMANAS:
+                for t_id in taller_ids:
+                    taller = taller_map[t_id]
+                    if (s, taller["diaSemana"]) in dias_excluidos:
+                        model.add(assign[(e, s, t_id)] == 0)
+
     # ─── SOFT CONSTRAINTS ────────────────────────────────────
 
     penalties = []
@@ -877,9 +1756,16 @@ def _ejecutar_solver(
 
     slots_raw: list[dict] = []
     vacios = 0
+    festivos_skipped = 0
     for s in SEMANAS:
         for t_id in taller_ids:
             taller = taller_map[t_id]
+
+            # Skip festivo slots — they don't exist in the calendar
+            if (s, taller["diaSemana"]) in dias_excluidos:
+                festivos_skipped += 1
+                continue
+
             assigned = False
             for e in empresa_ids:
                 if solver.value(assign[(e, s, t_id)]) == 1:
@@ -910,7 +1796,7 @@ def _ejecutar_solver(
                     "taller_nombre": taller["nombre"],
                 })
 
-    total_slots_posibles = len(SEMANAS) * len(taller_ids)
+    total_slots_posibles = len(SEMANAS) * len(taller_ids) - festivos_skipped
     if vacios > 0:
         warnings.append(
             f"{vacios}/{total_slots_posibles} slots vacantes "

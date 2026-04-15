@@ -4,12 +4,265 @@ Columnas en camelCase (Prisma). Tabla: "historicoTaller".
 """
 
 from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from io import BytesIO
 
 from app.db import get_db
 
 router = APIRouter()
+
+
+# ── New: List distinct trimestres ────────────────────────────
+
+@router.get("/trimestres")
+async def listar_trimestres(db: AsyncSession = Depends(get_db)):
+    """
+    Returns list of distinct trimestres that have historical data.
+    Sorted descending (most recent first).
+    """
+    result = await db.execute(
+        text("""
+            SELECT DISTINCT trimestre
+            FROM "historicoTaller"
+            WHERE trimestre IS NOT NULL
+            ORDER BY trimestre DESC
+        """)
+    )
+    trimestres = [row[0] for row in result.fetchall()]
+    return {"trimestres": trimestres}
+
+
+# ── New: Get historico for specific trimestre ────────────────
+
+@router.get("/{trimestre}")
+async def obtener_historico_trimestre(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns all historical records for a specific trimestre.
+    Includes empresa name, taller name, programa, etc.
+    """
+    result = await db.execute(
+        text("""
+            SELECT
+                h.id,
+                h."empresaId" AS empresa_id,
+                e.nombre AS empresa_nombre,
+                h."tallerId" AS taller_id,
+                t.nombre AS taller_nombre,
+                t.programa,
+                t."diaSemana" AS dia,
+                t.turno,
+                t.horario,
+                h.fecha,
+                h.estado,
+                h.ciudad,
+                h.trimestre,
+                EXTRACT(WEEK FROM h.fecha) AS semana_abs
+            FROM "historicoTaller" h
+            JOIN empresa e ON e.id = h."empresaId"
+            JOIN taller t ON t.id = h."tallerId"
+            WHERE h.trimestre = :trimestre
+            ORDER BY h.fecha ASC, t.turno ASC
+        """),
+        {"trimestre": trimestre},
+    )
+    registros = [dict(r) for r in result.mappings().all()]
+
+    # Calculate stats
+    total = len(registros)
+    ok_count = sum(1 for r in registros if r["estado"] == "OK")
+    cancelados = sum(1 for r in registros if r["estado"] == "CANCELADO")
+
+    return {
+        "trimestre": trimestre,
+        "total": total,
+        "ok": ok_count,
+        "cancelados": cancelados,
+        "registros": registros,
+    }
+
+
+# ── New: Export to Excel ─────────────────────────────────────
+
+@router.post("/{trimestre}/exportar-excel")
+async def exportar_historico_excel(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generates an Excel file from historicoTaller for the given trimestre.
+    Professional format with colors, filters, and summary sheet.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+    # Fetch data
+    result = await db.execute(
+        text("""
+            SELECT
+                h.id,
+                e.nombre AS empresa,
+                t.nombre AS taller,
+                t.programa,
+                t."diaSemana" AS dia,
+                t.turno,
+                t.horario,
+                h.fecha,
+                h.estado,
+                h.ciudad
+            FROM "historicoTaller" h
+            JOIN empresa e ON e.id = h."empresaId"
+            JOIN taller t ON t.id = h."tallerId"
+            WHERE h.trimestre = :trimestre
+            ORDER BY h.fecha ASC, t.turno ASC
+        """),
+        {"trimestre": trimestre},
+    )
+    registros = [dict(r) for r in result.mappings().all()]
+
+    if not registros:
+        # Return empty Excel with message
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sin datos"
+        ws["A1"] = f"No hay registros históricos para {trimestre}"
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=historico_{trimestre}.xlsx"},
+        )
+
+    # Create workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Histórico"
+
+    # Styles
+    header_font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    normal_font = Font(name="Arial", size=9)
+    cancelado_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+    cancelado_font = Font(name="Arial", size=9, strikethrough=True)
+    thin_border = Border(
+        left=Side(style="thin", color="D0D0D0"),
+        right=Side(style="thin", color="D0D0D0"),
+        top=Side(style="thin", color="D0D0D0"),
+        bottom=Side(style="thin", color="D0D0D0"),
+    )
+
+    # Headers
+    headers = ["Fecha", "Día", "Horario", "Turno", "Empresa", "Taller", "Programa", "Ciudad", "Estado"]
+    col_widths = [12, 6, 12, 8, 25, 40, 10, 12, 12]
+
+    for col, (h, w) in enumerate(zip(headers, col_widths), 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin_border
+        ws.column_dimensions[cell.column_letter].width = w
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:I{len(registros) + 1}"
+
+    # Data rows
+    for i, reg in enumerate(registros, 2):
+        is_cancelado = reg["estado"] == "CANCELADO"
+        fecha_str = reg["fecha"].strftime("%d/%m/%Y") if reg["fecha"] else ""
+
+        values = [
+            fecha_str,
+            reg["dia"],
+            reg["horario"],
+            reg["turno"],
+            reg["empresa"],
+            reg["taller"],
+            reg["programa"],
+            reg["ciudad"],
+            reg["estado"],
+        ]
+
+        for col, val in enumerate(values, 1):
+            cell = ws.cell(row=i, column=col, value=val)
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical="center")
+            if is_cancelado:
+                cell.fill = cancelado_fill
+                if col == 5:  # Empresa column
+                    cell.font = cancelado_font
+                else:
+                    cell.font = normal_font
+            else:
+                cell.font = normal_font
+
+    # Summary sheet
+    ws_resumen = wb.create_sheet("Resumen")
+    ws_resumen["A1"] = f"Histórico {trimestre}"
+    ws_resumen["A1"].font = Font(name="Arial", bold=True, size=14)
+
+    ok_count = sum(1 for r in registros if r["estado"] == "OK")
+    cancelados = sum(1 for r in registros if r["estado"] == "CANCELADO")
+    total = len(registros)
+
+    resumen_data = [
+        ("Total registros", total),
+        ("OK", ok_count),
+        ("Cancelados", cancelados),
+        ("% Asistencia", f"{round(ok_count / total * 100, 1)}%" if total > 0 else "0%"),
+    ]
+
+    for i, (label, value) in enumerate(resumen_data, 3):
+        ws_resumen.cell(row=i, column=1, value=label).font = Font(name="Arial", size=10, bold=True)
+        ws_resumen.cell(row=i, column=2, value=value).font = Font(name="Arial", size=10)
+
+    # By company
+    ws_resumen.cell(row=8, column=1, value="Por empresa").font = Font(name="Arial", bold=True, size=12)
+    empresas_stats = {}
+    for r in registros:
+        emp = r["empresa"]
+        if emp not in empresas_stats:
+            empresas_stats[emp] = {"ok": 0, "cancelados": 0}
+        if r["estado"] == "OK":
+            empresas_stats[emp]["ok"] += 1
+        else:
+            empresas_stats[emp]["cancelados"] += 1
+
+    row = 9
+    ws_resumen.cell(row=row, column=1, value="Empresa").font = Font(name="Arial", bold=True, size=9)
+    ws_resumen.cell(row=row, column=2, value="OK").font = Font(name="Arial", bold=True, size=9)
+    ws_resumen.cell(row=row, column=3, value="Canc.").font = Font(name="Arial", bold=True, size=9)
+    ws_resumen.cell(row=row, column=4, value="Total").font = Font(name="Arial", bold=True, size=9)
+
+    for emp, stats in sorted(empresas_stats.items()):
+        row += 1
+        ws_resumen.cell(row=row, column=1, value=emp)
+        ws_resumen.cell(row=row, column=2, value=stats["ok"])
+        ws_resumen.cell(row=row, column=3, value=stats["cancelados"])
+        ws_resumen.cell(row=row, column=4, value=stats["ok"] + stats["cancelados"])
+
+    ws_resumen.column_dimensions["A"].width = 30
+    ws_resumen.column_dimensions["B"].width = 10
+    ws_resumen.column_dimensions["C"].width = 10
+    ws_resumen.column_dimensions["D"].width = 10
+
+    # Return Excel
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=historico_{trimestre}.xlsx"},
+    )
 
 
 @router.get("/")

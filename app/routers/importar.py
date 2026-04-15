@@ -31,7 +31,7 @@ class ImportEmpresasResult(BaseModel):
     ciudades_creadas: list[str]
     empresa_ciudad_links: int
     config_trimestral_creadas: int
-    semanas_excluidas: int
+    festivos_importados: int
     warnings: list[str]
 
 
@@ -429,33 +429,150 @@ async def importar_empresas(
         )
         cfg_count += 1
 
-    # ── 5. Semanas excluidas ─────────────────────────────────
-    excl_count = 0
-    excl_sheet = None
-    for c in ["semanasexcluidas", "semanas_excluidas", "semanas excluidas"]:
+    # ── 5. Festivos (dates-based) ──────────────────────────────
+    from datetime import datetime, date, timedelta
+
+    festivo_count = 0
+    festivo_sheet = None
+    # Accept multiple sheet name variants
+    for c in ["festivos", "festivo", "semanasexcluidas", "semanas_excluidas", "semanas excluidas"]:
         if c in sheet_map:
-            excl_sheet = wb[sheet_map[c]]
+            festivo_sheet = wb[sheet_map[c]]
             break
 
-    if excl_sheet:
-        # Table "semanaExcluida" is now managed by Prisma migrations
-        for row in excl_sheet.iter_rows(
-            min_row=2, max_row=excl_sheet.max_row, values_only=True
-        ):
-            tri = _str(row[0]) if len(row) > 0 else None
-            sem = _int(row[1]) if len(row) > 1 else 0
-            motivo = _str(row[2]) if len(row) > 2 else None
-            if not tri or sem <= 0:
+    if festivo_sheet:
+        # Helper: convert fecha to festivo fields
+        DIA_LETRA = {0: "L", 1: "M", 2: "X", 3: "J", 4: "V", 5: "S", 6: "D"}
+        Q_MONTH = {1: "Q1", 2: "Q1", 3: "Q1", 4: "Q2", 5: "Q2", 6: "Q2",
+                   7: "Q3", 8: "Q3", 9: "Q3", 10: "Q4", 11: "Q4", 12: "Q4"}
+
+        def fecha_to_festivo_fields(fecha: date) -> dict:
+            """Given a date, returns {dia, trimestre, semana} for the festivo table."""
+            dia = DIA_LETRA[fecha.weekday()]
+            year = fecha.year
+            tri = f"{year}-{Q_MONTH[fecha.month]}"
+
+            # Calculate relative week: find first Monday of the quarter
+            quarter_num = (fecha.month - 1) // 3 + 1
+            quarter_start_month = (quarter_num - 1) * 3 + 1
+            first_day = date(year, quarter_start_month, 1)
+
+            if first_day.weekday() == 0:
+                first_monday = first_day
+            else:
+                days_until_monday = (7 - first_day.weekday()) % 7
+                first_monday = first_day + timedelta(days=days_until_monday)
+
+            days_diff = (fecha - first_monday).days
+            semana = (days_diff // 7) + 1
+            semana = max(1, min(13, semana))
+
+            return {"dia": dia, "trimestre": tri, "semana": semana}
+
+        festivos_to_insert: list[dict] = []
+
+        # Check header format (new: Fecha, Motivo | old: Trimestre, Semana, Motivo)
+        headers = [str(cell.value).strip().lower() if cell.value else "" for cell in festivo_sheet[1]]
+        is_new_format = "fecha" in headers
+
+        for row_num, row in enumerate(festivo_sheet.iter_rows(min_row=2, values_only=True), start=2):
+            if not row or row[0] is None:
                 continue
+
+            if is_new_format:
+                # New format: Fecha | Motivo
+                fecha_val = row[0]
+                motivo = _str(row[1]) if len(row) > 1 and row[1] else None
+
+                # Parse fecha
+                fecha = None
+                if isinstance(fecha_val, datetime):
+                    fecha = fecha_val.date()
+                elif isinstance(fecha_val, date):
+                    fecha = fecha_val
+                elif isinstance(fecha_val, str):
+                    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                        try:
+                            fecha = datetime.strptime(fecha_val.strip(), fmt).date()
+                            break
+                        except ValueError:
+                            continue
+
+                if not fecha:
+                    warnings.append(f"Festivos fila {row_num}: Fecha inválida '{fecha_val}'")
+                    continue
+
+                # Skip weekends
+                if fecha.weekday() >= 5:
+                    warnings.append(f"Festivos fila {row_num}: {fecha} cae en fin de semana — ignorado")
+                    continue
+
+                fields = fecha_to_festivo_fields(fecha)
+                festivos_to_insert.append({
+                    "fecha": fecha,
+                    "dia": fields["dia"],
+                    "trimestre": fields["trimestre"],
+                    "semana": fields["semana"],
+                    "motivo": motivo,
+                })
+            else:
+                # Legacy format: Trimestre | Semana | Motivo
+                # Convert to dates using approximate calculation (for backward compat)
+                tri = _str(row[0]) if len(row) > 0 else None
+                sem = _int(row[1]) if len(row) > 1 else 0
+                motivo = _str(row[2]) if len(row) > 2 else None
+                if not tri or sem <= 0:
+                    continue
+
+                # Legacy: exclude all 5 days of the week
+                year = int(tri[:4])
+                quarter = int(tri[-1])
+                quarter_start_month = {1: 1, 2: 4, 3: 7, 4: 10}[quarter]
+                first_day = date(year, quarter_start_month, 1)
+
+                if first_day.weekday() == 0:
+                    first_monday = first_day
+                else:
+                    days_until_monday = (7 - first_day.weekday()) % 7
+                    first_monday = first_day + timedelta(days=days_until_monday)
+
+                week_start = first_monday + timedelta(weeks=sem - 1)
+
+                # Add all 5 weekdays
+                for day_offset in range(5):
+                    fecha = week_start + timedelta(days=day_offset)
+                    dia = DIA_LETRA[fecha.weekday()]
+                    festivos_to_insert.append({
+                        "fecha": fecha,
+                        "dia": dia,
+                        "trimestre": tri,
+                        "semana": sem,
+                        "motivo": motivo,
+                    })
+
+        # Delete existing festivos for the year(s) being imported
+        years = set(f["fecha"].year for f in festivos_to_insert)
+        for year in years:
+            await db.execute(
+                text("DELETE FROM festivo WHERE EXTRACT(YEAR FROM fecha) = :year"),
+                {"year": year},
+            )
+
+        # Insert new festivos
+        for f in festivos_to_insert:
             await db.execute(
                 text("""
-                    INSERT INTO "semanaExcluida" (trimestre, semana, motivo)
-                    VALUES (:tri, :sem, :motivo)
-                    ON CONFLICT (trimestre, semana) DO UPDATE SET motivo = EXCLUDED.motivo
+                    INSERT INTO festivo (fecha, dia, trimestre, semana, motivo, "createdAt")
+                    VALUES (:fecha, :dia, :trimestre, :semana, :motivo, NOW())
+                    ON CONFLICT (fecha) DO UPDATE SET
+                        dia = EXCLUDED.dia,
+                        trimestre = EXCLUDED.trimestre,
+                        semana = EXCLUDED.semana,
+                        motivo = EXCLUDED.motivo
                 """),
-                {"tri": tri, "sem": sem, "motivo": motivo},
+                f,
             )
-            excl_count += 1
+            festivo_count += 1
 
     await db.commit()
 
@@ -466,7 +583,7 @@ async def importar_empresas(
         ciudades_creadas=ciudades_creadas,
         empresa_ciudad_links=ec_count,
         config_trimestral_creadas=cfg_count,
-        semanas_excluidas=excl_count,
+        festivos_importados=festivo_count,
         warnings=warnings,
     )
 
@@ -785,12 +902,12 @@ async def estado_importacion(trimestre: str, db: AsyncSession = Depends(get_db))
 
     try:
         r = await db.execute(
-            text('SELECT COUNT(*) FROM "semanaExcluida" WHERE trimestre = :tri'),
+            text('SELECT COUNT(*) FROM festivo WHERE trimestre = :tri'),
             {"tri": trimestre},
         )
-        counts["semanas_excluidas"] = r.scalar()
+        counts["festivos"] = r.scalar()
     except:  # noqa: E722
-        counts["semanas_excluidas"] = 0
+        counts["festivos"] = 0
 
     return {
         "trimestre": trimestre,
@@ -919,4 +1036,53 @@ async def clonar_trimestre(
         empresas_saltadas=saltadas,
         warnings=warnings,
     )
-    
+
+
+# ══════════════════════════════════════════════════════════════
+# ENDPOINT 5: Consultar festivos
+# ══════════════════════════════════════════════════════════════
+
+
+class FestivoOut(BaseModel):
+    id: int
+    fecha: str
+    dia: str
+    trimestre: str
+    semana: int
+    motivo: str | None
+
+
+class FestivosResult(BaseModel):
+    year: int
+    total: int
+    festivos: list[FestivoOut]
+
+
+@router.get("/festivos/{year}", response_model=FestivosResult)
+async def obtener_festivos(year: int, db: AsyncSession = Depends(get_db)):
+    """Returns all festivos for a given year."""
+    result = await db.execute(
+        text("""
+            SELECT id, fecha, dia, trimestre, semana, motivo
+            FROM festivo
+            WHERE EXTRACT(YEAR FROM fecha) = :year
+            ORDER BY fecha
+        """),
+        {"year": year},
+    )
+    rows = [dict(r) for r in result.mappings().all()]
+
+    # Convert date to string for JSON serialization
+    festivos = []
+    for row in rows:
+        festivos.append({
+            "id": row["id"],
+            "fecha": row["fecha"].strftime("%Y-%m-%d") if row["fecha"] else "",
+            "dia": row["dia"],
+            "trimestre": row["trimestre"],
+            "semana": row["semana"],
+            "motivo": row["motivo"],
+        })
+
+    return FestivosResult(year=year, total=len(festivos), festivos=festivos)
+

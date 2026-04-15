@@ -102,19 +102,32 @@ async def calcular_frecuencias(
     trimestre = params.trimestre
     warnings: list[str] = []
 
-    # ── 0. Calcular semanas disponibles (13 - excluidas) ────
+    # ── 0. Calcular semanas disponibles usando tabla festivo ────
+    # A week is "fully excluded" when all 5 weekdays (L,M,X,J,V) are festivos
     semanas_excluidas_count = 0
+    dias_festivos_por_semana: dict[int, set[str]] = {}
     try:
-        excl_q = await db.execute(
+        fest_q = await db.execute(
             text('''
-                SELECT COUNT(*) AS n FROM "semanaExcluida"
+                SELECT semana, dia FROM festivo
                 WHERE trimestre = :tri
             '''),
             {"tri": trimestre},
         )
-        semanas_excluidas_count = excl_q.scalar() or 0
+        for row in fest_q.mappings().all():
+            sem = row["semana"]
+            dia = row["dia"]
+            if sem not in dias_festivos_por_semana:
+                dias_festivos_por_semana[sem] = set()
+            dias_festivos_por_semana[sem].add(dia)
+
+        # Count weeks where all 5 days are festivos
+        DIAS_SEMANA = {"L", "M", "X", "J", "V"}
+        for sem, dias in dias_festivos_por_semana.items():
+            if dias >= DIAS_SEMANA:  # All 5 days are festivos
+                semanas_excluidas_count += 1
     except Exception:
-        pass  # tabla puede no existir
+        pass  # table may not exist or be empty
 
     SEMANAS_TRIMESTRE = 13
     semanas_disponibles = max(1, SEMANAS_TRIMESTRE - semanas_excluidas_count)
