@@ -233,6 +233,13 @@ async def importar_empresas(
     if "nombre" not in col_map:
         raise HTTPException(400, f"Columna 'nombre' no encontrada. Headers: {headers}")
 
+    # Warn about score columns being ignored (auto-calculated now)
+    score_cols_found = [c for c in ["scoreV3", "semaforo", "fiabilidadReciente"] if c in col_map]
+    if score_cols_found:
+        warnings.append(
+            f"Columnas {score_cols_found} ignoradas — los scores se calculan automáticamente desde el histórico"
+        )
+
     # ── Leer filas ───────────────────────────────────────────
     empresas_data: list[dict] = []
     seen_names: set[str] = set()
@@ -321,13 +328,13 @@ async def importar_empresas(
                 freq_ef = freq_total // 2
                 freq_it = freq_total - freq_ef
 
+        # NOTE: scoreV3, semaforo, fiabilidadReciente are IGNORED from Excel
+        # These fields are now auto-calculated from historical data
         empresas_data.append(
             {
                 "nombre": nombre,
                 "tipo": _programa(_get("tipo")),
-                "semaforo": _semaforo(_get("semaforo")),
-                "scoreV3": _float(_get("scoreV3")),
-                "fiabilidadReciente": _float(_get("fiabilidadReciente")),
+                # scoreV3, semaforo, fiabilidadReciente omitted — auto-calculated
                 "esComodin": _bool(_get("esComodin")),
                 "aceptaExtras": _bool(_get("aceptaExtras")),
                 "maxExtrasTrimestre": _int(_get("maxExtrasTrimestre")),
@@ -387,11 +394,11 @@ async def importar_empresas(
 
         if existing:
             eid, old_name = existing
+            # NOTE: scoreV3, semaforo, fiabilidadReciente NOT updated — auto-calculated
             await db.execute(
                 text("""
                     UPDATE empresa SET
-                        nombre = :nombre, tipo = :tipo, semaforo = :semaforo,
-                        "scoreV3" = :scoreV3, "fiabilidadReciente" = :fiabilidadReciente,
+                        nombre = :nombre, tipo = :tipo,
                         "esComodin" = :esComodin, "aceptaExtras" = :aceptaExtras,
                         "maxExtrasTrimestre" = :maxExtrasTrimestre,
                         "prioridadReduccion" = :prioridadReduccion,
@@ -406,6 +413,7 @@ async def importar_empresas(
             if old_name != emp["nombre"]:
                 warnings.append(f"'{old_name}' → '{emp['nombre']}'")
         else:
+            # New empresa: set neutral scores (will be calculated after first quarter)
             r = await db.execute(
                 text("""
                     INSERT INTO empresa (
@@ -414,7 +422,7 @@ async def importar_empresas(
                         "prioridadReduccion", "tieneBolsa", "turnoPreferido",
                         activa, notas, "updatedAt"
                     ) VALUES (
-                        :nombre, :tipo, :semaforo, :scoreV3, :fiabilidadReciente,
+                        :nombre, :tipo, 'AMBAR', 50, 50,
                         :esComodin, :aceptaExtras, :maxExtrasTrimestre,
                         :prioridadReduccion, :tieneBolsa, :turnoPreferido,
                         :activa, :notas, NOW()
@@ -751,11 +759,13 @@ async def importar_historico(
         "horario": ["horario", "hora", "time"],
         "turno": ["turno", "shift"],
         "empresa": ["empresa", "company", "emp"],
+        "empresa_original": ["empresa original", "empresa_original", "empresaoriginal", "original company"],
         "taller": ["taller", "workshop", "tal"],
         "programa": ["programa", "prog", "tipo", "type"],
         "ciudad": ["ciudad", "city"],
         "estado": ["estado", "status"],
         "fecha": ["fecha", "date", "fecha_taller"],
+        "motivo_cambio": ["motivo cambio", "motivo_cambio", "motivocambio", "motivo"],
     }
  
     col_idx: dict[str, int] = {}
@@ -898,7 +908,7 @@ async def importar_historico(
         else:
             estado_db = "OK"
  
-        # Resolver empresa
+        # Resolver empresa (final)
         empresa_nombre = str(empresa_raw).strip()
         empresa_upper = empresa_nombre.upper()
         # Intentar normalización legacy
@@ -907,13 +917,41 @@ async def importar_historico(
         if not eid:
             emp_404.add(empresa_upper)
             continue
- 
+
+        # Resolver empresa original (optional — defaults to eid if not present)
+        eid_original = eid  # Default: same as final empresa
+        empresa_orig_raw = _cell(row, "empresa_original")
+        if empresa_orig_raw and str(empresa_orig_raw).strip():
+            empresa_orig_nombre = str(empresa_orig_raw).strip()
+            empresa_orig_upper = empresa_orig_nombre.upper()
+            empresa_orig_upper = NORMALIZE_EMPRESA.get(empresa_orig_nombre, empresa_orig_upper)
+            eid_orig_lookup = emp_map.get(empresa_orig_upper)
+            if eid_orig_lookup:
+                eid_original = eid_orig_lookup
+            # If not found, just use eid (don't fail — legacy data may not have this)
+
+        # Resolver motivo_cambio (optional)
+        motivo_cambio = None
+        motivo_raw = _cell(row, "motivo_cambio")
+        if motivo_raw and str(motivo_raw).strip():
+            motivo_str = str(motivo_raw).strip().upper().replace(" ", "_")
+            # Normalize common variants
+            if motivo_str in ("EMPRESA_CANCELO", "EMPRESA CANCELO", "EMPRESA CANCELÓ"):
+                motivo_cambio = "EMPRESA_CANCELO"
+            elif motivo_str in ("DECISION_PLANIFICADOR", "DECISION PLANIFICADOR", "DECISIÓN PLANIFICADOR"):
+                motivo_cambio = "DECISION_PLANIFICADOR"
+            # Display text from Excel export
+            elif "CANCELÓ" in motivo_str or "CANCELO" in motivo_str:
+                motivo_cambio = "EMPRESA_CANCELO"
+            elif "PLANIFICADOR" in motivo_str:
+                motivo_cambio = "DECISION_PLANIFICADOR"
+
         # Resolver taller
         tid = match_taller(str(taller_raw).strip())
         if not tid:
             taller_404.add(str(taller_raw).strip())
             continue
- 
+
         # Resolver fecha
         fecha = None
         if has_fecha:
@@ -922,7 +960,7 @@ async def importar_historico(
                 fecha = fecha_raw.date()
             elif isinstance(fecha_raw, date):
                 fecha = fecha_raw
- 
+
         if fecha is None and has_semana:
             try:
                 sem = int(float(_cell(row, "semana", 1)))
@@ -930,29 +968,31 @@ async def importar_historico(
                 fecha = fecha_from_semana(sem, dia)
             except Exception:
                 fecha = fecha_fallback()
- 
+
         if fecha is None:
             fecha = fecha_fallback()
- 
+
         # Ciudad
         ciudad = str(_cell(row, "ciudad", "MADRID")).strip()
         if not ciudad:
             ciudad = "MADRID"
- 
+
         # Insertar
         await db.execute(
             text("""
                 INSERT INTO "historicoTaller"
-                    ("empresaId", "tallerId", fecha, estado, ciudad, trimestre)
-                VALUES (:eid, :tid, :fecha, :estado, :ciudad, :tri)
+                    ("empresaId", "empresaIdOriginal", "tallerId", fecha, estado, ciudad, trimestre, "motivoCambio")
+                VALUES (:eid, :eid_original, :tid, :fecha, :estado, :ciudad, :tri, :motivo)
             """),
             {
                 "eid": eid,
+                "eid_original": eid_original,
                 "tid": tid,
                 "fecha": fecha,
                 "estado": estado_db,
                 "ciudad": ciudad,
                 "tri": trimestre,
+                "motivo": motivo_cambio,
             },
         )
  

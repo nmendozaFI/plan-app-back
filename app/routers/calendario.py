@@ -87,6 +87,7 @@ class SlotUpdateInput(BaseModel):
     confirmado: bool | None = None
     empresa_id: int | None = None  # Can be null to clear (make vacancy)
     notas: str | None = None
+    motivo_cambio: str | None = None  # "EMPRESA_CANCELO" | "DECISION_PLANIFICADOR"
 
 
 class SlotBatchUpdateItem(BaseModel):
@@ -96,11 +97,25 @@ class SlotBatchUpdateItem(BaseModel):
     confirmado: bool | None = None
     empresa_id: int | None = None
     notas: str | None = None
+    motivo_cambio: str | None = None  # "EMPRESA_CANCELO" | "DECISION_PLANIFICADOR"
 
 
 class SlotBatchUpdateInput(BaseModel):
     """Input for batch updating multiple slots."""
     updates: list[SlotBatchUpdateItem]
+
+
+class ValidarAsignacionInput(BaseModel):
+    """Input for validating a company assignment to a slot."""
+    slot_id: int
+    empresa_id: int
+
+
+class ValidarAsignacionResult(BaseModel):
+    """Result of validating a company assignment."""
+    ok: bool  # True if no warnings
+    warnings: list[str]
+    restricciones_violadas: list[str]  # e.g. ["solo_dia: EY solo puede Viernes, slot es Martes"]
 
 
 # ── Helpers ─────────────────────────────────────────────────
@@ -352,6 +367,7 @@ async def obtener_calendario(
                    p.semana, p.dia, p.horario,
                    COALESCE(p.turno, t.turno) AS turno,
                    p."empresaId" AS empresa_id,
+                   p."empresaIdOriginal" AS empresa_id_original,
                    e.nombre AS empresa_nombre,
                    t.programa,
                    p."tallerId" AS taller_id,
@@ -361,7 +377,8 @@ async def obtener_calendario(
                    p."tipoAsignacion" AS tipo_asignacion,
                    p.estado,
                    p.confirmado,
-                   p.notas
+                   p.notas,
+                   p."motivoCambio" AS motivo_cambio
             FROM planificacion p
             JOIN taller t ON t.id = p."tallerId"
             LEFT JOIN empresa e ON e.id = p."empresaId"
@@ -394,6 +411,148 @@ async def obtener_calendario(
     }
 
 
+@router.post("/{trimestre}/validar-asignacion", response_model=ValidarAsignacionResult)
+async def validar_asignacion(
+    trimestre: str,
+    body: ValidarAsignacionInput,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Validates if assigning a company to a slot violates any restrictions.
+    Returns warnings but does NOT block the assignment.
+    Used by the frontend to show warnings before confirming.
+    """
+    warnings = []
+    restricciones_violadas = []
+
+    # 1. Get slot info
+    slot_result = await db.execute(
+        text("""
+            SELECT p.id, p.semana, p.dia, p."tallerId",
+                   t.nombre AS taller_nombre, t.programa, t.turno AS taller_turno
+            FROM planificacion p
+            JOIN taller t ON t.id = p."tallerId"
+            WHERE p.id = :slot_id AND p.trimestre = :tri
+        """),
+        {"slot_id": body.slot_id, "tri": trimestre},
+    )
+    slot = slot_result.mappings().first()
+    if not slot:
+        raise HTTPException(404, "Slot no encontrado")
+
+    slot = dict(slot)
+
+    # 2. Get company info
+    emp_result = await db.execute(
+        text('SELECT id, nombre, "turnoPreferido" FROM empresa WHERE id = :id'),
+        {"id": body.empresa_id},
+    )
+    empresa = emp_result.mappings().first()
+    if not empresa:
+        raise HTTPException(404, "Empresa no encontrada")
+    empresa = dict(empresa)
+
+    # 3. Get restrictions for this company
+    rest_result = await db.execute(
+        text('SELECT tipo, clave, valor FROM restriccion WHERE "empresaId" = :eid'),
+        {"eid": body.empresa_id},
+    )
+    restricciones = [dict(r) for r in rest_result.mappings().all()]
+
+    # 4. Check solo_dia
+    for r in restricciones:
+        if r["clave"] == "solo_dia":
+            if slot["dia"] != r["valor"]:
+                dia_nombres = {"L": "Lunes", "M": "Martes", "X": "Miércoles", "J": "Jueves", "V": "Viernes"}
+                restricciones_violadas.append(
+                    f"solo_dia: {empresa['nombre']} solo puede {dia_nombres.get(r['valor'], r['valor'])}, "
+                    f"pero el slot es {dia_nombres.get(slot['dia'], slot['dia'])}"
+                )
+
+    # 5. Check solo_taller
+    for r in restricciones:
+        if r["clave"] == "solo_taller":
+            taller_nombre = slot["taller_nombre"].strip().lower()
+            restriccion_valor = r["valor"].strip().lower()
+            if restriccion_valor not in taller_nombre and taller_nombre not in restriccion_valor:
+                restricciones_violadas.append(
+                    f"solo_taller: {empresa['nombre']} solo imparte '{r['valor']}', "
+                    f"pero el taller es '{slot['taller_nombre']}'"
+                )
+
+    # 6. Check no_comodin (warn that this company shouldn't be used as substitute)
+    for r in restricciones:
+        if r["clave"] == "no_comodin":
+            restricciones_violadas.append(
+                f"no_comodin: {empresa['nombre']} no debería usarse como comodín/sustituta"
+            )
+
+    # 7. Check max_extras — count how many times this company already appears beyond its frequency
+    for r in restricciones:
+        if r["clave"] == "max_extras":
+            max_extras = int(r["valor"])
+            # Count current assignments for this company
+            count_result = await db.execute(
+                text("""
+                    SELECT COUNT(*) AS total FROM planificacion
+                    WHERE trimestre = :tri AND "empresaId" = :eid
+                    AND estado NOT IN ('CANCELADO', 'VACANTE')
+                """),
+                {"tri": trimestre, "eid": body.empresa_id},
+            )
+            current = count_result.scalar() or 0
+            # Get original frequency
+            freq_result = await db.execute(
+                text("""
+                    SELECT "totalAsignado" FROM frecuencia
+                    WHERE trimestre = :tri AND "empresaId" = :eid
+                """),
+                {"tri": trimestre, "eid": body.empresa_id},
+            )
+            freq_row = freq_result.mappings().first()
+            original_freq = int(freq_row["totalAsignado"]) if freq_row else 0
+            extras_used = max(0, current - original_freq)
+            if extras_used >= max_extras:
+                restricciones_violadas.append(
+                    f"max_extras: {empresa['nombre']} ya tiene {extras_used} extras "
+                    f"(máximo permitido: {max_extras})"
+                )
+
+    # 8. Check if company already has a slot this week (H6 violation)
+    week_result = await db.execute(
+        text("""
+            SELECT COUNT(*) AS total FROM planificacion
+            WHERE trimestre = :tri AND semana = :sem AND "empresaId" = :eid
+            AND estado NOT IN ('CANCELADO', 'VACANTE')
+            AND id != :slot_id
+        """),
+        {"tri": trimestre, "sem": slot["semana"], "eid": body.empresa_id, "slot_id": body.slot_id},
+    )
+    week_count = week_result.scalar() or 0
+    if week_count > 0:
+        warnings.append(
+            f"{empresa['nombre']} ya tiene {week_count} taller(es) en la semana {slot['semana']}"
+        )
+
+    # 9. Check turno preference (soft warning)
+    turno_pref = empresa.get("turnoPreferido")
+    if turno_pref and slot.get("taller_turno") and slot["taller_turno"] != turno_pref:
+        turno_nombres = {"M": "Mañana", "T": "Tarde"}
+        warnings.append(
+            f"{empresa['nombre']} prefiere turno de {turno_nombres.get(turno_pref, turno_pref)}, "
+            f"pero el slot es de {turno_nombres.get(slot['taller_turno'], slot['taller_turno'])}"
+        )
+
+    # Combine
+    all_warnings = restricciones_violadas + warnings
+
+    return {
+        "ok": len(all_warnings) == 0,
+        "warnings": all_warnings,
+        "restricciones_violadas": restricciones_violadas,
+    }
+
+
 @router.post("/{trimestre}/exportar-excel")
 async def exportar_excel(
     trimestre: str,
@@ -414,16 +573,19 @@ async def exportar_excel(
             SELECT p.id, p.semana, p.dia, p.horario,
                    COALESCE(p.turno, t.turno) AS turno,
                    e.nombre AS empresa,
+                   e_orig.nombre AS empresa_original,
                    t.nombre AS taller,
                    t.programa,
                    c.nombre AS ciudad,
                    p."tipoAsignacion" AS tipo,
                    p.estado,
                    p.confirmado,
-                   p.notas
+                   p.notas,
+                   p."motivoCambio" AS motivo_cambio
             FROM planificacion p
             JOIN taller t ON t.id = p."tallerId"
             LEFT JOIN empresa e ON e.id = p."empresaId"
+            LEFT JOIN empresa e_orig ON e_orig.id = p."empresaIdOriginal"
             LEFT JOIN ciudad c ON c.id = p."ciudadId"
             WHERE p.trimestre = :trimestre
             ORDER BY p.semana,
@@ -440,14 +602,30 @@ async def exportar_excel(
     # ── 2. Construir filas para Excel ─────────────────────────
     all_rows: list[dict] = []
     has_notas = False
+    has_motivo = False
+    has_empresa_original = False
 
     for row in db_rows:
         estado = row["estado"] or "PLANIFICADO"
         confirmado = row["confirmado"]
         notas = row["notas"]
+        motivo = row.get("motivo_cambio")
+        empresa_original = row.get("empresa_original")
 
         if notas:
             has_notas = True
+        if motivo:
+            has_motivo = True
+        # Show empresa original column if any slot has a different original empresa
+        if empresa_original and empresa_original != row.get("empresa"):
+            has_empresa_original = True
+
+        # Format motivo_cambio for display
+        motivo_display = ""
+        if motivo == "EMPRESA_CANCELO":
+            motivo_display = "Empresa canceló"
+        elif motivo == "DECISION_PLANIFICADOR":
+            motivo_display = "Decisión planificador"
 
         all_rows.append({
             "semana": row["semana"],
@@ -456,6 +634,7 @@ async def exportar_excel(
             "horario": row["horario"],
             "turno": row["turno"] or "",
             "empresa": row["empresa"] or "",
+            "empresa_original": empresa_original or "",
             "taller": row["taller"],
             "programa": row["programa"],
             "ciudad": row["ciudad"] or "",
@@ -463,6 +642,7 @@ async def exportar_excel(
             "estado": estado,
             "confirmado": "SÍ" if confirmado else "",
             "notas": notas or "",
+            "motivo_cambio": motivo_display,
         })
 
     # ── 3. Contar estados para resumen ────────────────────────
@@ -504,13 +684,23 @@ async def exportar_excel(
     # Headers
     headers = [
         "Semana", "Fecha", "Día", "Horario", "Turno", "Empresa",
-        "Taller", "Programa", "Ciudad", "Tipo", "Estado", "Confirmado",
     ]
-    col_widths = [8, 14, 6, 14, 10, 25, 42, 10, 12, 12, 12, 14]
+    col_widths = [8, 14, 6, 14, 10, 25]
+
+    if has_empresa_original:
+        headers.append("Empresa Original")
+        col_widths.append(25)
+
+    headers.extend(["Taller", "Programa", "Ciudad", "Tipo", "Estado", "Confirmado"])
+    col_widths.extend([42, 10, 12, 12, 12, 14])
 
     if has_notas:
         headers.append("Notas")
         col_widths.append(30)
+
+    if has_motivo:
+        headers.append("Motivo cambio")
+        col_widths.append(20)
 
     for col, (h, w) in enumerate(zip(headers, col_widths), 1):
         cell = ws.cell(row=1, column=col, value=h)
@@ -522,8 +712,9 @@ async def exportar_excel(
 
     # Freeze header
     ws.freeze_panes = "A2"
-    # Auto-filter (M with notas, L without — one more due to Fecha column)
-    last_col = "M" if has_notas else "L"
+    # Auto-filter — calculate last column dynamically
+    col_count = len(headers)
+    last_col = chr(ord('A') + col_count - 1) if col_count <= 26 else "Z"
     ws.auto_filter.ref = f"A1:{last_col}{len(all_rows) + 1}"
 
     # Data rows
@@ -536,11 +727,18 @@ async def exportar_excel(
 
         values = [
             row["semana"], row["fecha"], row["dia"], row["horario"], row["turno"],
-            row["empresa"], row["taller"], row["programa"],
-            row["ciudad"], row["tipo"], row["estado"], row["confirmado"],
+            row["empresa"],
         ]
+        if has_empresa_original:
+            values.append(row["empresa_original"])
+        values.extend([
+            row["taller"], row["programa"],
+            row["ciudad"], row["tipo"], row["estado"], row["confirmado"],
+        ])
         if has_notas:
             values.append(row["notas"])
+        if has_motivo:
+            values.append(row["motivo_cambio"])
 
         for col, val in enumerate(values, 1):
             cell = ws.cell(row=i, column=col, value=val)
@@ -697,6 +895,15 @@ async def actualizar_slot(
         updates.append("notas = :notas")
         params["notas"] = body.notas
 
+    # Handle motivo_cambio
+    if body.motivo_cambio is not None:
+        updates.append('"motivoCambio" = :motivo_cambio')
+        params["motivo_cambio"] = body.motivo_cambio
+    # Auto-set motivo if estado is CANCELADO and no motivo provided (default: empresa cancelled)
+    elif body.estado == "CANCELADO" and body.motivo_cambio is None:
+        updates.append('"motivoCambio" = :motivo_cambio')
+        params["motivo_cambio"] = "EMPRESA_CANCELO"
+
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -720,7 +927,8 @@ async def actualizar_slot(
                    p."tipoAsignacion" AS tipo_asignacion,
                    p.estado,
                    p.confirmado,
-                   p.notas
+                   p.notas,
+                   p."motivoCambio" AS motivo_cambio
             FROM planificacion p
             JOIN taller t ON t.id = p."tallerId"
             LEFT JOIN empresa e ON e.id = p."empresaId"
@@ -775,6 +983,15 @@ async def actualizar_slots_batch(
             if item.notas is not None:
                 updates.append("notas = :notas")
                 params["notas"] = item.notas
+
+            # Handle motivo_cambio
+            if item.motivo_cambio is not None:
+                updates.append('"motivoCambio" = :motivo_cambio')
+                params["motivo_cambio"] = item.motivo_cambio
+            # Auto-set motivo if estado is CANCELADO and no motivo provided
+            elif item.estado == "CANCELADO" and item.motivo_cambio is None:
+                updates.append('"motivoCambio" = :motivo_cambio')
+                params["motivo_cambio"] = "EMPRESA_CANCELO"
 
             if updates:
                 updates.append('"updatedAt" = NOW()')
@@ -1481,6 +1698,34 @@ async def importar_excel_file(
     }
 
 
+# ── Recalcular Scores ────────────────────────────────────────
+
+
+class RecalcularScoresResult(BaseModel):
+    empresas_actualizadas: int
+    detalle: list[dict]
+    warnings: list[str]
+
+
+@router.post("/recalcular-scores", response_model=RecalcularScoresResult)
+async def recalcular_scores(db: AsyncSession = Depends(get_db)):
+    """
+    Recalculate all company scores from historical data.
+    Can be called manually anytime — useful after importing legacy data.
+    """
+    from app.routers.scores import calcular_scores_trimestre
+
+    warnings: list[str] = []
+    result = await calcular_scores_trimestre(db, "", warnings)
+    await db.commit()
+
+    return {
+        "empresas_actualizadas": result["empresas_actualizadas"],
+        "detalle": result["detalle"],
+        "warnings": warnings,
+    }
+
+
 # ── Cerrar Trimestre ─────────────────────────────────────────
 
 
@@ -1490,6 +1735,8 @@ class CerrarTrimestreResult(BaseModel):
     total_cancelado: int
     total_ignorado: int  # VACANTE + PLANIFICADO slots
     preview: bool
+    scores_actualizados: int = 0
+    score_warnings: list[str] = []
 
 
 @router.post("/{trimestre}/cerrar", response_model=CerrarTrimestreResult)
@@ -1524,6 +1771,7 @@ async def cerrar_trimestre(
                 p.semana,
                 p.dia,
                 p.estado,
+                p."motivoCambio" AS motivo_cambio,
                 c.nombre AS ciudad
             FROM planificacion p
             LEFT JOIN ciudad c ON c.id = p."ciudadId"
@@ -1609,9 +1857,9 @@ async def cerrar_trimestre(
         await db.execute(
             text("""
                 INSERT INTO "historicoTaller" (
-                    "empresaId", "empresaIdOriginal", "tallerId", fecha, estado, ciudad, trimestre, "createdAt"
+                    "empresaId", "empresaIdOriginal", "tallerId", fecha, estado, ciudad, trimestre, "motivoCambio", "createdAt"
                 )
-                VALUES (:eid, :eid_original, :tid, :fecha, :estado, :ciudad, :tri, NOW())
+                VALUES (:eid, :eid_original, :tid, :fecha, :estado, :ciudad, :tri, :motivo, NOW())
             """),
             {
                 "eid": slot["empresa_id"],
@@ -1621,9 +1869,17 @@ async def cerrar_trimestre(
                 "estado": estado_db,
                 "ciudad": slot["ciudad"] or "MADRID",
                 "tri": trimestre,
+                "motivo": slot.get("motivo_cambio"),
             },
         )
 
+    await db.commit()
+
+    # ── 9. Auto-calculate scores based on all historical data ────
+    from app.routers.scores import calcular_scores_trimestre
+
+    score_warnings: list[str] = []
+    score_result = await calcular_scores_trimestre(db, trimestre, score_warnings)
     await db.commit()
 
     return {
@@ -1632,6 +1888,8 @@ async def cerrar_trimestre(
         "total_cancelado": total_cancelado,
         "total_ignorado": total_ignorado,
         "preview": False,
+        "scores_actualizados": score_result["empresas_actualizadas"],
+        "score_warnings": score_warnings,
     }
 
 
