@@ -38,6 +38,19 @@ class PromoverResult(BaseModel):
     settings: AppSettingsOut
 
 
+class PlanningStatusOut(BaseModel):
+    """Full planning status for UI decision-making."""
+    trimestre_activo: str
+    trimestre_siguiente: Optional[str]
+    activo_tiene_frecuencias: bool
+    activo_tiene_calendario: bool
+    siguiente_tiene_frecuencias: bool
+    siguiente_tiene_calendario: bool
+    # Derived: which trimestre should be planned next
+    trimestre_a_planificar: Optional[str]
+    activo_necesita_planificacion: bool
+
+
 # ── Endpoints ────────────────────────────────────────────────
 
 
@@ -165,6 +178,83 @@ async def promover_trimestre(db: AsyncSession = Depends(get_db)):
             trimestre_activo=siguiente,
             trimestre_siguiente=None,
         ),
+    )
+
+
+@router.get("/status", response_model=PlanningStatusOut)
+async def get_planning_status(db: AsyncSession = Depends(get_db)):
+    """
+    Returns the current planning status for UI decision-making.
+
+    This helps the frontend decide:
+    - Which trimestre to show in Frecuencias/Calendario pages
+    - Whether to show "go to Fase 1/2" messages in Operacion
+    """
+    # Get current settings
+    result = await db.execute(
+        text("""
+            SELECT "trimestreActivo", "trimestreSiguiente"
+            FROM "appSettings"
+            WHERE id = 1
+        """)
+    )
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Settings not configured")
+
+    activo = row["trimestreActivo"]
+    siguiente = row["trimestreSiguiente"]
+
+    # Check frecuencias for activo
+    freq_activo_result = await db.execute(
+        text("SELECT COUNT(*) FROM frecuencia WHERE trimestre = :tri"),
+        {"tri": activo}
+    )
+    has_freq_activo = (freq_activo_result.scalar() or 0) > 0
+
+    # Check planificacion for activo
+    cal_activo_result = await db.execute(
+        text("SELECT COUNT(*) FROM planificacion WHERE trimestre = :tri"),
+        {"tri": activo}
+    )
+    has_cal_activo = (cal_activo_result.scalar() or 0) > 0
+
+    # Check frecuencias for siguiente (if exists)
+    has_freq_siguiente = False
+    has_cal_siguiente = False
+    if siguiente:
+        freq_sig_result = await db.execute(
+            text("SELECT COUNT(*) FROM frecuencia WHERE trimestre = :tri"),
+            {"tri": siguiente}
+        )
+        has_freq_siguiente = (freq_sig_result.scalar() or 0) > 0
+
+        cal_sig_result = await db.execute(
+            text("SELECT COUNT(*) FROM planificacion WHERE trimestre = :tri"),
+            {"tri": siguiente}
+        )
+        has_cal_siguiente = (cal_sig_result.scalar() or 0) > 0
+
+    # Decision logic:
+    # If activo has no frecuencias or no calendario, it needs planning first
+    activo_necesita = not has_freq_activo or not has_cal_activo
+
+    # Which trimestre to plan?
+    if activo_necesita:
+        trimestre_a_planificar = activo
+    else:
+        trimestre_a_planificar = siguiente  # May be None
+
+    return PlanningStatusOut(
+        trimestre_activo=activo,
+        trimestre_siguiente=siguiente,
+        activo_tiene_frecuencias=has_freq_activo,
+        activo_tiene_calendario=has_cal_activo,
+        siguiente_tiene_frecuencias=has_freq_siguiente,
+        siguiente_tiene_calendario=has_cal_siguiente,
+        trimestre_a_planificar=trimestre_a_planificar,
+        activo_necesita_planificacion=activo_necesita,
     )
 
 

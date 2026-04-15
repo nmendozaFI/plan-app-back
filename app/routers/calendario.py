@@ -37,6 +37,8 @@ class CalendarioInput(BaseModel):
     peso_equilibrio: int = 10
     peso_no_consecutivas: int = 8
     peso_turno_preferido: int = 3
+    peso_intercalar_ef_it: int = 6      # S4: Intercalar EF/IT en meses distintos
+    peso_diversidad_talleres: int = 4   # S5: Penalizar repetición del mismo taller
 
 
 class SugerenciaContingencia(BaseModel):
@@ -302,18 +304,18 @@ async def generar_calendario(
     for slot in slots_completos:
         # Vacancies: empresa_id=0 -> store as NULL with estado='VACANTE'
         is_vacancy = slot["empresa_id"] == 0
-        empresa_id = None if is_vacancy else slot["empresa_id"] 
+        empresa_id = None if is_vacancy else slot["empresa_id"]
         estado = "VACANTE" if is_vacancy else "PLANIFICADO"
         tipo_bd = "CONTINGENCIA" if slot["tipo_asignacion"] == "HUECO" else slot["tipo_asignacion"]
         es_contingencia = slot["tipo_asignacion"] == "HUECO"
         await db.execute(
             text("""
                 INSERT INTO planificacion
-                    (trimestre, semana, dia, horario, turno, "empresaId", "tallerId",
-                     "ciudadId", "tipoAsignacion", "esContingencia", estado, confirmado, "updatedAt")
+                    (trimestre, semana, dia, horario, turno, "empresaId", "empresaIdOriginal",
+                     "tallerId", "ciudadId", "tipoAsignacion", "esContingencia", estado, confirmado, "updatedAt")
                 VALUES (
-                    :tri, :sem, :dia, :horario, :turno, :eid, :tid,
-                    :cid, :tipo, :contingencia, :estado, false, NOW()
+                    :tri, :sem, :dia, :horario, :turno, :eid, :eid_original,
+                    :tid, :cid, :tipo, :contingencia, :estado, false, NOW()
                 )
             """),
             {
@@ -323,6 +325,7 @@ async def generar_calendario(
                 "horario": slot["horario"],
                 "turno": slot["turno"],
                 "eid": empresa_id,
+                "eid_original": empresa_id,  # Same as eid at generation time, NEVER updated later
                 "tid": slot["taller_id"],
                 "cid": slot.get("ciudad_id"),
                 "tipo": tipo_bd,
@@ -864,6 +867,218 @@ async def resumen_operacion(
     }
 
 
+# ── Análisis: Planificado vs Realizado ──────────────────────
+
+
+class EmpresaAnalisis(BaseModel):
+    """Per-company analysis metrics."""
+    empresa_id: int
+    empresa_nombre: str
+    asignados_solver: int
+    cumplidos: int
+    sustituida: int
+    cancelados: int
+    pendientes: int
+    extras_cubiertos: int
+    tasa_cumplimiento: float
+    tasa_sustitucion: float
+    sugerencia: str  # REDUCIR | REVISAR | MANTENER | SOLO_COMODIN
+
+
+class CambioSlot(BaseModel):
+    """Detail of a slot where company was substituted."""
+    semana: int
+    dia: str
+    taller: str
+    programa: str
+    empresa_original: str
+    empresa_final: str
+
+
+class AnalisisResumen(BaseModel):
+    """Global summary metrics."""
+    total_slots_asignados: int
+    cumplidos_sin_cambio: int
+    sustituidos: int
+    cancelados: int
+    pendientes: int
+    tasa_cumplimiento_global: float
+    tasa_sustitucion_global: float
+
+
+class AnalisisResponse(BaseModel):
+    """Full analysis response."""
+    trimestre: str
+    resumen: AnalisisResumen
+    por_empresa: list[EmpresaAnalisis]
+    cambios: list[CambioSlot]
+    total_empresas: int
+
+
+@router.get("/{trimestre}/analisis", response_model=AnalisisResponse)
+async def analisis_planificado_vs_realizado(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Compares solver's original assignment vs final state.
+    Returns per-company metrics: cumplimiento, sustituciones, extras.
+
+    This endpoint helps identify:
+    - Companies that were substituted (unreliable)
+    - Companies that stepped in as substitutes (reliable/flexible)
+    - The real "compliance rate" of each company
+    """
+    # 1. Get all slots with both current and original empresa
+    result = await db.execute(
+        text("""
+            SELECT
+                p.id,
+                p.semana,
+                p.dia,
+                p."tallerId" AS taller_id,
+                t.nombre AS taller_nombre,
+                t.programa,
+                p."empresaId" AS empresa_id_final,
+                e_final.nombre AS empresa_final,
+                p."empresaIdOriginal" AS empresa_id_original,
+                e_orig.nombre AS empresa_original,
+                p.estado
+            FROM planificacion p
+            JOIN taller t ON t.id = p."tallerId"
+            LEFT JOIN empresa e_final ON e_final.id = p."empresaId"
+            LEFT JOIN empresa e_orig ON e_orig.id = p."empresaIdOriginal"
+            WHERE p.trimestre = :trimestre
+            ORDER BY p.semana, p.dia
+        """),
+        {"trimestre": trimestre},
+    )
+    slots = [dict(r) for r in result.mappings().all()]
+
+    if not slots:
+        raise HTTPException(status_code=404, detail=f"No hay datos para {trimestre}")
+
+    # 2. Compute per-company metrics
+    empresas_stats: dict[int, dict] = {}
+
+    for slot in slots:
+        eid_orig = slot["empresa_id_original"]
+        eid_final = slot["empresa_id_final"]
+        estado = slot["estado"]
+
+        # Skip vacantes (no company assigned by solver)
+        if eid_orig is None and eid_final is None:
+            continue
+
+        # Track original assignments
+        if eid_orig is not None:
+            if eid_orig not in empresas_stats:
+                empresas_stats[eid_orig] = {
+                    "empresa_id": eid_orig,
+                    "empresa_nombre": slot["empresa_original"],
+                    "asignados_solver": 0,
+                    "cumplidos": 0,       # Slot ended with this company (OK/CONFIRMADO)
+                    "sustituida": 0,      # Slot ended with DIFFERENT company
+                    "cancelados": 0,      # Slot was CANCELADO
+                    "pendientes": 0,      # Slot still PLANIFICADO/CONFIRMADO
+                    "extras_cubiertos": 0,  # Slots where this company REPLACED another
+                }
+            empresas_stats[eid_orig]["asignados_solver"] += 1
+
+            if eid_final == eid_orig and estado in ("OK", "CONFIRMADO"):
+                empresas_stats[eid_orig]["cumplidos"] += 1
+            elif eid_final != eid_orig and eid_final is not None:
+                empresas_stats[eid_orig]["sustituida"] += 1
+            elif estado == "CANCELADO":
+                empresas_stats[eid_orig]["cancelados"] += 1
+            else:
+                empresas_stats[eid_orig]["pendientes"] += 1
+
+        # Track substitute assignments (company was NOT in solver but IS in final)
+        if eid_final is not None and eid_final != eid_orig:
+            if eid_final not in empresas_stats:
+                empresas_stats[eid_final] = {
+                    "empresa_id": eid_final,
+                    "empresa_nombre": slot["empresa_final"],
+                    "asignados_solver": 0,
+                    "cumplidos": 0,
+                    "sustituida": 0,
+                    "cancelados": 0,
+                    "pendientes": 0,
+                    "extras_cubiertos": 0,
+                }
+            empresas_stats[eid_final]["extras_cubiertos"] += 1
+
+    # 3. Compute rates
+    analysis = []
+    for eid, stats in empresas_stats.items():
+        asignados = stats["asignados_solver"]
+        tasa_cumplimiento = round(
+            (stats["cumplidos"] / asignados * 100) if asignados > 0 else 0, 1
+        )
+        tasa_sustitucion = round(
+            (stats["sustituida"] / asignados * 100) if asignados > 0 else 0, 1
+        )
+
+        analysis.append({
+            **stats,
+            "tasa_cumplimiento": tasa_cumplimiento,
+            "tasa_sustitucion": tasa_sustitucion,
+            # For next quarter: if tasa_cumplimiento < 70%, suggest reduction
+            "sugerencia": (
+                "REDUCIR" if tasa_cumplimiento < 70 and asignados > 0
+                else "MANTENER" if tasa_cumplimiento >= 90
+                else "REVISAR" if asignados > 0
+                else "SOLO_COMODIN"
+            ),
+        })
+
+    # Sort by tasa_cumplimiento ascending (worst first)
+    analysis.sort(key=lambda x: (x["tasa_cumplimiento"], -x["asignados_solver"]))
+
+    # 4. Global summary
+    total_slots = len([s for s in slots if s["empresa_id_original"] is not None])
+    total_cumplidos = sum(s["cumplidos"] for s in empresas_stats.values())
+    total_sustituidos = sum(s["sustituida"] for s in empresas_stats.values())
+    total_cancelados = sum(s["cancelados"] for s in empresas_stats.values())
+    total_pendientes = sum(s["pendientes"] for s in empresas_stats.values())
+
+    # Slot-level changes detail (for the changes table)
+    cambios = []
+    for slot in slots:
+        eid_orig = slot["empresa_id_original"]
+        eid_final = slot["empresa_id_final"]
+        if eid_orig is not None and eid_final is not None and eid_orig != eid_final:
+            cambios.append({
+                "semana": slot["semana"],
+                "dia": slot["dia"],
+                "taller": slot["taller_nombre"],
+                "programa": slot["programa"],
+                "empresa_original": slot["empresa_original"],
+                "empresa_final": slot["empresa_final"],
+            })
+
+    return {
+        "trimestre": trimestre,
+        "resumen": {
+            "total_slots_asignados": total_slots,
+            "cumplidos_sin_cambio": total_cumplidos,
+            "sustituidos": total_sustituidos,
+            "cancelados": total_cancelados,
+            "pendientes": total_pendientes,
+            "tasa_cumplimiento_global": round(
+                (total_cumplidos / total_slots * 100) if total_slots > 0 else 0, 1
+            ),
+            "tasa_sustitucion_global": round(
+                (total_sustituidos / total_slots * 100) if total_slots > 0 else 0, 1
+            ),
+        },
+        "por_empresa": analysis,
+        "cambios": cambios,
+        "total_empresas": len(analysis),
+    }
+
+
 # ── Quarter Close (Auto-close) ──────────────────────────────
 
 
@@ -1304,6 +1519,7 @@ async def cerrar_trimestre(
             SELECT
                 p.id,
                 p."empresaId" AS empresa_id,
+                p."empresaIdOriginal" AS empresa_id_original,
                 p."tallerId" AS taller_id,
                 p.semana,
                 p.dia,
@@ -1393,12 +1609,13 @@ async def cerrar_trimestre(
         await db.execute(
             text("""
                 INSERT INTO "historicoTaller" (
-                    "empresaId", "tallerId", fecha, estado, ciudad, trimestre, "createdAt"
+                    "empresaId", "empresaIdOriginal", "tallerId", fecha, estado, ciudad, trimestre, "createdAt"
                 )
-                VALUES (:eid, :tid, :fecha, :estado, :ciudad, :tri, NOW())
+                VALUES (:eid, :eid_original, :tid, :fecha, :estado, :ciudad, :tri, NOW())
             """),
             {
                 "eid": slot["empresa_id"],
+                "eid_original": slot.get("empresa_id_original"),
                 "tid": slot["taller_id"],
                 "fecha": fecha,
                 "estado": estado_db,
@@ -1717,6 +1934,89 @@ def _ejecutar_solver(
                         penalties.append(
                             assign[(e, s, t_id)] * params.peso_turno_preferido
                         )
+
+    # S4. Intercalar EF/IT en meses distintos
+    # Si una empresa participa en ambos programas (EF + IT), distribuirlos en meses diferentes.
+    # No concentrar todos los EF en un mes y todos los IT en otro.
+    import math
+    MONTH_WEEKS = {
+        1: [s for s in SEMANAS if 1 <= s <= 4],
+        2: [s for s in SEMANAS if 5 <= s <= 9],
+        3: [s for s in SEMANAS if 10 <= s <= 13],
+    }
+
+    empresas_mixtas = 0
+    for e in empresa_ids:
+        ef_total = empresas[e]["talleresEF"]
+        it_total = empresas[e]["talleresIT"]
+
+        # Solo aplicar si empresa tiene AMBOS EF e IT
+        if ef_total == 0 or it_total == 0:
+            continue
+
+        empresas_mixtas += 1
+
+        for month_num, month_weeks in MONTH_WEEKS.items():
+            if not month_weeks:
+                continue
+
+            # Contar asignaciones EF en este mes
+            ef_in_month = sum(
+                assign[(e, s, t_id)]
+                for s in month_weeks
+                for t_id in taller_ids_ef
+            )
+            # Contar asignaciones IT en este mes
+            it_in_month = sum(
+                assign[(e, s, t_id)]
+                for s in month_weeks
+                for t_id in taller_ids_it
+            )
+
+            # Penalizar si un mes tiene más de su parte justa de EF o IT
+            max_ef_per_month = math.ceil(ef_total / 3)
+            max_it_per_month = math.ceil(it_total / 3)
+
+            ef_excess = model.new_int_var(0, 20, f"ef_excess_{e}_{month_num}")
+            model.add(ef_excess >= ef_in_month - max_ef_per_month)
+            penalties.append(ef_excess * params.peso_intercalar_ef_it)
+
+            it_excess = model.new_int_var(0, 20, f"it_excess_{e}_{month_num}")
+            model.add(it_excess >= it_in_month - max_it_per_month)
+            penalties.append(it_excess * params.peso_intercalar_ef_it)
+
+    if empresas_mixtas > 0:
+        warnings.append(f"S4 Intercalar EF/IT: {empresas_mixtas} empresas con ambos programas")
+
+    # S5. Diversidad de talleres — penalizar repetición del mismo taller
+    # Cuando una empresa asiste múltiples veces en el trimestre, asignarla a talleres DIFERENTES.
+    # No enviar la misma empresa al mismo taller (ej: "CV práctico") tres veces.
+    empresas_diversidad = 0
+    for e in empresa_ids:
+        total = empresas[e]["totalAsignado"]
+        # Solo aplicar si tiene más de 1 taller (si solo tiene 1, no hay diversidad posible)
+        if total <= 1:
+            continue
+        # Excluir escuelas propias / alta frecuencia (>=6 talleres) — repiten por diseño
+        if total >= 6:
+            continue
+
+        empresas_diversidad += 1
+
+        for t_id in taller_ids:
+            # Contar cuántas semanas esta empresa está asignada a este taller específico
+            times_at_taller = sum(
+                assign[(e, s, t_id)]
+                for s in SEMANAS
+            )
+
+            # Penalizar si asignada al mismo taller más de una vez
+            repeat = model.new_int_var(0, 20, f"repeat_{e}_{t_id}")
+            model.add(repeat >= times_at_taller - 1)  # 0 si una vez, 1 si dos veces, etc.
+            penalties.append(repeat * params.peso_diversidad_talleres)
+
+    if empresas_diversidad > 0:
+        warnings.append(f"S5 Diversidad talleres: {empresas_diversidad} empresas (excluye escuelas propias >=6 talleres)")
 
     if penalties:
         model.minimize(sum(penalties))
