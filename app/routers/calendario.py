@@ -186,26 +186,68 @@ async def generar_calendario(
     )
     restricciones = [dict(r) for r in rest_result.mappings().all()]
 
-    # ── 3. Talleres (slots fijos) ─────────────────────────────
-    talleres_result = await db.execute(
+    # ── 3. Talleres (slots fijos) with per-week calendar overrides ───
+    # Uses SemanaConfig to determine which talleres are available each week.
+    # In intensive weeks: EF afternoon OFF, IT afternoon moved to Wednesday morning.
+    from app.routers.calendario_anual import cargar_talleres_semana
+
+    # Parse trimestre to get year and week range
+    anio = int(trimestre.split("-")[0])
+    quarter_num = int(trimestre.split("Q")[1])
+    iso_week_start = (quarter_num - 1) * 13 + 1
+
+    # Load talleres for each week of the trimestre
+    talleres_por_semana: dict[int, list[dict]] = {}
+    all_taller_ids: set[int] = set()
+    num_semanas = params.semanas  # typically 13
+
+    for semana_rel in range(1, num_semanas + 1):
+        iso_week = iso_week_start + semana_rel - 1
+        talleres_semana = await cargar_talleres_semana(db, anio, iso_week)
+        # Convert to solver format (id, diaSemana, etc.)
+        talleres_por_semana[semana_rel] = [
+            {
+                "id": t["taller_id"],
+                "nombre": t["nombre"],
+                "programa": t["programa"],
+                "diaSemana": t["dia_semana"],
+                "horario": t["horario"],
+                "turno": t["turno"],
+                "es_extra": t.get("es_extra", False),
+                "extra_id": t.get("extra_id"),
+            }
+            for t in talleres_semana
+        ]
+        for t in talleres_semana:
+            all_taller_ids.add(t["taller_id"])
+
+    # For backward compatibility, create a "union" list of all talleres (for summary)
+    # Get base talleres info for the union
+    base_talleres_result = await db.execute(
         text("""
             SELECT id, nombre, programa, "diaSemana", horario, turno
-            FROM taller WHERE activo = true
-            ORDER BY id
+            FROM taller WHERE activo = true ORDER BY id
         """)
     )
-    talleres = [dict(r) for r in talleres_result.mappings().all()]
+    base_talleres = [dict(r) for r in base_talleres_result.mappings().all()]
+    talleres = [t for t in base_talleres if t["id"] in all_taller_ids]
 
     if len(talleres) == 0:
         raise HTTPException(
             status_code=500,
-            detail="No hay talleres activos en la BD. Ejecutar migración de talleres.",
+            detail="No hay talleres activos para este trimestre. "
+                   "Verificar configuración de talleres en /planificacion/talleres.",
         )
 
+    # Count by week type for summary
+    normal_weeks = sum(1 for s in range(1, num_semanas + 1) if len(talleres_por_semana[s]) >= 18)
+    intensive_weeks = num_semanas - normal_weeks
+    avg_talleres = sum(len(talleres_por_semana[s]) for s in range(1, num_semanas + 1)) // num_semanas
     talleres_ef = [t for t in talleres if t["programa"] == "EF"]
     talleres_it = [t for t in talleres if t["programa"] == "IT"]
     warnings.append(
-        f"Catálogo: {len(talleres_ef)} EF + {len(talleres_it)} IT = {len(talleres)} talleres/semana"
+        f"Catálogo {trimestre}: {len(talleres_ef)} EF + {len(talleres_it)} IT base, "
+        f"{normal_weeks} semanas normales + {intensive_weeks} intensivas, ~{avg_talleres} talleres/semana promedio"
     )
 
     # ── 4. Ciudad Madrid (todos los talleres son de Madrid) ──
@@ -284,6 +326,7 @@ async def generar_calendario(
         frecuencias=frecuencias,
         restricciones=restricciones,
         talleres=talleres,
+        talleres_por_semana=talleres_por_semana,
         disponibilidad_map=disponibilidad_map,
         semanas_excluidas=semanas_excluidas,
         dias_excluidos=dias_excluidos,
@@ -2008,6 +2051,7 @@ def _ejecutar_solver(
     frecuencias: list[dict],
     restricciones: list[dict],
     talleres: list[dict],
+    talleres_por_semana: dict[int, list[dict]],  # NEW: per-week taller lists
     disponibilidad_map: dict[int, list[str]],
     semanas_excluidas: set[int],
     dias_excluidos: set[tuple[int, str]],
@@ -2182,6 +2226,18 @@ def _ejecutar_solver(
     print(f"\n{'─'*40}")
     print("PRE-FILTERING impossible assignments...")
 
+    # Build a map of available talleres per week (by taller ID)
+    talleres_disponibles_semana: dict[int, set[int]] = {}
+    taller_map_semana: dict[int, dict[int, dict]] = {}  # semana -> taller_id -> taller_info
+    for s in SEMANAS:
+        if s in talleres_por_semana:
+            talleres_disponibles_semana[s] = {t["id"] for t in talleres_por_semana[s]}
+            taller_map_semana[s] = {t["id"]: t for t in talleres_por_semana[s]}
+        else:
+            # Fallback to base talleres if no per-week config
+            talleres_disponibles_semana[s] = set(taller_ids)
+            taller_map_semana[s] = taller_map
+
     possible: set[tuple[int, int, int]] = set()
 
     for e in empresa_ids:
@@ -2194,19 +2250,26 @@ def _ejecutar_solver(
         for s in SEMANAS:
             # H7: New companies not in weeks 1-4
             if is_nueva and s <= 4:
-                debug_stats["H7_filtered"] += len(taller_ids)
+                debug_stats["H7_filtered"] += len(talleres_disponibles_semana.get(s, taller_ids))
                 continue
 
-            for t_id in taller_ids:
-                taller = taller_map[t_id]
+            # Get talleres available THIS WEEK (from annual calendar)
+            talleres_esta_semana = talleres_disponibles_semana.get(s, set(taller_ids))
+            taller_info_semana = taller_map_semana.get(s, taller_map)
 
-                # H4: Day availability
-                if taller["diaSemana"] not in dias_ok:
+            for t_id in talleres_esta_semana:
+                taller = taller_info_semana.get(t_id, taller_map.get(t_id))
+                if not taller:
+                    continue
+
+                # H4: Day availability - use the EFFECTIVE day for this week
+                effective_day = taller.get("diaSemana") or taller.get("dia_semana")
+                if effective_day not in dias_ok:
                     debug_stats["H4_filtered"] += 1
                     continue
 
-                # H8: Festivos
-                if (s, taller["diaSemana"]) in dias_excluidos:
+                # H8: Festivos - use effective day (could be overridden in intensive weeks)
+                if (s, effective_day) in dias_excluidos:
                     debug_stats["H8_filtered"] += 1
                     continue
 
@@ -2249,10 +2312,17 @@ def _ejecutar_solver(
 
     # H1. Cada slot (semana, taller) tiene A LO SUMO 1 empresa
     # Only sum over companies that can actually reach this slot
+    # UPDATED: iterate over per-week talleres (not global taller_ids)
     for s in SEMANAS:
-        for t_id in taller_ids:
-            # Skip festivo slots entirely
-            if (s, taller_map[t_id]["diaSemana"]) in dias_excluidos:
+        talleres_esta_semana = talleres_disponibles_semana.get(s, set(taller_ids))
+        taller_info_semana = taller_map_semana.get(s, taller_map)
+        for t_id in talleres_esta_semana:
+            taller = taller_info_semana.get(t_id, taller_map.get(t_id))
+            if not taller:
+                continue
+            # Skip festivo slots - use effective day for this week
+            effective_day = taller.get("diaSemana") or taller.get("dia_semana")
+            if (s, effective_day) in dias_excluidos:
                 continue
             vars_for_slot = [assign[(e, s, t_id)] for e in empresa_ids if (e, s, t_id) in possible]
             if vars_for_slot:
@@ -2585,28 +2655,43 @@ def _ejecutar_solver(
         }
 
     # ─── Extraer solución ────────────────────────────────────
+    # UPDATED: iterate over per-week talleres (not global taller_ids)
+    # This respects intensive weeks where some talleres are OFF or have different day/horario
 
     slots_raw: list[dict] = []
     vacios = 0
     festivos_skipped = 0
+    total_slots_posibles = 0
+
     for s in SEMANAS:
-        for t_id in taller_ids:
-            taller = taller_map[t_id]
+        talleres_esta_semana = talleres_disponibles_semana.get(s, set(taller_ids))
+        taller_info_semana = taller_map_semana.get(s, taller_map)
+
+        for t_id in talleres_esta_semana:
+            taller = taller_info_semana.get(t_id, taller_map.get(t_id))
+            if not taller:
+                continue
+
+            # Use effective day/horario for this specific week
+            effective_day = taller.get("diaSemana") or taller.get("dia_semana")
+            effective_horario = taller.get("horario", "")
+            effective_turno = taller.get("turno", "")
 
             # Skip festivo slots — they don't exist in the calendar
-            if (s, taller["diaSemana"]) in dias_excluidos:
+            if (s, effective_day) in dias_excluidos:
                 festivos_skipped += 1
                 continue
 
+            total_slots_posibles += 1
             assigned = False
             for e in empresa_ids:
                 # Check dict membership directly — don't compare BoolVar to int
                 if (e, s, t_id) in assign and solver.value(assign[(e, s, t_id)]) == 1:
                     slots_raw.append({
                         "semana": s,
-                        "dia": taller["diaSemana"],
-                        "horario": taller.get("horario", ""),
-                        "turno": taller.get("turno", ""),
+                        "dia": effective_day,
+                        "horario": effective_horario,
+                        "turno": effective_turno,
                         "empresa_id": e,
                         "empresa_nombre": empresas[e]["nombre"],
                         "programa": taller["programa"],
@@ -2621,17 +2706,15 @@ def _ejecutar_solver(
                 # Incluir slot vacío para que el frontend lo muestre
                 slots_raw.append({
                     "semana": s,
-                    "dia": taller["diaSemana"],
-                    "horario": taller.get("horario", ""),
-                    "turno": taller.get("turno", ""),
+                    "dia": effective_day,
+                    "horario": effective_horario,
+                    "turno": effective_turno,
                     "empresa_id": 0,
                     "empresa_nombre": "— Vacante —",
                     "programa": taller["programa"],
                     "taller_id": t_id,
                     "taller_nombre": taller["nombre"],
                 })
-
-    total_slots_posibles = len(SEMANAS) * len(taller_ids) - festivos_skipped
     if vacios > 0:
         warnings.append(
             f"{vacios}/{total_slots_posibles} slots vacantes "

@@ -18,6 +18,7 @@ from sqlalchemy import text
 from pydantic import BaseModel
 
 from app.db import get_db
+from app.routers.calendario_anual import cargar_talleres_semana
 
 router = APIRouter()
 
@@ -102,10 +103,19 @@ async def calcular_frecuencias(
     trimestre = params.trimestre
     warnings: list[str] = []
 
-    # ── 0. Calcular semanas disponibles usando tabla festivo ────
-    # A week is "fully excluded" when all 5 weekdays (L,M,X,J,V) are festivos
-    semanas_excluidas_count = 0
+    # ── 0. Calcular capacidad REAL usando calendario anual ──────
+    # Uses cargar_talleres_semana to get actual slots per week
+    # This accounts for intensive weeks (fewer EF) and festivos
+    SEMANAS_TRIMESTRE = 13
+
+    # Parse trimestre to get year and ISO week range
+    anio = int(trimestre.split("-")[0])
+    quarter_num = int(trimestre.split("Q")[1])
+    iso_week_start = (quarter_num - 1) * 13 + 1
+
+    # Load festivos for this trimestre (per-day exclusions)
     dias_festivos_por_semana: dict[int, set[str]] = {}
+    semanas_excluidas_count = 0
     try:
         fest_q = await db.execute(
             text('''
@@ -121,22 +131,56 @@ async def calcular_frecuencias(
                 dias_festivos_por_semana[sem] = set()
             dias_festivos_por_semana[sem].add(dia)
 
-        # Count weeks where all 5 days are festivos
+        # Count fully excluded weeks (all 5 days are festivos)
         DIAS_SEMANA = {"L", "M", "X", "J", "V"}
         for sem, dias in dias_festivos_por_semana.items():
-            if dias >= DIAS_SEMANA:  # All 5 days are festivos
+            if dias >= DIAS_SEMANA:
                 semanas_excluidas_count += 1
     except Exception:
         pass  # table may not exist or be empty
 
-    SEMANAS_TRIMESTRE = 13
-    semanas_disponibles = max(1, SEMANAS_TRIMESTRE - semanas_excluidas_count)
-    max_ef_trimestre = params.max_ef * semanas_disponibles
-    max_it_trimestre = params.max_it * semanas_disponibles
+    # Count actual slots per week from annual calendar
+    max_ef_trimestre = 0
+    max_it_trimestre = 0
+    normal_weeks = 0
+    intensive_weeks = 0
+
+    for semana_rel in range(1, SEMANAS_TRIMESTRE + 1):
+        # Skip fully excluded weeks
+        festivo_dias_semana = dias_festivos_por_semana.get(semana_rel, set())
+        if len(festivo_dias_semana) >= 5:
+            continue
+
+        iso_week = iso_week_start + semana_rel - 1
+        talleres_semana = await cargar_talleres_semana(db, anio, iso_week)
+
+        # Count EF and IT slots, excluding festivo days
+        ef_count = 0
+        it_count = 0
+        for t in talleres_semana:
+            dia = t.get("dia_semana")
+            if dia in festivo_dias_semana:
+                continue  # Skip this slot - it's a festivo day
+            if t["programa"] == "EF":
+                ef_count += 1
+            elif t["programa"] == "IT":
+                it_count += 1
+
+        max_ef_trimestre += ef_count
+        max_it_trimestre += it_count
+
+        # Track week types for reporting
+        if ef_count >= 14:  # Normal week has 14 EF
+            normal_weeks += 1
+        else:
+            intensive_weeks += 1
+
+    semanas_disponibles = SEMANAS_TRIMESTRE - semanas_excluidas_count
 
     warnings.append(
         f"Semanas disponibles: {semanas_disponibles}/13 "
-        f"({semanas_excluidas_count} excluidas) → "
+        f"({normal_weeks} normales + {intensive_weeks} intensivas, "
+        f"{semanas_excluidas_count} excluidas) → "
         f"capacidad total: {max_ef_trimestre} EF + {max_it_trimestre} IT"
     )
 
