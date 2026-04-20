@@ -879,7 +879,7 @@ async def actualizar_slot(
     """
     # Verify slot exists and belongs to this trimestre
     check = await db.execute(
-        text('SELECT id, "empresaId", estado, semana FROM planificacion WHERE id = :id AND trimestre = :tri'),
+        text('SELECT id, "empresaId", "empresaIdOriginal", estado, semana FROM planificacion WHERE id = :id AND trimestre = :tri'),
         {"id": slot_id, "tri": trimestre},
     )
     existing = check.mappings().first()
@@ -892,27 +892,37 @@ async def actualizar_slot(
 
     # Handle empresa_id changes
     new_empresa_id = body.empresa_id
+    # Skip H6 validation when planner explicitly sets a motivo_cambio (either reason = conscious override)
+    is_forced_assignment = body.motivo_cambio in ("DECISION_PLANIFICADOR", "EMPRESA_CANCELO")
+
     if body.empresa_id is not None or (body.estado and body.estado == "VACANTE"):
         # If clearing empresa (setting to vacancy)
         if body.empresa_id is None and body.estado == "VACANTE":
             updates.append('"empresaId" = NULL')
         elif body.empresa_id is not None:
             # Verify company doesn't already have a slot this week (H6 constraint)
-            week = existing["semana"]
-            conflict = await db.execute(
-                text('''
-                    SELECT id FROM planificacion
-                    WHERE trimestre = :tri AND semana = :week AND "empresaId" = :eid AND id != :slot_id
-                '''),
-                {"tri": trimestre, "week": week, "eid": body.empresa_id, "slot_id": slot_id},
-            )
-            if conflict.first():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Company {body.empresa_id} already has a slot in week {week}",
+            # SKIP validation if motivo_cambio is set (planner consciously overriding)
+            if not is_forced_assignment:
+                week = existing["semana"]
+                conflict = await db.execute(
+                    text('''
+                        SELECT id FROM planificacion
+                        WHERE trimestre = :tri AND semana = :week AND "empresaId" = :eid AND id != :slot_id
+                    '''),
+                    {"tri": trimestre, "week": week, "eid": body.empresa_id, "slot_id": slot_id},
                 )
+                if conflict.first():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Company {body.empresa_id} already has a slot in week {week}",
+                    )
             updates.append('"empresaId" = :empresa_id')
             params["empresa_id"] = body.empresa_id
+            # WRITE-ONCE: Set empresaIdOriginal only if it's currently NULL
+            # This preserves the original solver assignment for traceability
+            if existing["empresaIdOriginal"] is None:
+                updates.append('"empresaIdOriginal" = :empresa_id_original')
+                params["empresa_id_original"] = body.empresa_id
 
     # Handle estado changes with auto-adjustments
     if body.estado is not None:
@@ -961,6 +971,7 @@ async def actualizar_slot(
             SELECT p.id, p.semana, p.dia, p.horario,
                    COALESCE(p.turno, t.turno) AS turno,
                    p."empresaId" AS empresa_id,
+                   p."empresaIdOriginal" AS empresa_id_original,
                    e.nombre AS empresa_nombre,
                    t.programa,
                    p."tallerId" AS taller_id,
@@ -999,12 +1010,13 @@ async def actualizar_slots_batch(
 
     for item in body.updates:
         try:
-            # Build dynamic UPDATE for each slot
+            # Build dynamic UPDATE for each slot - include empresaIdOriginal for write-once logic
             check = await db.execute(
-                text('SELECT id FROM planificacion WHERE id = :id AND trimestre = :tri'),
+                text('SELECT id, "empresaIdOriginal" FROM planificacion WHERE id = :id AND trimestre = :tri'),
                 {"id": item.slot_id, "tri": trimestre},
             )
-            if not check.first():
+            existing = check.mappings().first()
+            if not existing:
                 errors.append(f"Slot {item.slot_id} not found")
                 continue
 
@@ -1022,6 +1034,10 @@ async def actualizar_slots_batch(
             if item.empresa_id is not None:
                 updates.append('"empresaId" = :empresa_id')
                 params["empresa_id"] = item.empresa_id
+                # WRITE-ONCE: Set empresaIdOriginal only if it's currently NULL
+                if existing["empresaIdOriginal"] is None:
+                    updates.append('"empresaIdOriginal" = :empresa_id_original')
+                    params["empresa_id_original"] = item.empresa_id
 
             if item.notas is not None:
                 updates.append("notas = :notas")
@@ -1488,6 +1504,7 @@ async def importar_excel_file(
             SELECT
                 p.id, p.semana, p.dia, p.horario,
                 p."empresaId" AS empresa_id,
+                p."empresaIdOriginal" AS empresa_id_original,
                 e.nombre AS empresa_nombre,
                 t.nombre AS taller_nombre,
                 t.programa,
@@ -1689,6 +1706,7 @@ async def importar_excel_file(
             updates_to_apply.append({
                 "slot_id": slot["id"],
                 "changes": changes,
+                "empresa_id_original": slot.get("empresa_id_original"),  # For write-once logic
             })
             actualizados += 1
 
@@ -1701,6 +1719,7 @@ async def importar_excel_file(
         for upd in updates_to_apply:
             slot_id = upd["slot_id"]
             changes = upd["changes"]
+            current_empresa_id_original = upd.get("empresa_id_original")
 
             set_parts = []
             params = {"id": slot_id}
@@ -1711,6 +1730,10 @@ async def importar_excel_file(
                 else:
                     set_parts.append('"empresaId" = :empresa_id')
                     params["empresa_id"] = changes["empresa_id"]
+                    # WRITE-ONCE: Set empresaIdOriginal only if it's currently NULL
+                    if current_empresa_id_original is None:
+                        set_parts.append('"empresaIdOriginal" = :empresa_id_original')
+                        params["empresa_id_original"] = changes["empresa_id"]
 
             if "estado" in changes:
                 set_parts.append("estado = :estado")
