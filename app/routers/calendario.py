@@ -16,6 +16,9 @@ Tablas Prisma (camelCase):
     "empresaCiudad", "solverLog"
 """
 
+import asyncio
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -321,8 +324,9 @@ async def generar_calendario(
     except Exception:
         pass  # table may not exist yet
 
-    # ── 7. Ejecutar solver ───────────────────────────────────
-    resultado = _ejecutar_solver(
+    # ── 7. Ejecutar solver (en thread separado para no bloquear event loop) ───
+    resultado = await asyncio.to_thread(
+        _ejecutar_solver,
         frecuencias=frecuencias,
         restricciones=restricciones,
         talleres=talleres,
@@ -2625,8 +2629,11 @@ def _ejecutar_solver(
     # ═══════════════════════════════════════════════════════════
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = params.timeout_seconds
-    solver.parameters.num_workers = 8
+    # Timeout y workers configurables por env var (Render suele ir con menos CPU que local)
+    solver_workers = int(os.getenv("SOLVER_WORKERS", "8"))
+    solver_timeout = int(os.getenv("SOLVER_TIMEOUT", str(params.timeout_seconds)))
+    solver.parameters.max_time_in_seconds = solver_timeout
+    solver.parameters.num_workers = solver_workers
 
     # Accept solutions within 5% of optimal (don't insist on OPTIMAL)
     solver.parameters.relative_gap_limit = 0.05
@@ -2646,7 +2653,7 @@ def _ejecutar_solver(
             elapsed = self.wall_time
             print(f"  Solution #{self.solution_count}: objective={obj:.0f}, elapsed={elapsed:.1f}s")
 
-    print(f"Starting solver with timeout={params.timeout_seconds}s, workers=8, gap_limit=5%...")
+    print(f"Starting solver with timeout={solver_timeout}s, workers={solver_workers}, gap_limit=5%...")
     callback = SolutionCallback()
     status_code = solver.solve(model, callback)
     elapsed = time.time() - start_time
