@@ -17,13 +17,26 @@ app = FastAPI(
     description="Motor de planificación trimestral de talleres EF/IT",
 )
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+# CORS configuration
+# With Next.js proxy, browser requests come from the same origin (no CORS).
+# Direct API calls (testing, SSR) still need CORS for these origins.
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://plani-app-rose.vercel.app,http://localhost:3000,http://127.0.0.1:3000"
+).split(",")
+
+# Regex to match Vercel preview URLs: https://plani-app-*.vercel.app
+ALLOWED_ORIGINS_REGEX = os.getenv(
+    "ALLOWED_ORIGINS_REGEX",
+    r"https://plani-app.*\.vercel\.app"
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGINS_REGEX,
     allow_credentials=True,
-    allow_methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 

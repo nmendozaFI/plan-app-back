@@ -6,8 +6,8 @@ import ssl
 from dotenv import load_dotenv
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL_PYTHON")
-print("DB URL:", os.getenv("DATABASE_URL_PYTHON"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+print("DB URL:", os.getenv("DATABASE_URL"))
 
 ssl_context = ssl.create_default_context()
 
