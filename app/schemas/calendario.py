@@ -1,4 +1,12 @@
+from typing import Literal
+
 from pydantic import BaseModel
+
+
+# V17: planificacion.estado dropped "OK". CONFIRMADO is the terminal state.
+# VACANTE is kept in the user-settable literal because actualizar_slot uses it
+# to mark a slot as vacant when the empresa is cleared (existing behavior).
+EstadoSlotInput = Literal["PLANIFICADO", "CONFIRMADO", "CANCELADO", "VACANTE"]
 
 
 class CalendarioInput(BaseModel):
@@ -56,7 +64,7 @@ class CalendarioOutput(BaseModel):
 
 class SlotUpdateInput(BaseModel):
     """Input for updating a single slot."""
-    estado: str | None = None  # PLANIFICADO | CONFIRMADO | OK | CANCELADO | VACANTE
+    estado: EstadoSlotInput | None = None  # V17: "OK" rejected with 422
     confirmado: bool | None = None
     empresa_id: int | None = None  # Can be null to clear (make vacancy)
     notas: str | None = None
@@ -66,7 +74,7 @@ class SlotUpdateInput(BaseModel):
 class SlotBatchUpdateItem(BaseModel):
     """Single item in a batch update."""
     slot_id: int
-    estado: str | None = None
+    estado: EstadoSlotInput | None = None  # V17: "OK" rejected with 422
     confirmado: bool | None = None
     empresa_id: int | None = None
     notas: str | None = None

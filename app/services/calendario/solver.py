@@ -5,6 +5,72 @@ import math
 from app.schemas.calendario import CalendarioInput
 
 
+def _franja_preferida(
+    restricciones_empresa: list[dict],
+    dia_codigo: str,  # "L" | "M" | "X" | "J" | "V"
+) -> tuple[str | None, str | None]:
+    """
+    Returns (franja, tipo) for the given empresa and day.
+
+    Priority: `franja_por_dia` for the specific day wins over the global
+    `franja_horaria`. `tipo` is "HARD" or "SOFT". Returns (None, None) if no
+    preference exists.
+
+    V16 helper. Shared between solver pre-filter, solver SOFT penalty pass,
+    and validar_asignacion in calendario.py — DO NOT duplicate.
+    """
+    franja_dia: str | None = None
+    tipo_dia: str | None = None
+    franja_global: str | None = None
+    tipo_global: str | None = None
+
+    for r in restricciones_empresa:
+        clave = r.get("clave")
+        valor = r.get("valor") or ""
+        tipo = r.get("tipo")  # "HARD" | "SOFT"
+
+        if clave == "franja_por_dia" and valor.startswith(f"{dia_codigo}:"):
+            # "L:12:00-14:00" -> "12:00-14:00"
+            franja_dia = valor.split(":", 1)[1]
+            tipo_dia = tipo
+        elif clave == "franja_horaria":
+            franja_global = valor
+            tipo_global = tipo
+
+    if franja_dia is not None:
+        return franja_dia, tipo_dia
+    return franja_global, tipo_global
+
+
+def _dias_exclusivos_hard(
+    restricciones_empresa: list[dict],
+) -> set[str] | None:
+    """
+    If the empresa has at least one HARD `franja_por_dia`, return the set of
+    declared day codes (subset of {"L","M","X","J","V"}). Days not in that set
+    are NOT valid candidates for this empresa.
+
+    Returns None when the empresa has zero HARD `franja_por_dia` restrictions,
+    meaning no day-exclusivity filter applies (solo_dia / configTrimestral /
+    franja_horaria HARD still apply through their own paths).
+
+    SOFT `franja_por_dia` does NOT trigger day-exclusivity — a SOFT preference
+    must remain a scoring penalty via `_franja_preferida`, never a HARD filter.
+
+    V16.1 helper. Sibling of `_franja_preferida`. Shared with validar_asignacion.
+    """
+    dias: set[str] = set()
+    for r in restricciones_empresa:
+        if r.get("clave") != "franja_por_dia":
+            continue
+        if r.get("tipo") != "HARD":
+            continue
+        valor = r.get("valor") or ""
+        if len(valor) >= 1 and valor[0] in {"L", "M", "X", "J", "V"}:
+            dias.add(valor[0])
+    return dias if dias else None
+
+
 def _generate_hints(
     possible: set,
     empresa_ids: list[int],
@@ -136,11 +202,14 @@ def _ejecutar_solver(
         "H6_constraints": 0,
         "H7_filtered": 0,
         "H8_filtered": 0,
+        "H_franja_filtered": 0,  # V16
+        "H_franja_dia_filtered": 0,  # V16.1: día no en set HARD franja_por_dia
         "S1_penalties": 0,
         "S2_penalties": 0,
         "S3_penalties": 0,
         "S4_penalties": 0,
         "S5_penalties": 0,
+        "S_franja_penalties": 0,  # V16
         "hints_generated": 0,
     }
 
@@ -293,6 +362,10 @@ def _ejecutar_solver(
         is_nueva = empresas[e].get("esNueva", False)
         ef_needed = int(empresas[e].get("talleresEF", 0) or 0)
         it_needed = int(empresas[e].get("talleresIT", 0) or 0)
+        rest_empresa = rest_por_empresa.get(e, [])
+        # V16.1: hoisted set of HARD-allowed days from franja_por_dia.
+        # None means no day-exclusivity (zero HARD franja_por_dia rows).
+        dias_permitidos_hard = _dias_exclusivos_hard(rest_empresa)
 
         for s in SEMANAS:
             # H7: New companies not in weeks 1-4
@@ -325,6 +398,30 @@ def _ejecutar_solver(
                     debug_stats["H5_filtered"] += 1
                     continue
 
+                # V16.1: HARD day-exclusivity from `franja_por_dia`.
+                # If empresa has at least one HARD franja_por_dia row, the
+                # declared days become the ONLY valid days. Days outside the
+                # set are filtered, regardless of franja match.
+                if (
+                    dias_permitidos_hard is not None
+                    and effective_day not in dias_permitidos_hard
+                ):
+                    debug_stats["H_franja_dia_filtered"] += 1
+                    continue
+
+                # V16: HARD franja_horaria / franja_por_dia pre-filter.
+                # If empresa has a HARD franja for this day (or globally) and the
+                # taller's horario does not match, drop the candidate. SOFT
+                # variants are handled in the penalty pass below.
+                franja_pref, tipo_franja = _franja_preferida(rest_empresa, effective_day)
+                if (
+                    franja_pref is not None
+                    and tipo_franja == "HARD"
+                    and (taller.get("horario") or "") != franja_pref
+                ):
+                    debug_stats["H_franja_filtered"] += 1
+                    continue
+
                 # Program type match — no point creating var if empresa doesn't need this program
                 if taller["programa"] == "EF" and ef_needed == 0:
                     continue
@@ -343,6 +440,8 @@ def _ejecutar_solver(
     print(f"  H5 (solo_taller): {debug_stats['H5_filtered']:,}")
     print(f"  H7 (new company): {debug_stats['H7_filtered']:,}")
     print(f"  H8 (festivo): {debug_stats['H8_filtered']:,}")
+    print(f"  H_franja (HARD V16): {debug_stats['H_franja_filtered']:,}")
+    print(f"  H_franja_dia (HARD V16.1): {debug_stats['H_franja_dia_filtered']:,}")
     print(f"{'─'*40}\n")
 
     # ─── Helper to get assign var or 0 for impossible ────────
@@ -597,6 +696,46 @@ def _ejecutar_solver(
     print(f"S5: {debug_stats['S5_penalties']} diversidad penalties ({empresas_diversidad} empresas 3-5 talleres) [OPTIMIZED]")
     if empresas_diversidad > 0:
         warnings.append(f"S5 Diversidad talleres: {empresas_diversidad} empresas (excluye escuelas propias >=6 talleres)")
+
+    # ─── V16 ─ SOFT franja_horaria / franja_por_dia penalty ──
+    # Mirrors S3 (turno preferido) magnitude — `peso_turno_preferido` —
+    # since franja is conceptually a tighter horario preference of the same
+    # type. HARD variants are already enforced by the pre-filter above.
+    s_franja_empresas = 0
+    for e in empresa_ids:
+        rest_empresa = rest_por_empresa.get(e, [])
+        # Skip empresa entirely if no franja restriction declared
+        if not any(r.get("clave") in ("franja_horaria", "franja_por_dia") for r in rest_empresa):
+            continue
+        s_franja_empresas += 1
+
+        # Penalize only over candidates the empresa can actually take.
+        for s in SEMANAS:
+            talleres_esta_semana = talleres_disponibles_semana.get(s, set(taller_ids))
+            taller_info_semana = taller_map_semana.get(s, taller_map)
+            for t_id in talleres_esta_semana:
+                if (e, s, t_id) not in possible:
+                    continue
+                taller = taller_info_semana.get(t_id, taller_map.get(t_id))
+                if not taller:
+                    continue
+                effective_day = taller.get("diaSemana") or taller.get("dia_semana")
+                franja_pref, tipo_franja = _franja_preferida(rest_empresa, effective_day)
+                if (
+                    franja_pref is not None
+                    and tipo_franja == "SOFT"
+                    and (taller.get("horario") or "") != franja_pref
+                ):
+                    penalties.append(assign[(e, s, t_id)] * params.peso_turno_preferido)
+                    debug_stats["S_franja_penalties"] += 1
+    print(
+        f"S_franja: {debug_stats['S_franja_penalties']} franja penalties "
+        f"({s_franja_empresas} empresas con franja SOFT) [V16, weight=peso_turno_preferido]"
+    )
+    if s_franja_empresas > 0:
+        warnings.append(
+            f"S_franja: {s_franja_empresas} empresa(s) con preferencia de franja SOFT"
+        )
 
     # ═══════════════════════════════════════════════════════════
     # OPTIMIZATION 2: Generate solver hints (warm-start)

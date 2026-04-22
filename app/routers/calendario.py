@@ -32,7 +32,11 @@ from app.schemas.calendario import (
     EmpresaCambiada, CambioDetalle, ImportarExcelResult, ImportarExcelInput,
     RecalcularScoresResult,
 )
-from app.services.calendario.solver import _ejecutar_solver
+from app.services.calendario.solver import (
+    _ejecutar_solver,
+    _franja_preferida,
+    _dias_exclusivos_hard,
+)
 from app.services.calendario.post_proceso import (
     calcular_fecha_slot, _asignar_ciudades, _guardar_log,
 )
@@ -331,10 +335,10 @@ async def obtener_calendario(
     rows = [dict(r) for r in result.mappings().all()]
 
     # Compute summary stats
+    # V17: dropped OK state on planificacion. CONFIRMADO is the terminal state.
     asignados = sum(1 for r in rows if r["estado"] != "VACANTE")
     vacantes = sum(1 for r in rows if r["estado"] == "VACANTE")
-    confirmados = sum(1 for r in rows if r["confirmado"])
-    ok_count = sum(1 for r in rows if r["estado"] == "OK")
+    confirmados = sum(1 for r in rows if r["estado"] == "CONFIRMADO")
     cancelados = sum(1 for r in rows if r["estado"] == "CANCELADO")
 
     return {
@@ -343,7 +347,6 @@ async def obtener_calendario(
         "asignados": asignados,
         "vacantes": vacantes,
         "confirmados": confirmados,
-        "ok": ok_count,
         "cancelados": cancelados,
         "slots": rows,
     }
@@ -367,7 +370,9 @@ async def validar_asignacion(
     slot_result = await db.execute(
         text("""
             SELECT p.id, p.semana, p.dia, p."tallerId",
-                   t.nombre AS taller_nombre, t.programa, t.turno AS taller_turno
+                   t.nombre AS taller_nombre, t.programa,
+                   t.turno AS taller_turno,
+                   COALESCE(p.horario, t.horario) AS horario
             FROM planificacion p
             JOIN taller t ON t.id = p."tallerId"
             WHERE p.id = :slot_id AND p.trimestre = :tri
@@ -424,6 +429,41 @@ async def validar_asignacion(
                         f"solo_taller: {empresa['nombre']} solo imparte '{r['valor']}', "
                         f"pero el taller es '{slot['taller_nombre']}'"
                     )
+
+    # 5b. V16 — franja_horaria / franja_por_dia
+    # franja_por_dia for the slot's day takes priority over franja_horaria.
+    # HARD violations go to restricciones_violadas; SOFT to warnings.
+    slot_horario = slot.get("horario") or ""
+
+    # V16.1: HARD day-exclusivity from franja_por_dia. If the empresa has any
+    # HARD franja_por_dia row, the declared days are the only valid ones.
+    # This is reported BEFORE the franja-match check; the franja-match block
+    # below only emits when the franja itself is wrong, not when the day is.
+    dias_permitidos_hard = _dias_exclusivos_hard(restricciones)
+    dia_fuera_set = (
+        dias_permitidos_hard is not None
+        and slot["dia"] not in dias_permitidos_hard
+    )
+    if dia_fuera_set:
+        restricciones_violadas.append(
+            f"franja_por_dia_dia: {empresa['nombre']} tiene franja_por_dia HARD "
+            f"limitada a {sorted(dias_permitidos_hard)}, pero se asigna en {slot['dia']}"
+        )
+
+    franja_pref, tipo_franja = _franja_preferida(restricciones, slot["dia"])
+    if (
+        franja_pref is not None
+        and slot_horario != franja_pref
+        and not dia_fuera_set  # avoid double-reporting when the day itself is invalid
+    ):
+        msg = (
+            f"franja: {empresa['nombre']} requiere franja '{franja_pref}' "
+            f"el {slot['dia']}, pero el slot es de '{slot_horario}'"
+        )
+        if tipo_franja == "HARD":
+            restricciones_violadas.append(msg)
+        else:
+            warnings.append(msg)
 
     # 6. Check no_comodin (warn that this company shouldn't be used as substitute)
     for r in restricciones:
@@ -591,7 +631,8 @@ async def exportar_excel(
         })
 
     # ── 3. Contar estados para resumen ────────────────────────
-    estado_counts = {"OK": 0, "CONFIRMADO": 0, "PLANIFICADO": 0, "CANCELADO": 0, "VACANTE": 0}
+    # V17: dropped OK on planificacion. CONFIRMADO is the terminal state.
+    estado_counts = {"CONFIRMADO": 0, "PLANIFICADO": 0, "CANCELADO": 0, "VACANTE": 0}
     for r in all_rows:
         estado = r["estado"]
         if estado in estado_counts:
@@ -617,14 +658,14 @@ async def exportar_excel(
     normal_font = Font(name="Arial", size=9)
 
     # Estado-specific styles
+    # V17: OK collapsed into CONFIRMADO. CONFIRMADO inherits the former OK
+    # green palette (it is now the terminal state).
     vacante_fill = PatternFill("solid", fgColor="FEF3C7")  # amarillo suave
     vacante_font = Font(name="Arial", size=9, color="92400E", italic=True)
-    ok_fill = PatternFill("solid", fgColor="D1FAE5")  # verde suave
-    ok_font = Font(name="Arial", size=9, color="065F46")
     cancelado_fill = PatternFill("solid", fgColor="FEE2E2")  # rojo suave
     cancelado_font = Font(name="Arial", size=9, color="991B1B", strike=True)
-    confirmado_fill = PatternFill("solid", fgColor="DBEAFE")  # azul suave
-    confirmado_font = Font(name="Arial", size=9, color="1E40AF")
+    confirmado_fill = PatternFill("solid", fgColor="D1FAE5")  # verde suave
+    confirmado_font = Font(name="Arial", size=9, color="065F46")
 
     # Headers
     headers = [
@@ -666,7 +707,6 @@ async def exportar_excel(
     for i, row in enumerate(all_rows, 2):
         estado = row["estado"]
         is_vacante = estado == "VACANTE"
-        is_ok = estado == "OK"
         is_cancelado = estado == "CANCELADO"
         is_confirmado = estado == "CONFIRMADO"
 
@@ -694,9 +734,6 @@ async def exportar_excel(
             if is_vacante:
                 cell.fill = vacante_fill
                 cell.font = vacante_font
-            elif is_ok:
-                cell.fill = ok_fill
-                cell.font = ok_font
             elif is_cancelado:
                 cell.fill = cancelado_fill
                 # Only strikethrough on empresa column (6 — after adding Fecha)
@@ -710,11 +747,11 @@ async def exportar_excel(
             else:
                 cell.font = normal_font
 
-            # Semana column: center and bold
+            # Semana column: center and bold (CONFIRMADO uses former OK green)
             if col == 1:
                 cell.font = Font(
                     name="Arial", size=9, bold=True,
-                    color="92400E" if is_vacante else "065F46" if is_ok else "991B1B" if is_cancelado else "1E40AF" if is_confirmado else "000000",
+                    color="92400E" if is_vacante else "991B1B" if is_cancelado else "065F46" if is_confirmado else "000000",
                 )
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
@@ -728,7 +765,6 @@ async def exportar_excel(
         ("Total slots", total_slots),
         ("", ""),
         ("ESTADOS", ""),
-        ("OK", estado_counts["OK"]),
         ("Confirmados", estado_counts["CONFIRMADO"]),
         ("Planificados", estado_counts["PLANIFICADO"]),
         ("Cancelados", estado_counts["CANCELADO"]),
@@ -736,7 +772,7 @@ async def exportar_excel(
         ("", ""),
         ("INSTRUCCIONES", ""),
         ("1. Columna 'Empresa'", "Completar vacantes con empresa asignada"),
-        ("2. Columna 'Estado'", "OK = completado, CANCELADO = no realizado"),
+        ("2. Columna 'Estado'", "CONFIRMADO = confirmado con la empresa, CANCELADO = no realizado"),
         ("3. Columna 'Confirmado'", "SÍ = empresa confirmó asistencia"),
         ("4. Al cierre del trimestre", "Importar como histórico en el sistema"),
     ]
@@ -1020,14 +1056,15 @@ async def resumen_operacion(
     Returns operational summary for the quarter.
     """
     # Overall stats
+    # V17: estado=OK was collapsed into CONFIRMADO. Confirmados is now the
+    # terminal "completed" count for progress calculation.
     result = await db.execute(
         text("""
             SELECT
                 COUNT(*) AS total_slots,
                 SUM(CASE WHEN estado != 'VACANTE' THEN 1 ELSE 0 END) AS asignados,
                 SUM(CASE WHEN estado = 'VACANTE' THEN 1 ELSE 0 END) AS vacantes,
-                SUM(CASE WHEN confirmado = true THEN 1 ELSE 0 END) AS confirmados,
-                SUM(CASE WHEN estado = 'OK' THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN estado = 'CONFIRMADO' THEN 1 ELSE 0 END) AS confirmados,
                 SUM(CASE WHEN estado = 'CANCELADO' THEN 1 ELSE 0 END) AS cancelados
             FROM planificacion
             WHERE trimestre = :trimestre
@@ -1044,8 +1081,7 @@ async def resumen_operacion(
                 COUNT(*) AS total,
                 SUM(CASE WHEN estado != 'VACANTE' THEN 1 ELSE 0 END) AS asignados,
                 SUM(CASE WHEN estado = 'VACANTE' THEN 1 ELSE 0 END) AS vacantes,
-                SUM(CASE WHEN confirmado = true THEN 1 ELSE 0 END) AS confirmados,
-                SUM(CASE WHEN estado = 'OK' THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN estado = 'CONFIRMADO' THEN 1 ELSE 0 END) AS confirmados,
                 SUM(CASE WHEN estado = 'CANCELADO' THEN 1 ELSE 0 END) AS cancelados
             FROM planificacion
             WHERE trimestre = :trimestre
@@ -1062,8 +1098,7 @@ async def resumen_operacion(
             SELECT
                 e.nombre AS empresa,
                 COUNT(*) AS total,
-                SUM(CASE WHEN p.confirmado = true THEN 1 ELSE 0 END) AS confirmados,
-                SUM(CASE WHEN p.estado = 'OK' THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN p.estado = 'CONFIRMADO' THEN 1 ELSE 0 END) AS confirmados,
                 SUM(CASE WHEN p.estado = 'CANCELADO' THEN 1 ELSE 0 END) AS cancelados
             FROM planificacion p
             JOIN empresa e ON e.id = p."empresaId"
@@ -1075,10 +1110,10 @@ async def resumen_operacion(
     )
     by_company = [dict(r) for r in by_company_result.mappings().all()]
 
-    # Progress percentage: slots with OK or CANCELADO (finished)
+    # Progress percentage: confirmados / total (V17: confirmados now includes former-OK)
     total = totals.get("total_slots") or 0
-    finished = (totals.get("ok") or 0) + (totals.get("cancelados") or 0)
-    progress_pct = round((finished / total) * 100, 1) if total > 0 else 0
+    confirmados_count = totals.get("confirmados") or 0
+    progress_pct = round((confirmados_count / total) * 100, 1) if total > 0 else 0
 
     return {
         "trimestre": trimestre,
@@ -1154,7 +1189,7 @@ async def analisis_planificado_vs_realizado(
                     "empresa_id": eid_orig,
                     "empresa_nombre": slot["empresa_original"],
                     "asignados_solver": 0,
-                    "cumplidos": 0,       # Slot ended with this company (OK/CONFIRMADO)
+                    "cumplidos": 0,       # Slot ended with this company (CONFIRMADO)
                     "sustituida": 0,      # Slot ended with DIFFERENT company
                     "cancelados": 0,      # Slot was CANCELADO
                     "pendientes": 0,      # Slot still PLANIFICADO/CONFIRMADO
@@ -1162,7 +1197,7 @@ async def analisis_planificado_vs_realizado(
                 }
             empresas_stats[eid_orig]["asignados_solver"] += 1
 
-            if eid_final == eid_orig and estado in ("OK", "CONFIRMADO"):
+            if eid_final == eid_orig and estado == "CONFIRMADO":
                 empresas_stats[eid_orig]["cumplidos"] += 1
             elif eid_final != eid_orig and eid_final is not None:
                 empresas_stats[eid_orig]["sustituida"] += 1
@@ -1388,8 +1423,9 @@ async def importar_excel_file(
 
     # ── 5. Procesar filas del Excel ───────────────────────────
     # Estado normalization map (handles typos)
+    # V17: "OK" no longer accepted on planificacion. Rows with estado=OK
+    # surface a row-level error suggesting the user re-export.
     ESTADO_NORMALIZE = {
-        "OK": "OK",
         "CANCELADO": "CANCELADO",
         "CONFIRMADO": "CONFIRMADO",
         "CONFRIMADO": "CONFIRMADO",  # common typo
@@ -1454,9 +1490,18 @@ async def importar_excel_file(
                     # Don't skip - we can still update estado/confirmado
 
             # ── Process estado (with typo normalization) ──────
+            # V17: reject "OK" with a clear row-level error so the planner
+            # knows their Excel is stale (it must be re-exported).
             estado_nuevo = None
             if estado_val:
                 estado_raw = str(estado_val).strip().upper()
+                if estado_raw == "OK":
+                    warnings.append(
+                        f"Fila {row_num}: Estado 'OK' ya no es válido. "
+                        f"Usa 'CONFIRMADO'. Re-exporta desde la app si tienes dudas."
+                    )
+                    errores += 1
+                    continue
                 estado_nuevo = ESTADO_NORMALIZE.get(estado_raw, estado_raw)
                 # Check if it's valid after normalization
                 if estado_nuevo not in ESTADO_NORMALIZE.values():
@@ -1660,12 +1705,15 @@ async def cerrar_trimestre(
        e inserta los nuevos registros
     4. Si confirmar=False, solo devuelve un preview de lo que se cerraria
 
-    Solo se copian slots con estado OK o CANCELADO.
+    Solo se copian slots con estado CONFIRMADO o CANCELADO.
     Slots VACANTE y PLANIFICADO se ignoran (no ejecutados).
+    V17: el estado terminal en planificacion es CONFIRMADO (OK fue retirado).
+    historicoTaller mantiene su propio enum (OK | CANCELADO) para registrar
+    si el taller se llegó a impartir.
     """
     from datetime import date, timedelta
 
-    # ── 1. Leer slots con estado final (OK o CANCELADO) ──────
+    # ── 1. Leer slots con estado final (CONFIRMADO o CANCELADO) ──────
     result = await db.execute(
         text("""
             SELECT
@@ -1681,7 +1729,7 @@ async def cerrar_trimestre(
             FROM planificacion p
             LEFT JOIN ciudad c ON c.id = p."ciudadId"
             WHERE p.trimestre = :tri
-            AND p.estado IN ('OK', 'CANCELADO')
+            AND p.estado IN ('CONFIRMADO', 'CANCELADO')
             AND p."empresaId" IS NOT NULL
         """),
         {"tri": trimestre},
@@ -1693,14 +1741,14 @@ async def cerrar_trimestre(
         text("""
             SELECT COUNT(*) FROM planificacion
             WHERE trimestre = :tri
-            AND (estado NOT IN ('OK', 'CANCELADO') OR "empresaId" IS NULL)
+            AND (estado NOT IN ('CONFIRMADO', 'CANCELADO') OR "empresaId" IS NULL)
         """),
         {"tri": trimestre},
     )
     total_ignorado = ignorados_result.scalar() or 0
 
-    # ── 3. Separar OK y CANCELADO ────────────────────────────
-    slots_ok = [s for s in slots_finales if s["estado"] == "OK"]
+    # ── 3. Separar CONFIRMADO y CANCELADO ────────────────────
+    slots_ok = [s for s in slots_finales if s["estado"] == "CONFIRMADO"]
     slots_cancelado = [s for s in slots_finales if s["estado"] == "CANCELADO"]
 
     total_ok = len(slots_ok)
@@ -1710,7 +1758,7 @@ async def cerrar_trimestre(
     if total_ok == 0 and total_cancelado == 0:
         raise HTTPException(
             status_code=400,
-            detail=f"No hay slots con estado OK o CANCELADO en {trimestre}. "
+            detail=f"No hay slots con estado CONFIRMADO o CANCELADO en {trimestre}. "
                    "El trimestre parece no estar listo para cerrar.",
         )
 
@@ -1755,9 +1803,12 @@ async def cerrar_trimestre(
     )
 
     # ── 8. Insertar nuevos registros ─────────────────────────
+    # V17: planificacion.estado = CONFIRMADO maps to historicoTaller.estado = OK
+    # (the EstadoTaller enum on historicoTaller stays OK | CANCELADO — separate
+    # system that tracks "did the workshop happen", untouched by V17).
     for slot in slots_finales:
         fecha = calcular_fecha(trimestre, slot["semana"], slot["dia"])
-        estado_db = "OK" if slot["estado"] == "OK" else "CANCELADO"
+        estado_db = "OK" if slot["estado"] == "CONFIRMADO" else "CANCELADO"
 
         await db.execute(
             text("""

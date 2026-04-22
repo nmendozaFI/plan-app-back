@@ -10,11 +10,17 @@ Endpoints:
   POST   /api/restricciones/importar       → importar desde Excel
 
 Claves soportadas (clave → descripción para la UI):
-  solo_dia     → Empresa solo disponible ese día (L/M/X/J/V)
-  solo_taller  → Empresa solo imparte ese taller (FK a taller via tallerId)
-  no_comodin   → No usar como comodín en contingencias
-  max_extras   → Máximo de extras por trimestre (valor numérico)
+  solo_dia        → Empresa solo disponible ese día (L/M/X/J/V)
+  solo_taller     → Empresa solo imparte ese taller (FK a taller via tallerId)
+  no_comodin      → No usar como comodín en contingencias
+  max_extras      → Máximo de extras por trimestre (valor numérico)
+  franja_horaria  → Empresa solo imparte en una franja canónica concreta
+                    (V16: '09:30-11:30' | '12:00-14:00' | '15:00-17:00')
+  franja_por_dia  → Empresa solo imparte en cierta franja un día concreto
+                    (V16: 'D:HH:MM-HH:MM', máx una por (empresa, día))
 """
+
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,9 +56,22 @@ class RestriccionOut(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────
 
-CLAVES_VALIDAS = {"solo_dia", "solo_taller", "no_comodin", "max_extras"}
+CLAVES_VALIDAS = {
+    "solo_dia",
+    "solo_taller",
+    "no_comodin",
+    "max_extras",
+    "franja_horaria",   # V16
+    "franja_por_dia",   # V16
+}
 TIPOS_VALIDOS  = {"HARD", "SOFT"}
-DIAS_VALIDOS   = {"L", "M", "X", "J", "V"}
+DIAS_VALIDOS   = frozenset({"L", "M", "X", "J", "V"})
+FRANJAS_CANONICAS = frozenset({"09:30-11:30", "12:00-14:00", "15:00-17:00"})
+
+# Strict regexes for V16 franja keys
+_RE_FRANJA_HORARIA = re.compile(r"^(09:30-11:30|12:00-14:00|15:00-17:00)$")
+_RE_FRANJA_POR_DIA = re.compile(r"^[LMXJV]:(09:30-11:30|12:00-14:00|15:00-17:00)$")
+
 
 def _validar(data: RestriccionIn):
     if data.tipo not in TIPOS_VALIDOS:
@@ -76,6 +95,18 @@ def _validar(data: RestriccionIn):
         raise HTTPException(
             400,
             "Para solo_taller es obligatorio `taller_id` (FK a taller del catálogo)"
+        )
+    if data.clave == "franja_horaria" and not _RE_FRANJA_HORARIA.match(data.valor or ""):
+        raise HTTPException(
+            400,
+            "franja_horaria requiere valor exacto entre "
+            "'09:30-11:30', '12:00-14:00', '15:00-17:00'",
+        )
+    if data.clave == "franja_por_dia" and not _RE_FRANJA_POR_DIA.match(data.valor or ""):
+        raise HTTPException(
+            400,
+            "franja_por_dia requiere formato 'D:HH:MM-HH:MM' con "
+            "D ∈ {L,M,X,J,V} y franja canónica",
         )
 
 
@@ -248,6 +279,19 @@ async def importar_restricciones(
             if clave == "solo_dia" and valor.upper() not in DIAS_VALIDOS:
                 errores.append(f"Fila {i}: día '{valor}' inválido para solo_dia")
                 continue
+            # V16: franja keys with strict regex (single source of truth = _validar)
+            if clave == "franja_horaria" and not _RE_FRANJA_HORARIA.match(valor):
+                errores.append(
+                    f"Fila {i}: franja_horaria '{valor}' no es canónica. "
+                    f"Usar 09:30-11:30 | 12:00-14:00 | 15:00-17:00"
+                )
+                continue
+            if clave == "franja_por_dia" and not _RE_FRANJA_POR_DIA.match(valor):
+                errores.append(
+                    f"Fila {i}: franja_por_dia '{valor}' inválida. "
+                    f"Formato esperado 'D:HH:MM-HH:MM' con D ∈ L,M,X,J,V y franja canónica"
+                )
+                continue
 
             # Resolve solo_taller → tallerId (exact, case-insensitive)
             taller_id = None
@@ -340,6 +384,42 @@ async def crear_restriccion(
         # Keep valor in sync with the canonical taller name (helps backward compat)
         valor_final = taller_nombre_ref
 
+    # V16 uniqueness for franja_horaria: at most one per empresa
+    if data.clave == "franja_horaria":
+        existing = await db.execute(
+            text("""
+                SELECT id, valor FROM restriccion
+                WHERE "empresaId" = :eid AND clave = 'franja_horaria'
+            """),
+            {"eid": empresa_id},
+        )
+        row = existing.mappings().first()
+        if row:
+            raise HTTPException(
+                409,
+                f"La empresa ya tiene una franja_horaria activa "
+                f"(id={row['id']}, valor='{row['valor']}'). Edita o elimina la existente.",
+            )
+
+    # V16 uniqueness for franja_por_dia: at most one per (empresa, día)
+    if data.clave == "franja_por_dia":
+        dia_letter = (data.valor or "").split(":", 1)[0]
+        existing = await db.execute(
+            text("""
+                SELECT id, valor FROM restriccion
+                WHERE "empresaId" = :eid AND clave = 'franja_por_dia'
+                  AND valor LIKE :dia_prefix
+            """),
+            {"eid": empresa_id, "dia_prefix": f"{dia_letter}:%"},
+        )
+        row = existing.mappings().first()
+        if row:
+            raise HTTPException(
+                409,
+                f"La empresa ya tiene una franja_por_dia para el día {dia_letter} "
+                f"(id={row['id']}, valor='{row['valor']}'). Edita o elimina la existente.",
+            )
+
     dup = await db.execute(
         text("""
             SELECT id FROM restriccion
@@ -412,6 +492,46 @@ async def editar_restriccion(
     if data.clave == "solo_taller":
         taller_nombre_ref = await _verificar_taller(db, data.taller_id)  # type: ignore[arg-type]
         valor_final = taller_nombre_ref
+
+    # V16 uniqueness for franja_horaria (excluding self)
+    if data.clave == "franja_horaria":
+        existing = await db.execute(
+            text("""
+                SELECT id, valor FROM restriccion
+                WHERE "empresaId" = :eid AND clave = 'franja_horaria' AND id != :rid
+            """),
+            {"eid": row["empresaId"], "rid": restriccion_id},
+        )
+        clash = existing.mappings().first()
+        if clash:
+            raise HTTPException(
+                409,
+                f"La empresa ya tiene otra franja_horaria activa "
+                f"(id={clash['id']}, valor='{clash['valor']}').",
+            )
+
+    # V16 uniqueness for franja_por_dia (excluding self)
+    if data.clave == "franja_por_dia":
+        dia_letter = (data.valor or "").split(":", 1)[0]
+        existing = await db.execute(
+            text("""
+                SELECT id, valor FROM restriccion
+                WHERE "empresaId" = :eid AND clave = 'franja_por_dia'
+                  AND valor LIKE :dia_prefix AND id != :rid
+            """),
+            {
+                "eid": row["empresaId"],
+                "dia_prefix": f"{dia_letter}:%",
+                "rid": restriccion_id,
+            },
+        )
+        clash = existing.mappings().first()
+        if clash:
+            raise HTTPException(
+                409,
+                f"La empresa ya tiene otra franja_por_dia para el día {dia_letter} "
+                f"(id={clash['id']}, valor='{clash['valor']}').",
+            )
 
     await db.execute(
         text("""
