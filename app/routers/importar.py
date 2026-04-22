@@ -97,6 +97,8 @@ HEADER_MAP = {
     "turnopreferido": "turnoPreferido",
     "turno": "turnoPreferido",
     "activa": "activa",
+    "esnueva": "esNueva",
+    "nueva": "esNueva",
     "notas": "notas",
     # Frecuencia solicitada — OLD format (single column = total)
     "frecuenciasolicitada": "frecuenciaSolicitada",
@@ -342,6 +344,7 @@ async def importar_empresas(
                 "tieneBolsa": _bool(_get("tieneBolsa")),
                 "turnoPreferido": _str(_get("turnoPreferido")),
                 "activa": _bool(_get("activa", "SI")),
+                "esNueva": _bool(_get("esNueva", "NO")),
                 "notas": _str(_get("notas")),
                 "ciudades": ciudades,
                 # Frequency fields
@@ -403,7 +406,8 @@ async def importar_empresas(
                         "maxExtrasTrimestre" = :maxExtrasTrimestre,
                         "prioridadReduccion" = :prioridadReduccion,
                         "tieneBolsa" = :tieneBolsa, "turnoPreferido" = :turnoPreferido,
-                        activa = :activa, notas = :notas, "updatedAt" = NOW()
+                        activa = :activa, "esNueva" = :esNueva,
+                        notas = :notas, "updatedAt" = NOW()
                     WHERE id = :id
                 """),
                 {**emp, "id": eid},
@@ -420,12 +424,12 @@ async def importar_empresas(
                         nombre, tipo, semaforo, "scoreV3", "fiabilidadReciente",
                         "esComodin", "aceptaExtras", "maxExtrasTrimestre",
                         "prioridadReduccion", "tieneBolsa", "turnoPreferido",
-                        activa, notas, "updatedAt"
+                        activa, "esNueva", notas, "updatedAt"
                     ) VALUES (
                         :nombre, :tipo, 'AMBAR', 50, 50,
                         :esComodin, :aceptaExtras, :maxExtrasTrimestre,
                         :prioridadReduccion, :tieneBolsa, :turnoPreferido,
-                        :activa, :notas, NOW()
+                        :activa, :esNueva, :notas, NOW()
                     ) RETURNING id
                 """),
                 emp,

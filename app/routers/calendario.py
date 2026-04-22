@@ -1729,6 +1729,33 @@ async def cerrar_trimestre(
 
     await db.commit()
 
+    # ── 8b. Auto-limpiar esNueva en empresas con histórico ──────
+    # Tras el primer trimestre cerrado, una empresa "nueva" ya no lo es.
+    es_nueva_result = await db.execute(
+        text('''
+            UPDATE empresa
+               SET "esNueva" = false
+             WHERE "esNueva" = true
+               AND EXISTS (
+                   SELECT 1 FROM "historicoTaller" h
+                    WHERE h."empresaId" = empresa.id
+                    LIMIT 1
+               )
+             RETURNING id, nombre
+        '''),
+    )
+    limpiadas = es_nueva_result.mappings().all()
+    for row in limpiadas:
+        try:
+            import logging
+            logging.getLogger(__name__).info(
+                f"[CIERRE_TRIMESTRE] {row['nombre']} ya no es nueva "
+                "(aparece en históricos)"
+            )
+        except Exception:
+            pass
+    await db.commit()
+
     # ── 9. Auto-calculate scores based on all historical data ────
     from app.routers.scores import calcular_scores_trimestre
 

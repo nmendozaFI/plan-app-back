@@ -12,6 +12,9 @@ Tablas Prisma (camelCase):
     "empresaCiudad", restriccion
 """
 
+import logging
+import math
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -20,7 +23,46 @@ from pydantic import BaseModel
 from app.db import get_db
 from app.routers.calendario_anual import cargar_talleres_semana
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+def _get_max_extras(empresa: dict, restricciones_empresa: list[dict]) -> int | None:
+    """
+    Returns the max extras cap for an empresa.
+    Priority: SOFT restriction 'max_extras' (trimestral override)
+              > empresa.maxExtrasTrimestre (baseline from maestro).
+    Semantics:
+      - None / NULL → no limit
+      - 0 → cap of 0 extras (receives none)
+      - N > 0 → receives up to N extras
+    """
+    override = next(
+        (
+            r for r in restricciones_empresa
+            if r.get("tipo") == "SOFT" and r.get("clave") == "max_extras"
+        ),
+        None,
+    )
+    if override and override.get("valor") not in (None, ""):
+        try:
+            return int(override["valor"])
+        except (ValueError, TypeError):
+            pass
+    return empresa.get("maxExtrasTrimestre")
+
+
+def _tiene_no_comodin(restricciones_empresa: list[dict]) -> bool:
+    """True si la empresa tiene SOFT no_comodin=true (case-insensitive)."""
+    for r in restricciones_empresa:
+        if (
+            r.get("tipo") == "SOFT"
+            and r.get("clave") == "no_comodin"
+            and str(r.get("valor", "")).strip().lower() == "true"
+        ):
+            return True
+    return False
 
 
 # ── Schemas ──────────────────────────────────────────────────
@@ -204,7 +246,8 @@ async def calcular_frecuencias(
                    e."aceptaExtras",
                    e."maxExtrasTrimestre",
                    e."prioridadReduccion",
-                   e."tieneBolsa"
+                   e."tieneBolsa",
+                   e."esNueva"
             FROM "configTrimestral" ct
             JOIN empresa e ON e.id = ct."empresaId"
             WHERE ct.trimestre = :trimestre
@@ -294,23 +337,9 @@ async def calcular_frecuencias(
         eid = cfg["empresaId"]
         score = cfg["scoreV3"]
         semaforo = _calcular_semaforo(score)
+        es_nueva = bool(cfg.get("esNueva") or False)
 
-        # Ajuste por desempeño previo
-        ajuste = 0.0
-        if eid in desempeno_anterior:
-            desv = desempeno_anterior[eid]
-            if desv <= -2:
-                ajuste = -1.0
-                warnings.append(
-                    f"{cfg['nombre']}: desviación {desv} en Q anterior → reducción -1"
-                )
-            elif desv < 0:
-                ajuste = -0.5
-                warnings.append(
-                    f"{cfg['nombre']}: desviación {desv} en Q anterior → reducción -0.5"
-                )
-
-        # Frecuencia base — check for explicit EF/IT split first
+        # ── Frecuencia base (SIN ajuste todavía) ──────────────
         explicit_ef = cfg.get("frecuenciaEF")
         explicit_it = cfg.get("frecuenciaIT")
 
@@ -318,28 +347,9 @@ async def calcular_frecuencias(
             # NEW format: use explicit EF/IT values from master import
             ef = (explicit_ef or 0)
             it = (explicit_it or 0)
-            freq_total = ef + it
-            # Apply performance adjustment proportionally
-            if ajuste != 0 and freq_total > 0:
-                adj_ef = int(ef * ajuste / freq_total) if ef > 0 else 0
-                adj_it = int(it * ajuste / freq_total) if it > 0 else 0
-                ef = max(0, ef + adj_ef)
-                it = max(0, it + adj_it)
-                freq_total = ef + it
-            freq_total = max(1, freq_total)
-            # Ensure at least 1 total if both would be 0
-            if ef == 0 and it == 0:
-                if cfg["tipoParticipacion"] == "EF":
-                    ef = 1
-                elif cfg["tipoParticipacion"] == "IT":
-                    it = 1
-                else:
-                    ef = 1
-                freq_total = ef + it
         elif cfg["frecuenciaSolicitada"] is not None:
             # OLD format: total only, split proportionally
             freq_total = cfg["frecuenciaSolicitada"]
-            freq_total = max(1, int(freq_total + ajuste))
             ef, it = _repartir_ef_it(freq_total, cfg["tipoParticipacion"])
         else:
             # No explicit frequency: calculate from score/semaforo
@@ -349,8 +359,93 @@ async def calcular_frecuencias(
                 score=score,
                 escuela_propia=cfg["escuelaPropia"],
             )
-            freq_total = max(1, int(freq_total + ajuste))
             ef, it = _repartir_ef_it(freq_total, cfg["tipoParticipacion"])
+
+        # ── Reducción -50% a empresas esNueva ─────────────────
+        # Antes del ajuste por desempeño: empresa nueva recibe la mitad el primer año.
+        if es_nueva:
+            ef = math.floor(ef * 0.5)
+            it = math.floor(it * 0.5)
+            # Preservar invariante: mínimo 1 total
+            if ef + it < 1:
+                if cfg["tipoParticipacion"] == "IT":
+                    it = 1
+                else:
+                    ef = 1
+            logger.info(
+                f"[NUEVA] {cfg['nombre']}: reducción 50% aplicada → "
+                f"EF={ef}, IT={it}"
+            )
+            warnings.append(
+                f"{cfg['nombre']}: empresa nueva → reducción 50% "
+                f"(EF={ef}, IT={it})"
+            )
+
+        # ── Ajuste por desempeño previo (matriz por semáforo) ─
+        # desv = impartidos - asignados (trimestral, del Q cerrado anterior)
+        #   > 0 → over-delivered (hicieron más de lo asignado)
+        #   < 0 → under-delivered
+        ajuste = 0
+        if eid in desempeno_anterior:
+            desv = desempeno_anterior[eid]
+
+            if semaforo == "VERDE":
+                # Dead zone [-0.25, +0.25] → nada
+                if desv > 0.25:
+                    ajuste = -1
+                elif desv < -0.25:
+                    ajuste = +1
+            elif semaforo == "AMBAR":
+                # Dead zone [-0.5, +0.5] → nada
+                if desv > 0.5:
+                    ajuste = -1 if abs(desv) <= 1 else -2
+                elif desv < -0.5:
+                    ajuste = +1 if abs(desv) <= 1 else +2
+            else:  # ROJO
+                # Solo penalizaciones; nunca premiar
+                if desv > 0:
+                    ajuste = -1 if desv <= 1 else -2
+                # desv <= 0 → no change
+
+            if ajuste != 0:
+                logger.info(
+                    f"[PERF] {cfg['nombre']} ({semaforo}) dev={desv} → "
+                    f"ajuste={ajuste:+d}"
+                )
+                warnings.append(
+                    f"{cfg['nombre']}: semáforo {semaforo}, "
+                    f"desviación {desv} en Q anterior → ajuste {ajuste:+d}"
+                )
+
+                # Aplicar al total (EF+IT) y dividir proporcionalmente
+                total_actual = ef + it
+                nuevo_total = max(1, total_actual + ajuste)
+                delta = nuevo_total - total_actual
+                if delta != 0 and total_actual > 0:
+                    # Reparte proporcional: mayor mitad a EF si AMBAS
+                    if cfg["tipoParticipacion"] == "EF":
+                        ef = max(0, ef + delta)
+                    elif cfg["tipoParticipacion"] == "IT":
+                        it = max(0, it + delta)
+                    else:
+                        # Proporcional: EF = round(nuevo_total * ef / total_actual)
+                        prop_ef = round(nuevo_total * ef / total_actual)
+                        ef = max(0, prop_ef)
+                        it = max(0, nuevo_total - ef)
+                elif delta != 0:
+                    # total_actual == 0 — caso raro
+                    if cfg["tipoParticipacion"] == "IT":
+                        it = max(0, it + delta)
+                    else:
+                        ef = max(0, ef + delta)
+
+        # Invariante mínimo: al menos 1 total si la empresa está activa
+        if ef + it < 1:
+            if cfg["tipoParticipacion"] == "IT":
+                it = 1
+            else:
+                ef = 1
+        freq_total = ef + it
 
         # ── Fix: solo_taller fuerza programa ──────────────────
         # Si la empresa tiene restricción solo_taller y ese taller
@@ -400,8 +495,8 @@ async def calcular_frecuencias(
             "total": ef + it,
             "semaforo": semaforo,
             "score": round(score, 1),
-            "ajuste_desempeno": ajuste,
-            "es_nueva": False,
+            "ajuste_desempeno": float(ajuste),
+            "es_nueva": es_nueva,
             "es_comodin": cfg["esComodin"],
             "prioridad_reduccion": cfg["prioridadReduccion"],
             "ciudades_activas": ciudades_map.get(eid, []),
@@ -409,6 +504,8 @@ async def calcular_frecuencias(
             # Metadata para redistribución
             "_slots_it_liberados": slots_it_liberados,
             "_slots_ef_liberados": slots_ef_liberados,
+            "_max_extras_trimestre": cfg.get("maxExtrasTrimestre"),
+            "_extras_asignados": 0,
         })
 
     # ── 5b. Redistribuir slots liberados por solo_taller ──────
@@ -429,6 +526,8 @@ async def calcular_frecuencias(
     for e in empresas_bruto:
         e.pop("_slots_it_liberados", None)
         e.pop("_slots_ef_liberados", None)
+        e.pop("_max_extras_trimestre", None)
+        e.pop("_extras_asignados", None)
 
     # ── 6. Recorte para encajar en modelo trimestral ─────────
     # Límite = slots_por_semana × semanas_disponibles (no por semana)
@@ -639,14 +738,18 @@ def _aplicar_recortes(
     """
     recortes: list[RecorteDetalle] = []
 
-    # Orden de recorte: ALTA → MEDIA, comodines primero, menor score primero
+    # Orden de recorte:
+    #   1. Prioridad: ALTA → MEDIA (BAJA nunca se recorta)
+    #   2. Semáforo dentro del tier: Rojo → Ámbar → Verde (Verde protegido)
+    #   3. Menor score primero (menos "merecen" mantener)
     PRIORIDAD_ORDEN = {"ALTA": 0, "MEDIA": 1, "BAJA": 2}
+    SEMAFORO_RECORTE = {"ROJO": 0, "AMBAR": 1, "VERDE": 2}
 
     candidatos = sorted(
         empresas,
         key=lambda e: (
             PRIORIDAD_ORDEN.get(e["prioridad_reduccion"], 2),
-            0 if e["es_comodin"] else 1,
+            SEMAFORO_RECORTE.get(e["semaforo"], 2),
             e["score"],
         ),
     )
@@ -749,22 +852,29 @@ def _calcular_frecuencia_base(
     score: float,
     escuela_propia: bool,
 ) -> int:
+    """
+    Base frequency per planner doc (recalibrated):
+      - AMBAS: 3 (was 4)
+      - EF: 3
+      - IT: 2
+      - Verde bonus: 0 (was +1; Verde ya protegida en recortes)
+      - Rojo penalty: -2 (was -1; reducción estructural más agresiva)
+      - Own-school bonus: +1
+    """
     if tipo == "AMBAS":
-        base = 4
+        base = 3
     elif tipo == "EF":
         base = 3
     else:
         base = 2
 
-    if semaforo == "VERDE":
-        base += 1
-    elif semaforo == "ROJO":
-        base = max(1, base - 1)
+    if semaforo == "ROJO":
+        base -= 2
 
     if escuela_propia:
         base += 1
 
-    return base
+    return max(1, base)
 
 
 def _repartir_ef_it(total: int, tipo: str) -> tuple[int, int]:
@@ -801,46 +911,40 @@ def _redistribuir_slots_liberados(
     warnings: list[str],
 ) -> None:
     """
-    Redistribuye slots liberados por restricción solo_taller a otras empresas.
+    Redistribuye slots liberados por restricción solo_taller.
 
-    Prioridades (reflejo del criterio real del planificador):
-    1. Contratantes / EF propias (prioridad BAJA = protegidas) — garantizar compromisos
-    2. Verde/Ámbar + comodín — fiables y flexibles
-    3. Resto por score descendente
-
-    Solo se da slot extra a empresas que:
-    - Participan en el programa correspondiente (tipo AMBAS o el programa específico)
-    - No tienen restricción solo_taller que lo impida
-    - Están activas
+    Pool de candidatos: empresas con esComodin=True AND sin SOFT no_comodin=true.
+    Dentro del pool se mantiene la prioridad anterior (BAJA → semáforo → score),
+    aplicando además el cap de _get_max_extras (SOFT max_extras > maxExtrasTrimestre).
     """
 
-    def _tiene_solo_taller_programa(emp: dict, programa: str) -> bool:
-        """True si la empresa tiene solo_taller de un programa DIFERENTE."""
-        for r in emp.get("restricciones", []):
-            if r["clave"] == "solo_taller":
-                # Si tiene solo_taller, solo puede recibir del mismo programa
-                # que su taller forzado — esto se resuelve más arriba,
-                # aquí simplemente excluimos
-                return True
-        return False
+    def _tiene_solo_taller(emp: dict) -> bool:
+        return any(
+            r.get("clave") == "solo_taller"
+            for r in emp.get("restricciones", [])
+        )
 
-    def _puede_recibir(emp: dict, programa: str) -> bool:
-        """Verifica si la empresa puede recibir un slot extra del programa dado."""
-        if _tiene_solo_taller_programa(emp, programa):
+    def _cap(emp: dict) -> int | None:
+        """None = sin límite; 0 = no recibe nada."""
+        return _get_max_extras(
+            {"maxExtrasTrimestre": emp.get("_max_extras_trimestre")},
+            emp.get("restricciones", []),
+        )
+
+    def _puede_recibir(emp: dict) -> bool:
+        if not emp.get("es_comodin"):
             return False
-        # Verificar tipo de participación
-        tipo = None  # noqa: F841
-        for r in emp.get("restricciones", []):
-            pass  # tipo viene del campo directo
-        # Usamos los talleres actuales como proxy: si ya tiene IT>0 o EF>0, puede recibir
-        if programa == "IT":
-            # Puede recibir IT si no es solo-EF
-            # Heurística: si talleres_it >= 0 y no tiene restricción contraria
-            return True
-        else:
-            return True
+        if _tiene_no_comodin(emp.get("restricciones", [])):
+            return False
+        if _tiene_solo_taller(emp):
+            return False
+        cap = _cap(emp)
+        if cap is not None and emp.get("_extras_asignados", 0) >= cap:
+            return False
+        return True
 
-    # Orden de prioridad para recibir slots extras
+    # Prioridad dentro del pool de comodines elegibles:
+    #   BAJA contratantes → comodines → Verde/Ámbar → mayor score primero
     PRIORIDAD_RECEPCION = {"BAJA": 0, "MEDIA": 1, "ALTA": 2}
     SEMAFORO_ORDEN = {"VERDE": 0, "AMBAR": 1, "ROJO": 2}
 
@@ -850,50 +954,47 @@ def _redistribuir_slots_liberados(
             PRIORIDAD_RECEPCION.get(e["prioridad_reduccion"], 2),
             0 if e["es_comodin"] else 1,
             SEMAFORO_ORDEN.get(e["semaforo"], 2),
-            -e["score"],  # mayor score primero
+            -e["score"],
         ),
     )
 
-    # ── Redistribuir IT ──────────────────────────────────────
-    it_pendiente = it_libres
-    for emp in candidatos:
-        if it_pendiente <= 0:
-            break
-        if not _puede_recibir(emp, "IT"):
-            continue
-        # Empresas con solo_taller ya fueron excluidas por _puede_recibir
-        # No dar más de 1 extra por empresa en redistribución
-        emp["talleres_it"] += 1
-        emp["total"] = emp["talleres_ef"] + emp["talleres_it"]
-        it_pendiente -= 1
-        warnings.append(
-            f"{emp['nombre']}: recibe +1 IT redistribuido "
-            f"(slot liberado por restricción solo_taller)"
-        )
+    def _asignar(programa: str, libres: int) -> int:
+        pendiente = libres
+        for emp in candidatos:
+            if pendiente <= 0:
+                break
+            if not _puede_recibir(emp):
+                continue
+            cap = _cap(emp)
+            if cap is not None:
+                disponible = cap - emp.get("_extras_asignados", 0)
+                if disponible <= 0:
+                    continue
+            if programa == "IT":
+                emp["talleres_it"] += 1
+            else:
+                emp["talleres_ef"] += 1
+            emp["total"] = emp["talleres_ef"] + emp["talleres_it"]
+            emp["_extras_asignados"] = emp.get("_extras_asignados", 0) + 1
+            pendiente -= 1
+            warnings.append(
+                f"{emp['nombre']}: recibe +1 {programa} redistribuido "
+                f"(slot liberado por restricción solo_taller)"
+            )
+        return pendiente
 
+    it_pendiente = _asignar("IT", it_libres)
     if it_pendiente > 0:
         warnings.append(
-            f"⚠ No se pudieron redistribuir {it_pendiente} slot(s) IT. "
+            f"⚠ No se pudieron redistribuir {it_pendiente} slot(s) IT "
+            f"(pool de comodines elegibles agotado o max_extras alcanzado). "
             "Requiere ajuste manual."
         )
 
-    # ── Redistribuir EF ──────────────────────────────────────
-    ef_pendiente = ef_libres
-    for emp in candidatos:
-        if ef_pendiente <= 0:
-            break
-        if not _puede_recibir(emp, "EF"):
-            continue
-        emp["talleres_ef"] += 1
-        emp["total"] = emp["talleres_ef"] + emp["talleres_it"]
-        ef_pendiente -= 1
-        warnings.append(
-            f"{emp['nombre']}: recibe +1 EF redistribuido "
-            f"(slot liberado por restricción solo_taller)"
-        )
-
+    ef_pendiente = _asignar("EF", ef_libres)
     if ef_pendiente > 0:
         warnings.append(
-            f"⚠ No se pudieron redistribuir {ef_pendiente} slot(s) EF. "
+            f"⚠ No se pudieron redistribuir {ef_pendiente} slot(s) EF "
+            f"(pool de comodines elegibles agotado o max_extras alcanzado). "
             "Requiere ajuste manual."
         )
