@@ -11,7 +11,7 @@ Endpoints:
 
 Claves soportadas (clave → descripción para la UI):
   solo_dia     → Empresa solo disponible ese día (L/M/X/J/V)
-  solo_taller  → Empresa solo imparte ese taller (nombre del taller)
+  solo_taller  → Empresa solo imparte ese taller (FK a taller via tallerId)
   no_comodin   → No usar como comodín en contingencias
   max_extras   → Máximo de extras por trimestre (valor numérico)
 """
@@ -32,6 +32,7 @@ class RestriccionIn(BaseModel):
     tipo: str        # "HARD" | "SOFT"
     clave: str       # "solo_dia" | "solo_taller" | "no_comodin" | "max_extras"
     valor: str       # "V" | "Gestión de ingresos" | "true" | "1"
+    taller_id: int | None = None  # FK to taller, required for solo_taller
     descripcion: str | None = None
 
 
@@ -42,6 +43,8 @@ class RestriccionOut(BaseModel):
     tipo: str
     clave: str
     valor: str
+    taller_id: int | None = None
+    taller_nombre_ref: str | None = None
     descripcion: str | None
 
 
@@ -69,6 +72,25 @@ def _validar(data: RestriccionIn):
             int(data.valor)
         except ValueError:
             raise HTTPException(400, "Para max_extras el valor debe ser un número entero")
+    if data.clave == "solo_taller" and data.taller_id is None:
+        raise HTTPException(
+            400,
+            "Para solo_taller es obligatorio `taller_id` (FK a taller del catálogo)"
+        )
+
+
+async def _verificar_taller(db: AsyncSession, taller_id: int) -> str:
+    """Verify taller exists and is active. Returns taller name for valor sync."""
+    result = await db.execute(
+        text("SELECT nombre, activo FROM taller WHERE id = :id"),
+        {"id": taller_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(400, f"Taller {taller_id} no encontrado en el catálogo")
+    if not row["activo"]:
+        raise HTTPException(400, f"Taller {taller_id} ('{row['nombre']}') no está activo")
+    return row["nombre"]
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -81,9 +103,11 @@ async def listar_todas(
     """Lista todas las restricciones, opcionalmente filtradas por empresa."""
     q = """
         SELECT r.id, r."empresaId" AS empresa_id, e.nombre AS empresa_nombre,
-               r.tipo, r.clave, r.valor, r.descripcion
+               r.tipo, r.clave, r.valor, r."tallerId" AS taller_id,
+               tl.nombre AS taller_nombre_ref, r.descripcion
         FROM restriccion r
         JOIN empresa e ON e.id = r."empresaId"
+        LEFT JOIN taller tl ON tl.id = r."tallerId"
     """
     params: dict = {}
     if empresa_id is not None:
@@ -111,9 +135,11 @@ async def listar_por_empresa(
     result = await db.execute(
         text("""
             SELECT r.id, r."empresaId" AS empresa_id, e.nombre AS empresa_nombre,
-                   r.tipo, r.clave, r.valor, r.descripcion
+                   r.tipo, r.clave, r.valor, r."tallerId" AS taller_id,
+                   tl.nombre AS taller_nombre_ref, r.descripcion
             FROM restriccion r
             JOIN empresa e ON e.id = r."empresaId"
+            LEFT JOIN taller tl ON tl.id = r."tallerId"
             WHERE r."empresaId" = :eid
             ORDER BY r.tipo, r.clave
         """),
@@ -129,7 +155,7 @@ async def importar_restricciones(
 ):
     """
     Importa restricciones desde un archivo Excel.
-    
+
     Columnas esperadas:
       nombre       → nombre de la empresa (debe existir en BD)
       tipo         → HARD | SOFT
@@ -137,6 +163,10 @@ async def importar_restricciones(
       valor        → V, nombre del taller, true, 1, etc.
       trimestre    → (opcional) para contexto, no se usa en la restricción
       descripcion  → (opcional) nota interna
+
+    Para `solo_taller` se intenta resolver `valor` (nombre del taller) a
+    `tallerId` consultando el catálogo. Si no se encuentra coincidencia,
+    se inserta la fila con `tallerId=NULL` y se añade un warning.
     """
     import openpyxl
     from io import BytesIO
@@ -168,6 +198,15 @@ async def importar_restricciones(
     for r in emp_result.mappings().all():
         # Normalizar: trim, uppercase para matching flexible
         empresa_map[r["nombre"].strip().upper()] = r["id"]
+
+    # Cargar talleres activos para resolver solo_taller → tallerId
+    taller_result = await db.execute(
+        text("SELECT id, nombre FROM taller WHERE activo = true")
+    )
+    taller_map = {
+        r["nombre"].strip().lower(): r["id"]
+        for r in taller_result.mappings().all()
+    }
 
     creadas = 0
     actualizadas = 0
@@ -210,6 +249,16 @@ async def importar_restricciones(
                 errores.append(f"Fila {i}: día '{valor}' inválido para solo_dia")
                 continue
 
+            # Resolve solo_taller → tallerId (exact, case-insensitive)
+            taller_id = None
+            if clave == "solo_taller":
+                taller_id = taller_map.get(valor.strip().lower())
+                if taller_id is None:
+                    errores.append(
+                        f"Fila {i}: taller '{valor}' no encontrado en catálogo — "
+                        f"tallerId queda NULL. Edite manualmente desde la UI."
+                    )
+
             # Check duplicado
             dup = await db.execute(
                 text("""
@@ -221,27 +270,33 @@ async def importar_restricciones(
             existing = dup.mappings().first()
 
             if existing:
-                # Actualizar tipo y descripcion si cambian
+                # Actualizar tipo, descripcion y tallerId si cambian
                 await db.execute(
                     text("""
                         UPDATE restriccion
-                        SET tipo = :tipo, descripcion = :desc
+                        SET tipo = :tipo, descripcion = :desc, "tallerId" = :tid
                         WHERE id = :id
                     """),
-                    {"tipo": tipo, "desc": descripcion or None, "id": existing["id"]},
+                    {
+                        "tipo": tipo,
+                        "desc": descripcion or None,
+                        "tid": taller_id,
+                        "id": existing["id"],
+                    },
                 )
                 actualizadas += 1
             else:
                 await db.execute(
                     text("""
-                        INSERT INTO restriccion ("empresaId", tipo, clave, valor, descripcion)
-                        VALUES (:eid, :tipo, :clave, :valor, :desc)
+                        INSERT INTO restriccion ("empresaId", tipo, clave, valor, "tallerId", descripcion)
+                        VALUES (:eid, :tipo, :clave, :valor, :tid, :desc)
                     """),
                     {
                         "eid": empresa_id,
                         "tipo": tipo,
                         "clave": clave,
                         "valor": valor,
+                        "tid": taller_id,
                         "desc": descripcion or None,
                     },
                 )
@@ -277,30 +332,39 @@ async def crear_restriccion(
     if not emp_row:
         raise HTTPException(404, f"Empresa {empresa_id} no encontrada")
 
+    # For solo_taller, validate taller exists and sync valor with the taller's nombre
+    taller_nombre_ref: str | None = None
+    valor_final = data.valor
+    if data.clave == "solo_taller":
+        taller_nombre_ref = await _verificar_taller(db, data.taller_id)  # type: ignore[arg-type]
+        # Keep valor in sync with the canonical taller name (helps backward compat)
+        valor_final = taller_nombre_ref
+
     dup = await db.execute(
         text("""
             SELECT id FROM restriccion
             WHERE "empresaId" = :eid AND clave = :clave AND valor = :valor
         """),
-        {"eid": empresa_id, "clave": data.clave, "valor": data.valor},
+        {"eid": empresa_id, "clave": data.clave, "valor": valor_final},
     )
     if dup.mappings().first():
         raise HTTPException(
             409,
-            f"Ya existe una restricción '{data.clave}={data.valor}' para esta empresa"
+            f"Ya existe una restricción '{data.clave}={valor_final}' para esta empresa"
         )
 
     result = await db.execute(
         text("""
-            INSERT INTO restriccion ("empresaId", tipo, clave, valor, descripcion)
-            VALUES (:eid, :tipo, :clave, :valor, :desc)
+            INSERT INTO restriccion ("empresaId", tipo, clave, valor, "tallerId", descripcion)
+            VALUES (:eid, :tipo, :clave, :valor, :tid, :desc)
             RETURNING id
         """),
         {
             "eid": empresa_id,
             "tipo": data.tipo,
             "clave": data.clave,
-            "valor": data.valor,
+            "valor": valor_final,
+            "tid": data.taller_id,
             "desc": data.descripcion,
         },
     )
@@ -313,7 +377,9 @@ async def crear_restriccion(
         "empresa_nombre": emp_row["nombre"],
         "tipo": data.tipo,
         "clave": data.clave,
-        "valor": data.valor,
+        "valor": valor_final,
+        "taller_id": data.taller_id,
+        "taller_nombre_ref": taller_nombre_ref,
         "descripcion": data.descripcion,
     }
 
@@ -340,16 +406,25 @@ async def editar_restriccion(
     if not row:
         raise HTTPException(404, f"Restricción {restriccion_id} no encontrada")
 
+    # For solo_taller, validate taller exists and sync valor
+    taller_nombre_ref: str | None = None
+    valor_final = data.valor
+    if data.clave == "solo_taller":
+        taller_nombre_ref = await _verificar_taller(db, data.taller_id)  # type: ignore[arg-type]
+        valor_final = taller_nombre_ref
+
     await db.execute(
         text("""
             UPDATE restriccion
-            SET tipo = :tipo, clave = :clave, valor = :valor, descripcion = :desc
+            SET tipo = :tipo, clave = :clave, valor = :valor,
+                "tallerId" = :tid, descripcion = :desc
             WHERE id = :id
         """),
         {
             "tipo": data.tipo,
             "clave": data.clave,
-            "valor": data.valor,
+            "valor": valor_final,
+            "tid": data.taller_id,
             "desc": data.descripcion,
             "id": restriccion_id,
         },
@@ -362,7 +437,9 @@ async def editar_restriccion(
         "empresa_nombre": row["empresa_nombre"],
         "tipo": data.tipo,
         "clave": data.clave,
-        "valor": data.valor,
+        "valor": valor_final,
+        "taller_id": data.taller_id,
+        "taller_nombre_ref": taller_nombre_ref,
         "descripcion": data.descripcion,
     }
 

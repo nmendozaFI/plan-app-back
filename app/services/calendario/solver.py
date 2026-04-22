@@ -221,19 +221,23 @@ def _ejecutar_solver(
         else:
             dias_disponibles[eid] = disponibilidad_map.get(eid, ["L", "M", "X", "J", "V"])
 
-    # Solo_taller por empresa (nombre → taller_ids que coincidan)
+    # Solo_taller por empresa: prioriza tallerId (FK). Si NULL, fallback al
+    # match fuzzy por nombre (compatibilidad con filas legadas pre-V15).
     solo_taller_ids: dict[int, list[int]] = {}
     for eid in empresa_ids:
         for r in rest_por_empresa.get(eid, []):
             if r["clave"] == "solo_taller":
-                nombre = r["valor"].strip().lower()
-                matching = [
-                    t["id"] for t in talleres
-                    if nombre in t["nombre"].strip().lower()
-                    or t["nombre"].strip().lower() in nombre
-                ]
-                if matching:
-                    solo_taller_ids[eid] = matching
+                if r.get("tallerId") is not None:
+                    solo_taller_ids.setdefault(eid, []).append(r["tallerId"])
+                else:
+                    nombre = r["valor"].strip().lower()
+                    matching = [
+                        t["id"] for t in talleres
+                        if nombre in t["nombre"].strip().lower()
+                        or t["nombre"].strip().lower() in nombre
+                    ]
+                    if matching:
+                        solo_taller_ids.setdefault(eid, []).extend(matching)
 
     # No_comodin: empresas excluidas de contingencias (para post-proceso y sugerencias)
     no_comodin_ids: set[int] = set()

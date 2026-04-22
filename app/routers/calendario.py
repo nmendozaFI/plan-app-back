@@ -76,7 +76,7 @@ async def generar_calendario(
 
     # ── 2. Restricciones ─────────────────────────────────────
     rest_result = await db.execute(
-        text('SELECT "empresaId", tipo, clave, valor FROM restriccion')
+        text('SELECT "empresaId", tipo, clave, valor, "tallerId" FROM restriccion')
     )
     restricciones = [dict(r) for r in rest_result.mappings().all()]
 
@@ -392,7 +392,7 @@ async def validar_asignacion(
 
     # 3. Get restrictions for this company
     rest_result = await db.execute(
-        text('SELECT tipo, clave, valor FROM restriccion WHERE "empresaId" = :eid'),
+        text('SELECT tipo, clave, valor, "tallerId" FROM restriccion WHERE "empresaId" = :eid'),
         {"eid": body.empresa_id},
     )
     restricciones = [dict(r) for r in rest_result.mappings().all()]
@@ -407,16 +407,23 @@ async def validar_asignacion(
                     f"pero el slot es {dia_nombres.get(slot['dia'], slot['dia'])}"
                 )
 
-    # 5. Check solo_taller
+    # 5. Check solo_taller — prioriza tallerId (FK), fallback a fuzzy por nombre
     for r in restricciones:
         if r["clave"] == "solo_taller":
-            taller_nombre = slot["taller_nombre"].strip().lower()
-            restriccion_valor = r["valor"].strip().lower()
-            if restriccion_valor not in taller_nombre and taller_nombre not in restriccion_valor:
-                restricciones_violadas.append(
-                    f"solo_taller: {empresa['nombre']} solo imparte '{r['valor']}', "
-                    f"pero el taller es '{slot['taller_nombre']}'"
-                )
+            if r.get("tallerId") is not None:
+                if r["tallerId"] != slot["tallerId"]:
+                    restricciones_violadas.append(
+                        f"solo_taller: {empresa['nombre']} solo imparte un taller específico, "
+                        f"pero el taller de este slot no coincide"
+                    )
+            else:
+                taller_nombre = slot["taller_nombre"].strip().lower()
+                restriccion_valor = r["valor"].strip().lower()
+                if restriccion_valor not in taller_nombre and taller_nombre not in restriccion_valor:
+                    restricciones_violadas.append(
+                        f"solo_taller: {empresa['nombre']} solo imparte '{r['valor']}', "
+                        f"pero el taller es '{slot['taller_nombre']}'"
+                    )
 
     # 6. Check no_comodin (warn that this company shouldn't be used as substitute)
     for r in restricciones:
@@ -807,6 +814,21 @@ async def actualizar_slot(
                     {"tri": trimestre, "week": week, "eid": body.empresa_id, "slot_id": slot_id},
                 )
                 if conflict.first():
+                    # Comodines (Capgemini, Indra, Santander, Repsol) pueden doblar
+                    # semana en operación SOLO si se indica motivo_cambio (trazabilidad).
+                    empresa_row = await db.execute(
+                        text('SELECT "esComodin" FROM empresa WHERE id = :id'),
+                        {"id": body.empresa_id},
+                    )
+                    es_comodin = bool(empresa_row.scalar() or False)
+                    if es_comodin:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"La empresa es comodín y puede doblar semana, "
+                                f"pero debe indicar motivo_cambio para trazabilidad"
+                            ),
+                        )
                     raise HTTPException(
                         status_code=400,
                         detail=f"Company {body.empresa_id} already has a slot in week {week}",
@@ -907,7 +929,7 @@ async def actualizar_slots_batch(
         try:
             # Build dynamic UPDATE for each slot - include empresaIdOriginal for write-once logic
             check = await db.execute(
-                text('SELECT id, "empresaIdOriginal" FROM planificacion WHERE id = :id AND trimestre = :tri'),
+                text('SELECT id, "empresaIdOriginal", semana FROM planificacion WHERE id = :id AND trimestre = :tri'),
                 {"id": item.slot_id, "tri": trimestre},
             )
             existing = check.mappings().first()
@@ -927,6 +949,35 @@ async def actualizar_slots_batch(
                 params["confirmado"] = item.confirmado
 
             if item.empresa_id is not None:
+                # H6 check: company can't have 2 slots in same week — same logic as actualizar_slot.
+                # Skip if motivo_cambio was provided (planner is consciously forcing).
+                # Comodines pueden doblar semana SOLO con motivo_cambio (trazabilidad).
+                is_forced_assignment = item.motivo_cambio in ("DECISION_PLANIFICADOR", "EMPRESA_CANCELO")
+                if not is_forced_assignment:
+                    week = existing["semana"]
+                    conflict = await db.execute(
+                        text('''
+                            SELECT id FROM planificacion
+                            WHERE trimestre = :tri AND semana = :week AND "empresaId" = :eid AND id != :slot_id
+                        '''),
+                        {"tri": trimestre, "week": week, "eid": item.empresa_id, "slot_id": item.slot_id},
+                    )
+                    if conflict.first():
+                        empresa_row = await db.execute(
+                            text('SELECT "esComodin" FROM empresa WHERE id = :id'),
+                            {"id": item.empresa_id},
+                        )
+                        es_comodin = bool(empresa_row.scalar() or False)
+                        if es_comodin:
+                            errors.append(
+                                f"Slot {item.slot_id}: La empresa es comodín y puede doblar semana, "
+                                f"pero debe indicar motivo_cambio para trazabilidad"
+                            )
+                        else:
+                            errors.append(
+                                f"Slot {item.slot_id}: Company {item.empresa_id} already has a slot in week {week}"
+                            )
+                        continue
                 updates.append('"empresaId" = :empresa_id')
                 params["empresa_id"] = item.empresa_id
                 # WRITE-ONCE: Set empresaIdOriginal only if it's currently NULL
