@@ -114,6 +114,18 @@ HEADER_MAP = {
     "freq_it": "frecuenciaIT",
     "talleresit": "frecuenciaIT",
     "it": "frecuenciaIT",
+    # escuelaPropia (V18)
+    "escuelapropia": "escuelaPropia",
+    "escuela_propia": "escuelaPropia",
+    "escuela": "escuelaPropia",
+    # disponibilidadDias (V18)
+    "disponibilidaddias": "disponibilidadDias",
+    "disponibilidad": "disponibilidadDias",
+    "dias": "disponibilidadDias",
+    "dias_disponibles": "disponibilidadDias",
+    # voluntariosDisponibles (V18)
+    "voluntariosdisponibles": "voluntariosDisponibles",
+    "voluntarios": "voluntariosDisponibles",
 }
 
 # Normalización empresas Q1
@@ -189,6 +201,43 @@ def _prioridad(val) -> str:
         return "MEDIA"
     s = str(val).strip().upper()
     return s if s in ("ALTA", "MEDIA", "BAJA") else "MEDIA"
+
+
+_DIAS_CANONICOS = ["L", "M", "X", "J", "V"]
+
+
+def _normalizar_dias(val) -> str | None:
+    """Coerces day input to canonical 'L,M,X,J,V'-style. Returns None if empty
+    or if any non-day character remains after stripping separators (strict)."""
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple, set)):
+        items = [str(x) for x in val]
+    else:
+        items = [str(val)]
+    chars: list[str] = []
+    for item in items:
+        s = item.upper()
+        for sep in (",", ";", "-", " ", "/", "."):
+            s = s.replace(sep, "")
+        chars.extend(s)
+    if not chars:
+        return None
+    if not all(c in _DIAS_CANONICOS for c in chars):
+        return None
+    return ",".join(d for d in _DIAS_CANONICOS if d in set(chars))
+
+
+def _to_int_or_none(val) -> int | None:
+    """Coerces to int; returns None on missing/blank/unparseable."""
+    if val is None:
+        return None
+    if isinstance(val, str) and val.strip() == "":
+        return None
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -330,6 +379,21 @@ async def importar_empresas(
                 freq_ef = freq_total // 2
                 freq_it = freq_total - freq_ef
 
+        # ── ConfigTrimestral fields wired in V18 ──────────────
+        # None = column absent or cell blank → keep DB default on UPDATE,
+        # fall back to legacy literal on INSERT.
+        escuela_propia_raw = _get("escuelaPropia")
+        escuela_propia_val = (
+            _bool(escuela_propia_raw) if escuela_propia_raw is not None else None
+        )
+
+        disponibilidad_raw = _get("disponibilidadDias")
+        disponibilidad_val = (
+            _normalizar_dias(disponibilidad_raw) if disponibilidad_raw else None
+        )
+
+        voluntarios_val = _to_int_or_none(_get("voluntariosDisponibles"))
+
         # NOTE: scoreV3, semaforo, fiabilidadReciente are IGNORED from Excel
         # These fields are now auto-calculated from historical data
         empresas_data.append(
@@ -351,6 +415,10 @@ async def importar_empresas(
                 "frecuenciaSolicitada": freq_total,
                 "frecuenciaEF": freq_ef,
                 "frecuenciaIT": freq_it,
+                # ConfigTrimestral fields (V18) — None means "not provided"
+                "escuelaPropia": escuela_propia_val,
+                "disponibilidadDias": disponibilidad_val,
+                "voluntariosDisponibles": voluntarios_val,
             }
         )
 
@@ -491,32 +559,66 @@ async def importar_empresas(
 
         if existing.first():
             # Update existing config (preserve other fields, update freq/tipo/notas)
+            update_fragments = [
+                '"tipoParticipacion" = :tipo',
+                '"turnoPreferido" = :turno',
+                '"frecuenciaSolicitada" = :freq',
+                '"frecuenciaEF" = :freq_ef',
+                '"frecuenciaIT" = :freq_it',
+                '"notas" = COALESCE(:notas, "notas")',
+                '"updatedAt" = NOW()',
+            ]
+            update_params = {
+                "eid": eid,
+                "tri": trimestre,
+                "tipo": tipo_calc,
+                "turno": emp["turnoPreferido"],
+                "freq": emp.get("frecuenciaSolicitada"),
+                "freq_ef": emp.get("frecuenciaEF"),
+                "freq_it": emp.get("frecuenciaIT"),
+                "notas": emp.get("notas"),
+            }
+
+            # V18: only override these when Excel explicitly provided a value
+            if emp.get("escuelaPropia") is not None:
+                update_fragments.append('"escuelaPropia" = :escuela')
+                update_params["escuela"] = emp["escuelaPropia"]
+
+            if emp.get("disponibilidadDias") is not None:
+                update_fragments.append('"disponibilidadDias" = :dias')
+                update_params["dias"] = emp["disponibilidadDias"]
+
+            if emp.get("voluntariosDisponibles") is not None:
+                update_fragments.append('"voluntariosDisponibles" = :vol')
+                update_params["vol"] = emp["voluntariosDisponibles"]
+
             await db.execute(
-                text("""
+                text(f"""
                     UPDATE "configTrimestral"
-                    SET "tipoParticipacion" = :tipo,
-                        "turnoPreferido" = :turno,
-                        "frecuenciaSolicitada" = :freq,
-                        "frecuenciaEF" = :freq_ef,
-                        "frecuenciaIT" = :freq_it,
-                        "notas" = COALESCE(:notas, "notas"),
-                        "updatedAt" = NOW()
+                    SET {', '.join(update_fragments)}
                     WHERE trimestre = :tri AND "empresaId" = :eid
                 """),
-                {
-                    "eid": eid,
-                    "tri": trimestre,
-                    "tipo": tipo_calc,
-                    "turno": emp["turnoPreferido"],
-                    "freq": emp.get("frecuenciaSolicitada"),
-                    "freq_ef": emp.get("frecuenciaEF"),
-                    "freq_it": emp.get("frecuenciaIT"),
-                    "notas": emp.get("notas"),
-                },
+                update_params,
             )
             cfg_updated += 1
         else:
             # Create new config
+            # V18: bind escuelaPropia / disponibilidadDias / voluntariosDisponibles,
+            # falling back to legacy defaults when the Excel did not provide them.
+            escuela_val = (
+                emp["escuelaPropia"] if emp.get("escuelaPropia") is not None else False
+            )
+            dias_val = (
+                emp["disponibilidadDias"]
+                if emp.get("disponibilidadDias") is not None
+                else "L,M,X,J,V"
+            )
+            vol_val = (
+                emp["voluntariosDisponibles"]
+                if emp.get("voluntariosDisponibles") is not None
+                else 0
+            )
+
             await db.execute(
                 text("""
                     INSERT INTO "configTrimestral" (
@@ -525,18 +627,21 @@ async def importar_empresas(
                         "frecuenciaSolicitada", "frecuenciaEF", "frecuenciaIT",
                         "voluntariosDisponibles", "notas", "createdAt", "updatedAt"
                     ) VALUES (
-                        :eid, :tri, :tipo, false, 'L,M,X,J,V', :turno,
-                        :freq, :freq_ef, :freq_it, 0, :notas, NOW(), NOW()
+                        :eid, :tri, :tipo, :escuela, :dias, :turno,
+                        :freq, :freq_ef, :freq_it, :vol, :notas, NOW(), NOW()
                     )
                 """),
                 {
                     "eid": eid,
                     "tri": trimestre,
                     "tipo": tipo_calc,
+                    "escuela": escuela_val,
+                    "dias": dias_val,
                     "turno": emp["turnoPreferido"],
                     "freq": emp.get("frecuenciaSolicitada"),
                     "freq_ef": emp.get("frecuenciaEF"),
                     "freq_it": emp.get("frecuenciaIT"),
+                    "vol": vol_val,
                     "notas": emp.get("notas"),
                 },
             )
