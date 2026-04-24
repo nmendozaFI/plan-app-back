@@ -187,6 +187,20 @@ class ImportarExcelInput(BaseModel):
     dry_run: bool = False
 
 
+class ImportarExcelBulkResult(BaseModel):
+    """V18: result of bulk INSERT calendar importer (POST /{trimestre}/importar-excel-bulk)."""
+    trimestre: str
+    total_procesados: int
+    insertados: int
+    vacantes: int
+    empresa_no_encontrada: int
+    taller_no_encontrado: int
+    errores: int
+    warnings: list[str]
+    dry_run: bool
+    wipe_first: bool
+
+
 class RecalcularScoresResult(BaseModel):
     empresas_actualizadas: int
     detalle: list[dict]

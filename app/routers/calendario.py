@@ -30,6 +30,7 @@ from app.schemas.calendario import (
     EmpresaAnalisis, CambioSlot, AnalisisResumen, AnalisisResponse,
     CerrarTrimestreInput, CerrarTrimestreResult,
     EmpresaCambiada, CambioDetalle, ImportarExcelResult, ImportarExcelInput,
+    ImportarExcelBulkResult,
     RecalcularScoresResult,
 )
 from app.services.calendario.solver import (
@@ -1662,6 +1663,376 @@ async def importar_excel_file(
         "cambios_detalle": [CambioDetalle(**cd) for cd in cambios_detalle],
         "warnings": warnings[:50],  # Limitar warnings
     }
+
+
+# ── V18: Bulk INSERT calendar importer ──────────────────────
+
+
+_BULK_ESTADO_NORMALIZE = {
+    "CANCELADO": "CANCELADO",
+    "CONFIRMADO": "CONFIRMADO",
+    "CONFRIMADO": "CONFIRMADO",
+    "CONFIRAMDO": "CONFIRMADO",
+    "PLANIFICADO": "PLANIFICADO",
+    "PLANFICADO": "PLANIFICADO",
+    "VACANTE": "VACANTE",
+}
+
+_BULK_TIPO_VALID = {"BASE", "EXTRA", "CONTINGENCIA"}
+
+
+def _bulk_parse_bool(val) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().upper() in ("SI", "SÍ", "TRUE", "1", "YES", "X")
+
+
+def _bulk_normalize_motivo(val) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    norm = s.upper().replace(" ", "_")
+    if "CANCEL" in norm:
+        return "EMPRESA_CANCELO"
+    if "PLANIFICADOR" in norm:
+        return "DECISION_PLANIFICADOR"
+    if norm in ("EMPRESA_CANCELO", "DECISION_PLANIFICADOR"):
+        return norm
+    return None
+
+
+@router.post("/{trimestre}/importar-excel-bulk", response_model=ImportarExcelBulkResult)
+async def importar_excel_bulk(
+    trimestre: str,
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    wipe_first: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    V18: bulk INSERT importer for a prepared calendar Excel.
+
+    Designed for loading legacy/real data into an empty trimestre.
+    UPDATE-style adjustments still go through /importar-excel-file.
+
+    Headers (case-insensitive, whitespace-stripped):
+      Required: Semana, Fecha, Día, Horario, Turno, Empresa, Taller, Programa, Ciudad, Estado
+      Optional: Empresa Original, Tipo, Confirmado, Notas, Motivo cambio
+
+    Behavior:
+      - wipe_first=True  → DELETE planificacion WHERE trimestre=:tri before inserting.
+      - wipe_first=False + rows already exist → 409.
+      - dry_run=True     → validate + count only (no DB writes; DELETE skipped).
+    """
+    import openpyxl
+    from io import BytesIO
+
+    warnings: list[str] = []
+    total_procesados = 0
+    insertados = 0
+    vacantes = 0
+    empresa_no_encontrada = 0
+    taller_no_encontrado = 0
+    errores = 0
+
+    # ── 1. Read workbook ─────────────────────────────────────
+    try:
+        content = await file.read()
+        wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al leer Excel: {str(e)}")
+
+    # ── 2. Header detection ──────────────────────────────────
+    canonical_headers = [
+        "Semana", "Fecha", "Día", "Horario", "Turno", "Empresa",
+        "Taller", "Programa", "Ciudad", "Estado",
+        "Empresa Original", "Tipo", "Confirmado", "Notas", "Motivo cambio",
+    ]
+    actual = [str(c.value).strip().lower() if c.value is not None else "" for c in ws[1]]
+
+    col_map: dict[str, int] = {}
+    for canon in canonical_headers:
+        target = canon.lower()
+        for j, h in enumerate(actual):
+            if h == target:
+                col_map[canon] = j
+                break
+
+    required = ["Semana", "Fecha", "Día", "Horario", "Turno",
+                "Empresa", "Taller", "Programa", "Ciudad", "Estado"]
+    missing = [h for h in required if h not in col_map]
+    if missing:
+        wb.close()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Columnas requeridas no encontradas: {', '.join(missing)}. "
+                   f"Headers encontrados: {[c.value for c in ws[1]][:20]}",
+        )
+
+    # ── 3. Pre-check: 409 unless wipe_first ──────────────────
+    if not wipe_first:
+        existing = await db.execute(
+            text('SELECT COUNT(*) FROM planificacion WHERE trimestre = :tri'),
+            {"tri": trimestre},
+        )
+        existing_count = existing.scalar() or 0
+        if existing_count > 0:
+            wb.close()
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ya existen {existing_count} filas para {trimestre}. "
+                       f"Pasa wipe_first=true para reemplazarlas, o usa "
+                       f"POST /{trimestre}/importar-excel-file para actualizaciones.",
+            )
+
+    # ── 4. Lookups ──────────────────────────────────────────
+    emp_result = await db.execute(
+        text("SELECT id, nombre FROM empresa WHERE activa = true")
+    )
+    empresas_map: dict[str, int] = {
+        r["nombre"].strip().lower(): r["id"] for r in emp_result.mappings().all()
+    }
+
+    taller_result = await db.execute(
+        text('SELECT id, nombre, "diaSemana", horario, programa FROM taller WHERE activo = true')
+    )
+    talleres_map: dict[tuple[str, str, str, str], int] = {}
+    for r in taller_result.mappings().all():
+        key = (
+            (r["nombre"] or "").strip().lower(),
+            (r["diaSemana"] or "").strip().upper(),
+            (r["horario"] or "").strip(),
+            (r["programa"] or "").strip().upper(),
+        )
+        talleres_map[key] = r["id"]
+
+    ciudad_result = await db.execute(text("SELECT id, nombre FROM ciudad"))
+    ciudades_map: dict[str, int] = {
+        r["nombre"].strip().lower(): r["id"] for r in ciudad_result.mappings().all()
+    }
+
+    # ── 5. Parse rows → inserts_to_apply ─────────────────────
+    inserts_to_apply: list[dict] = []
+    seen_empresa_404: set[str] = set()
+    seen_taller_404: set[tuple] = set()
+    seen_ciudad_404: set[str] = set()
+
+    def _cell(row, key):
+        idx = col_map.get(key)
+        if idx is None or idx >= len(row):
+            return None
+        return row[idx]
+
+    for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not row or all(c is None for c in row):
+            continue
+        total_procesados += 1
+
+        try:
+            # Semana
+            try:
+                semana = int(row[col_map["Semana"]]) if row[col_map["Semana"]] is not None else None
+            except (ValueError, TypeError):
+                warnings.append(f"Fila {row_num}: Semana inválida '{row[col_map['Semana']]}'")
+                errores += 1
+                continue
+            if semana is None or not (1 <= semana <= 13):
+                warnings.append(f"Fila {row_num}: Semana fuera de rango [1..13]: {semana}")
+                errores += 1
+                continue
+
+            # Día / Horario / Turno / Programa
+            dia = (str(_cell(row, "Día") or "").strip().upper()) or None
+            horario = (str(_cell(row, "Horario") or "").strip()) or None
+            turno = (str(_cell(row, "Turno") or "").strip()) or None
+            programa = (str(_cell(row, "Programa") or "").strip().upper()) or None
+
+            if not dia or not horario or not programa:
+                warnings.append(
+                    f"Fila {row_num}: Faltan campos obligatorios (Día/Horario/Programa)"
+                )
+                errores += 1
+                continue
+
+            # Estado
+            estado_raw = _cell(row, "Estado")
+            if estado_raw is None or str(estado_raw).strip() == "":
+                warnings.append(f"Fila {row_num}: Estado vacío")
+                errores += 1
+                continue
+            estado_upper = str(estado_raw).strip().upper()
+            if estado_upper == "OK":
+                warnings.append(
+                    f"Fila {row_num}: Estado 'OK' no válido (V17). Usa 'CONFIRMADO'."
+                )
+                errores += 1
+                continue
+            estado = _BULK_ESTADO_NORMALIZE.get(estado_upper)
+            if not estado:
+                warnings.append(f"Fila {row_num}: Estado '{estado_raw}' inválido")
+                errores += 1
+                continue
+
+            # Empresa
+            empresa_raw = _cell(row, "Empresa")
+            empresa_str = str(empresa_raw).strip() if empresa_raw is not None else ""
+            empresa_id: int | None = None
+            if empresa_str:
+                empresa_id = empresas_map.get(empresa_str.lower())
+                if empresa_id is None:
+                    if empresa_str.upper() not in seen_empresa_404:
+                        warnings.append(
+                            f"Fila {row_num}: Empresa '{empresa_str}' no encontrada — empresaId queda NULL"
+                        )
+                        seen_empresa_404.add(empresa_str.upper())
+                    empresa_no_encontrada += 1
+            else:
+                # Blank empresa → vacancy. Force estado=VACANTE for consistency.
+                if estado != "VACANTE":
+                    warnings.append(
+                        f"Fila {row_num}: Empresa vacía con estado '{estado}' → fuerzo VACANTE"
+                    )
+                    estado = "VACANTE"
+
+            # Empresa Original (write-once at INSERT time)
+            empresa_original_raw = _cell(row, "Empresa Original")
+            empresa_id_original: int | None = empresa_id
+            if empresa_original_raw is not None:
+                eo_str = str(empresa_original_raw).strip()
+                if eo_str and eo_str.lower() != empresa_str.lower():
+                    eo_id = empresas_map.get(eo_str.lower())
+                    if eo_id is not None:
+                        empresa_id_original = eo_id
+                    else:
+                        warnings.append(
+                            f"Fila {row_num}: Empresa Original '{eo_str}' no encontrada — usando empresaId"
+                        )
+
+            # Taller (strict 4-tuple match)
+            taller_raw = _cell(row, "Taller")
+            if not taller_raw or not str(taller_raw).strip():
+                warnings.append(f"Fila {row_num}: Taller vacío")
+                errores += 1
+                continue
+            taller_key = (
+                str(taller_raw).strip().lower(), dia, horario, programa,
+            )
+            taller_id = talleres_map.get(taller_key)
+            if taller_id is None:
+                if taller_key not in seen_taller_404:
+                    warnings.append(
+                        f"Fila {row_num}: Taller no encontrado para "
+                        f"(nombre='{taller_raw}', día={dia}, horario={horario}, programa={programa})"
+                    )
+                    seen_taller_404.add(taller_key)
+                taller_no_encontrado += 1
+                errores += 1
+                continue
+
+            # Ciudad
+            ciudad_raw = _cell(row, "Ciudad")
+            ciudad_id: int | None = None
+            if ciudad_raw is not None:
+                c_str = str(ciudad_raw).strip()
+                if c_str:
+                    ciudad_id = ciudades_map.get(c_str.lower())
+                    if ciudad_id is None and c_str.upper() not in seen_ciudad_404:
+                        warnings.append(
+                            f"Fila {row_num}: Ciudad '{c_str}' no encontrada — ciudadId queda NULL"
+                        )
+                        seen_ciudad_404.add(c_str.upper())
+
+            # Tipo asignación
+            tipo_raw = _cell(row, "Tipo")
+            tipo_asig = "BASE"
+            if tipo_raw is not None:
+                t_str = str(tipo_raw).strip().upper()
+                if t_str == "HUECO":
+                    tipo_asig = "CONTINGENCIA"
+                elif t_str in _BULK_TIPO_VALID:
+                    tipo_asig = t_str
+            es_contingencia = (tipo_asig == "CONTINGENCIA")
+
+            # Confirmado
+            confirmado = _bulk_parse_bool(_cell(row, "Confirmado"))
+
+            # Notas / Motivo cambio
+            notas_raw = _cell(row, "Notas")
+            notas_val = str(notas_raw).strip() if notas_raw is not None and str(notas_raw).strip() else None
+            motivo_val = _bulk_normalize_motivo(_cell(row, "Motivo cambio"))
+
+            inserts_to_apply.append({
+                "tri": trimestre,
+                "sem": semana,
+                "dia": dia,
+                "horario": horario,
+                "turno": turno,
+                "eid": empresa_id,
+                "eid_original": empresa_id_original,
+                "tid": taller_id,
+                "cid": ciudad_id,
+                "tipo": tipo_asig,
+                "contingencia": es_contingencia,
+                "estado": estado,
+                "confirmado": confirmado,
+                "notas": notas_val,
+                "motivo": motivo_val,
+            })
+
+            if estado == "VACANTE":
+                vacantes += 1
+            else:
+                insertados += 1
+
+        except Exception as e:
+            warnings.append(f"Fila {row_num}: Error procesando: {str(e)}")
+            errores += 1
+
+    wb.close()
+
+    # ── 6. Apply (skip in dry_run) ───────────────────────────
+    if not dry_run:
+        if wipe_first:
+            await db.execute(
+                text('DELETE FROM planificacion WHERE trimestre = :tri'),
+                {"tri": trimestre},
+            )
+        for ins in inserts_to_apply:
+            await db.execute(
+                text("""
+                    INSERT INTO planificacion (
+                        trimestre, semana, dia, horario, turno,
+                        "empresaId", "empresaIdOriginal", "tallerId", "ciudadId",
+                        "tipoAsignacion", "esContingencia", estado, confirmado,
+                        notas, "motivoCambio", "updatedAt"
+                    ) VALUES (
+                        :tri, :sem, :dia, :horario, :turno,
+                        :eid, :eid_original, :tid, :cid,
+                        :tipo, :contingencia, :estado, :confirmado,
+                        :notas, :motivo, NOW()
+                    )
+                """),
+                ins,
+            )
+        await db.commit()
+
+    return ImportarExcelBulkResult(
+        trimestre=trimestre,
+        total_procesados=total_procesados,
+        insertados=insertados,
+        vacantes=vacantes,
+        empresa_no_encontrada=empresa_no_encontrada,
+        taller_no_encontrado=taller_no_encontrado,
+        errores=errores,
+        warnings=warnings[:100],
+        dry_run=dry_run,
+        wipe_first=wipe_first,
+    )
 
 
 # ── Recalcular Scores ────────────────────────────────────────
