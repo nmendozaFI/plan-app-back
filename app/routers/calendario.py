@@ -18,7 +18,7 @@ Tablas Prisma (camelCase):
 
 import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
@@ -30,7 +30,8 @@ from app.schemas.calendario import (
     EmpresaAnalisis, CambioSlot, AnalisisResumen, AnalisisResponse,
     CerrarTrimestreInput, CerrarTrimestreResult,
     EmpresaCambiada, CambioDetalle, ImportarExcelResult, ImportarExcelInput,
-    ImportarExcelBulkResult,
+    ImportarExcelBulkResult, FilaExtraInsertada,
+    ListaExtrasResponse, SlotExtraResponse,
     RecalcularScoresResult,
 )
 from app.services.calendario.solver import (
@@ -1735,9 +1736,11 @@ async def importar_excel_bulk(
     total_procesados = 0
     insertados = 0
     vacantes = 0
+    extras_insertados = 0
     empresa_no_encontrada = 0
     taller_no_encontrado = 0
     errores = 0
+    extras_pending: list[dict] = []  # rows queued for EXTRA classification (post-INSERT)
 
     # ── 1. Read workbook ─────────────────────────────────────
     try:
@@ -1802,6 +1805,10 @@ async def importar_excel_bulk(
         text('SELECT id, nombre, "diaSemana", horario, programa FROM taller WHERE activo = true')
     )
     talleres_map: dict[tuple[str, str, str, str], int] = {}
+    # V20: secondary index by (nombre, programa) → list of taller_ids, used as
+    # fallback when the strict 4-tuple match fails so escuela-propia rows whose
+    # day/horario differ from the catalog can still resolve a tallerId.
+    talleres_by_name_prog: dict[tuple[str, str], list[int]] = {}
     for r in taller_result.mappings().all():
         key = (
             (r["nombre"] or "").strip().lower(),
@@ -1810,6 +1817,25 @@ async def importar_excel_bulk(
             (r["programa"] or "").strip().upper(),
         )
         talleres_map[key] = r["id"]
+        soft_key = (
+            (r["nombre"] or "").strip().lower(),
+            (r["programa"] or "").strip().upper(),
+        )
+        talleres_by_name_prog.setdefault(soft_key, []).append(r["id"])
+
+    # V20: escuelaPropia per empresa for THIS trimestre (true/false). Empresas
+    # without a configTrimestral row default to False.
+    ep_result = await db.execute(
+        text('''
+            SELECT "empresaId", "escuelaPropia"
+              FROM "configTrimestral"
+             WHERE trimestre = :tri
+        '''),
+        {"tri": trimestre},
+    )
+    escuela_propia_map: dict[int, bool] = {
+        r["empresaId"]: bool(r["escuelaPropia"]) for r in ep_result.mappings().all()
+    }
 
     ciudad_result = await db.execute(text("SELECT id, nombre FROM ciudad"))
     ciudades_map: dict[str, int] = {
@@ -1887,10 +1913,19 @@ async def importar_excel_bulk(
                 if empresa_id is None:
                     if empresa_str.upper() not in seen_empresa_404:
                         warnings.append(
-                            f"Fila {row_num}: Empresa '{empresa_str}' no encontrada — empresaId queda NULL"
+                            f"Fila {row_num}: Empresa '{empresa_str}' no encontrada — fila rechazada"
                         )
                         seen_empresa_404.add(empresa_str.upper())
+                    # V20: empresa-not-found is now a hard rejection (was previously
+                    # a soft warning that inserted with empresaId=NULL). Required so
+                    # counter buckets are mutually exclusive and the math invariant
+                    # total_procesados = insertados + vacantes + extras_insertados
+                    #                  + empresa_no_encontrada + taller_no_encontrado
+                    #                  + errores
+                    # holds. Previous behavior silently dropped empresa assignments
+                    # on misspelled names — surfacing as a rejection is safer.
                     empresa_no_encontrada += 1
+                    continue
             else:
                 # Blank empresa → vacancy. Force estado=VACANTE for consistency.
                 if estado != "VACANTE":
@@ -1923,16 +1958,40 @@ async def importar_excel_bulk(
                 str(taller_raw).strip().lower(), dia, horario, programa,
             )
             taller_id = talleres_map.get(taller_key)
+            soft_match_used = False
             if taller_id is None:
-                if taller_key not in seen_taller_404:
-                    warnings.append(
-                        f"Fila {row_num}: Taller no encontrado para "
-                        f"(nombre='{taller_raw}', día={dia}, horario={horario}, programa={programa})"
-                    )
-                    seen_taller_404.add(taller_key)
-                taller_no_encontrado += 1
-                errores += 1
-                continue
+                # V20: fallback — match by (nombre, programa) only.
+                # If this softer match also fails, the row is genuinely invalid
+                # catalog and we keep the legacy reject behavior.
+                soft_key = (str(taller_raw).strip().lower(), programa)
+                soft_candidates = talleres_by_name_prog.get(soft_key)
+                if not soft_candidates:
+                    if taller_key not in seen_taller_404:
+                        warnings.append(
+                            f"Fila {row_num}: Taller no encontrado para "
+                            f"(nombre='{taller_raw}', día={dia}, horario={horario}, programa={programa})"
+                        )
+                        seen_taller_404.add(taller_key)
+                    # V20: counter buckets are mutually exclusive — only
+                    # taller_no_encontrado increments here (was previously
+                    # double-counted with errores too).
+                    taller_no_encontrado += 1
+                    continue
+                # Soft-matched: pick the first candidate. The row still has to
+                # qualify as EXTRA (escuelaPropia + collision) — see post-loop
+                # classification. Empresa is required for EXTRA classification:
+                # vacancies cannot be EXTRA.
+                if empresa_id is None:
+                    if taller_key not in seen_taller_404:
+                        warnings.append(
+                            f"Fila {row_num}: Taller no encontrado por (día,horario) y "
+                            f"sin empresa para clasificar como EXTRA — rechazado"
+                        )
+                        seen_taller_404.add(taller_key)
+                    taller_no_encontrado += 1
+                    continue
+                taller_id = soft_candidates[0]
+                soft_match_used = True
 
             # Ciudad
             ciudad_raw = _cell(row, "Ciudad")
@@ -1966,7 +2025,7 @@ async def importar_excel_bulk(
             notas_val = str(notas_raw).strip() if notas_raw is not None and str(notas_raw).strip() else None
             motivo_val = _bulk_normalize_motivo(_cell(row, "Motivo cambio"))
 
-            inserts_to_apply.append({
+            ins_row = {
                 "tri": trimestre,
                 "sem": semana,
                 "dia": dia,
@@ -1982,12 +2041,17 @@ async def importar_excel_bulk(
                 "confirmado": confirmado,
                 "notas": notas_val,
                 "motivo": motivo_val,
-            })
-
-            if estado == "VACANTE":
-                vacantes += 1
-            else:
-                insertados += 1
+                # V20: bookkeeping for EXTRA classification (stripped before INSERT).
+                "_soft_match_used": soft_match_used,
+                "_row_num": row_num,
+                "_taller_nombre": str(taller_raw).strip(),
+                "_empresa_nombre": empresa_str,
+            }
+            inserts_to_apply.append(ins_row)
+            # V20 hotfix: counter accounting fully deferred to the post-loop
+            # classification pass — every row (strict OR soft match) must be
+            # evaluated against the EXTRA rule before we know which bucket it
+            # falls into (insertados / vacantes / extras_insertados / rejection).
 
         except Exception as e:
             warnings.append(f"Fila {row_num}: Error procesando: {str(e)}")
@@ -1995,7 +2059,97 @@ async def importar_excel_bulk(
 
     wb.close()
 
+    # ── 5b. EXTRA classification pass (V20, hotfix) ──────────
+    # EXTRA classification rule (V20, hotfix):
+    # EXTRA = (empresa has escuelaPropia=true in this trimestre) AND
+    #         (this row collides with another slot for same trimestre+semana+dia+horario
+    #          belonging to a different empresa).
+    #
+    # This rule applies to EVERY row that successfully resolved a taller, regardless of
+    # whether the catalog match was strict (nombre+día+horario+programa) or soft (nombre+programa).
+    #
+    # Rationale: extras are a semantic concept ("this slot was added on top of the standard
+    # calendar by an escuela propia company"), not a structural one. They show up in two flavors:
+    #   - Same workshop, same time, different company (most common — strict catalog match).
+    #   - Workshop moved to a different day/time (less common — soft fallback match).
+    # Both are EXTRA. The classification rule is the same for both.
+    #
+    # Both AND conditions are required. EP without collision = BASE. Collision without EP = BASE
+    # (or rejected if row only matched via fallback).
+    #
+    # Collisions are computed against (a) other rows in the SAME bulk batch and
+    # (b) rows already committed to planificacion for this trimestre. (b) is
+    # only relevant when wipe_first=False (otherwise the trimestre is wiped and
+    # cannot have pre-existing rows by construction of the 409 guard) — Option C.
+    occupancy: dict[tuple[int, str, str], set[int]] = {}
+    for ins in inserts_to_apply:
+        if ins["eid"] is None:
+            continue
+        key = (ins["sem"], ins["dia"], ins["horario"])
+        occupancy.setdefault(key, set()).add(ins["eid"])
+
+    # Pre-existing rows (only matters when wipe_first=False).
+    if not wipe_first:
+        existing_slots = await db.execute(
+            text('''
+                SELECT semana, dia, horario, "empresaId"
+                  FROM planificacion
+                 WHERE trimestre = :tri
+                   AND "empresaId" IS NOT NULL
+            '''),
+            {"tri": trimestre},
+        )
+        for r in existing_slots.mappings().all():
+            key = (r["semana"], r["dia"], r["horario"])
+            occupancy.setdefault(key, set()).add(r["empresaId"])
+
+    final_inserts: list[dict] = []
+    for ins in inserts_to_apply:
+        empresa_id_row = ins["eid"]
+
+        # Vacancies (no empresa) cannot be EXTRA — they are not soft-matched
+        # either (the soft-match path requires empresa_id), so they always
+        # come from a strict catalog match and go in as VACANTE.
+        if empresa_id_row is None:
+            final_inserts.append(ins)
+            vacantes += 1
+            continue
+
+        is_ep = bool(escuela_propia_map.get(empresa_id_row, False))
+        key = (ins["sem"], ins["dia"], ins["horario"])
+        others = occupancy.get(key, set()) - {empresa_id_row}
+        has_collision = len(others) > 0
+
+        if is_ep and has_collision:
+            ins["tipo"] = "EXTRA"
+            extras_pending.append(ins)
+            extras_insertados += 1
+            final_inserts.append(ins)
+            continue
+
+        # Not EXTRA. Strict-matched rows fall through to BASE. Soft-matched
+        # rows are rejected because they don't fit the catalog and don't
+        # qualify as EXTRA either.
+        if ins["_soft_match_used"]:
+            reason = []
+            if not is_ep:
+                reason.append("empresa no tiene escuelaPropia=true en este trimestre")
+            if not has_collision:
+                reason.append("sin colisión en (semana,día,horario)")
+            warnings.append(
+                f"Fila {ins['_row_num']}: Taller con día/horario fuera de catálogo "
+                f"para '{ins['_taller_nombre']}' rechazado — {' y '.join(reason)}"
+            )
+            taller_no_encontrado += 1
+        else:
+            final_inserts.append(ins)
+            insertados += 1
+
+    inserts_to_apply = final_inserts
+
     # ── 6. Apply (skip in dry_run) ───────────────────────────
+    extras_detalle: list[FilaExtraInsertada] = []
+    _BK_KEYS = ("_soft_match_used", "_row_num", "_taller_nombre", "_empresa_nombre")
     if not dry_run:
         if wipe_first:
             await db.execute(
@@ -2003,7 +2157,8 @@ async def importar_excel_bulk(
                 {"tri": trimestre},
             )
         for ins in inserts_to_apply:
-            await db.execute(
+            params = {k: v for k, v in ins.items() if k not in _BK_KEYS}
+            result = await db.execute(
                 text("""
                     INSERT INTO planificacion (
                         trimestre, semana, dia, horario, turno,
@@ -2016,22 +2171,144 @@ async def importar_excel_bulk(
                         :tipo, :contingencia, :estado, :confirmado,
                         :notas, :motivo, NOW()
                     )
+                    RETURNING id
                 """),
-                ins,
+                params,
             )
+            new_id = result.scalar()
+            if ins.get("tipo") == "EXTRA" and new_id is not None:
+                extras_detalle.append(
+                    FilaExtraInsertada(
+                        planificacion_id=new_id,
+                        semana=ins["sem"],
+                        dia=ins["dia"],
+                        horario=ins["horario"],
+                        taller_nombre=ins["_taller_nombre"],
+                        empresa_nombre=ins["_empresa_nombre"],
+                        fila_excel=ins["_row_num"],
+                    )
+                )
         await db.commit()
+    else:
+        # Dry-run: surface the EXTRAs that *would* be inserted with id=None
+        # (row not committed, no real Planificacion.id exists yet).
+        for ins in inserts_to_apply:
+            if ins.get("tipo") == "EXTRA":
+                extras_detalle.append(
+                    FilaExtraInsertada(
+                        planificacion_id=None,
+                        semana=ins["sem"],
+                        dia=ins["dia"],
+                        horario=ins["horario"],
+                        taller_nombre=ins["_taller_nombre"],
+                        empresa_nombre=ins["_empresa_nombre"],
+                        fila_excel=ins["_row_num"],
+                    )
+                )
 
     return ImportarExcelBulkResult(
         trimestre=trimestre,
         total_procesados=total_procesados,
         insertados=insertados,
         vacantes=vacantes,
+        extras_insertados=extras_insertados,
+        extras_detalle=extras_detalle,
         empresa_no_encontrada=empresa_no_encontrada,
         taller_no_encontrado=taller_no_encontrado,
         errores=errores,
         warnings=warnings[:100],
         dry_run=dry_run,
         wipe_first=wipe_first,
+    )
+
+
+# ── V20: EXTRAS listing ──────────────────────────────────────
+
+
+_EXTRAS_ESTADO_WHITELIST = {"VACANTE", "PLANIFICADO", "CONFIRMADO", "CANCELADO"}
+
+
+@router.get("/{trimestre}/extras", response_model=ListaExtrasResponse)
+async def listar_extras(
+    trimestre: str,
+    estado: list[str] | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """V20: list every Planificacion row with tipoAsignacion='EXTRA' for the trimestre.
+
+    Joins empresa and taller for human-readable names; orders by
+    (semana, dia, horario, taller_nombre).
+
+    Optional ?estado=... query (repeatable) filters to the given V17 estados.
+    Each value must be in {VACANTE, PLANIFICADO, CONFIRMADO, CANCELADO}; an
+    invalid value returns 400.
+    """
+    estado_filter_sql = ""
+    params: dict = {"tri": trimestre}
+    if estado:
+        invalid = [e for e in estado if e not in _EXTRAS_ESTADO_WHITELIST]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Estado(s) inválido(s): {invalid}. "
+                    f"Permitidos: {sorted(_EXTRAS_ESTADO_WHITELIST)}"
+                ),
+            )
+        estado_filter_sql = " AND p.estado = ANY(:estados)"
+        params["estados"] = list(estado)
+
+    result = await db.execute(
+        text(
+            '''
+            SELECT
+                p.id,
+                p.semana,
+                p.dia,
+                p.horario,
+                p."empresaId"  AS empresa_id,
+                p.estado,
+                p.confirmado,
+                p.notas,
+                p."motivoCambio" AS motivo_cambio,
+                p."createdAt"  AS created_at,
+                e.nombre       AS empresa_nombre,
+                t.nombre       AS taller_nombre
+              FROM planificacion p
+              LEFT JOIN empresa e ON e.id = p."empresaId"
+              LEFT JOIN taller  t ON t.id = p."tallerId"
+             WHERE p.trimestre = :tri
+               AND p."tipoAsignacion" = 'EXTRA'
+            '''
+            + estado_filter_sql +
+            '''
+             ORDER BY p.semana, p.dia, p.horario, t.nombre
+            '''
+        ),
+        params,
+    )
+    rows = result.mappings().all()
+    extras = [
+        SlotExtraResponse(
+            id=r["id"],
+            semana=r["semana"],
+            dia=r["dia"],
+            horario=r["horario"] or "",
+            taller_nombre=r["taller_nombre"] or "",
+            empresa_id=r["empresa_id"],
+            empresa_nombre=r["empresa_nombre"],
+            estado=r["estado"],
+            confirmado=bool(r["confirmado"]),
+            notas=r["notas"],
+            motivo_cambio=r["motivo_cambio"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return ListaExtrasResponse(
+        trimestre=trimestre,
+        total=len(extras),
+        extras=extras,
     )
 
 

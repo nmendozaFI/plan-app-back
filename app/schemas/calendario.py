@@ -1,6 +1,7 @@
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # V17: planificacion.estado dropped "OK". CONFIRMADO is the terminal state.
@@ -187,18 +188,61 @@ class ImportarExcelInput(BaseModel):
     dry_run: bool = False
 
 
+class FilaExtraInsertada(BaseModel):
+    """V20: detail of an EXTRA slot inserted via the bulk importer.
+
+    `planificacion_id` is `None` in dry_run mode (row was not committed) and
+    the actual inserted Planificacion.id when dry_run=false.
+    """
+    planificacion_id: int | None
+    semana: int
+    dia: str
+    horario: str
+    taller_nombre: str
+    empresa_nombre: str
+    fila_excel: int
+
+
 class ImportarExcelBulkResult(BaseModel):
-    """V18: result of bulk INSERT calendar importer (POST /{trimestre}/importar-excel-bulk)."""
+    """V18: result of bulk INSERT calendar importer (POST /{trimestre}/importar-excel-bulk).
+
+    V20: adds extras_insertados / extras_detalle for escuela-propia EXTRA rows.
+    """
     trimestre: str
     total_procesados: int
     insertados: int
     vacantes: int
+    extras_insertados: int = 0
+    extras_detalle: list[FilaExtraInsertada] = Field(default_factory=list)
     empresa_no_encontrada: int
     taller_no_encontrado: int
     errores: int
     warnings: list[str]
     dry_run: bool
     wipe_first: bool
+
+
+class SlotExtraResponse(BaseModel):
+    """V20: one EXTRA row in GET /api/calendario/{trimestre}/extras."""
+    id: int
+    semana: int
+    dia: str
+    horario: str
+    taller_nombre: str
+    empresa_id: int | None
+    empresa_nombre: str | None
+    estado: str
+    confirmado: bool
+    notas: str | None
+    motivo_cambio: str | None
+    created_at: datetime
+
+
+class ListaExtrasResponse(BaseModel):
+    """V20: response for GET /api/calendario/{trimestre}/extras."""
+    trimestre: str
+    total: int
+    extras: list[SlotExtraResponse]
 
 
 class RecalcularScoresResult(BaseModel):
