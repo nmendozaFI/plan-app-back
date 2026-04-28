@@ -245,6 +245,33 @@ class ListaExtrasResponse(BaseModel):
     extras: list[SlotExtraResponse]
 
 
+class CrearSlotExtraInput(BaseModel):
+    """V21: input for POST /api/planificacion/{trimestre}/extra.
+
+    The router validates the EXTRA AND-rule (empresa is escuelaPropia in the
+    trimestre AND there is a colliding slot from another empresa) before
+    inserting. `programa` must match the taller's programa — coherence check.
+    """
+    empresa_id: int
+    semana: int = Field(..., ge=1, le=13)
+    dia: str
+    horario: str
+    taller_id: int
+    programa: Literal["EF", "IT"]
+    notas: str | None = None
+
+
+class EditarSlotExtraInput(BaseModel):
+    """V21: input for PATCH /api/planificacion/{slot_id}/extra.
+
+    Both fields optional, but at least one must be provided (router-level
+    check). PATCH never moves the slot (no día/horario/taller/semana edits)
+    so the AND-rule that classified it as EXTRA stays intact.
+    """
+    empresa_id: int | None = None
+    notas: str | None = None
+
+
 class RecalcularScoresResult(BaseModel):
     empresas_actualizadas: int
     detalle: list[dict]

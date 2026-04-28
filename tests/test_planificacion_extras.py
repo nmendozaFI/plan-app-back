@@ -108,6 +108,53 @@ async def _pick_one_taller(db) -> dict:
     return dict(row)
 
 
+async def _insert_base_slot(
+    db,
+    *,
+    trimestre: str,
+    semana: int,
+    dia: str,
+    horario: str,
+    empresa_id: int,
+    taller_id: int,
+    turno: str = "M",
+) -> int:
+    """V21 helper: insert a BASE planificacion row directly via SQL.
+
+    Used by POST/PATCH /extra tests to set up a colliding slot without
+    going through the bulk Excel importer.
+    """
+    res = await db.execute(
+        text(
+            '''
+            INSERT INTO planificacion (
+                trimestre, semana, dia, horario, turno,
+                "empresaId", "empresaIdOriginal", "tallerId",
+                "tipoAsignacion", "esContingencia", estado, confirmado,
+                "updatedAt"
+            ) VALUES (
+                :tri, :sem, :dia, :horario, :turno,
+                :eid, :eid, :tid,
+                'BASE', false, 'PLANIFICADO', false,
+                NOW()
+            ) RETURNING id
+            '''
+        ),
+        {
+            "tri": trimestre,
+            "sem": semana,
+            "dia": dia,
+            "horario": horario,
+            "turno": turno,
+            "eid": empresa_id,
+            "tid": taller_id,
+        },
+    )
+    sid = res.scalar()
+    await db.commit()
+    return sid
+
+
 async def _pick_two_talleres(db) -> tuple[dict, dict]:
     """Pick two real talleres that share programa but differ in (diaSemana, horario).
 
@@ -714,3 +761,434 @@ async def test_two_ep_companies_collision(client, db_session):
     )
     types = [r["tipoAsignacion"] for r in rows_db.mappings().all()]
     assert types == ["EXTRA", "EXTRA"]
+
+
+# ── V21: POST /api/planificacion/{trimestre}/extra ─────────────
+
+
+@pytest.mark.asyncio
+async def test_crear_extra_ok_con_colision_y_empresa_ep(client, db_session):
+    """POST creates an EXTRA when empresa is EP and there's a colliding row."""
+    taller = await _pick_one_taller(db_session)
+
+    base_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}POST_OK_BASE")
+    ep_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}POST_OK_EP")
+    await _set_config_trimestral(db_session, base_id, escuela_propia=False)
+    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+
+    # Pre-existing BASE slot at (sem=1, día, horario) — the collision target.
+    await _insert_base_slot(
+        db_session,
+        trimestre=TEST_TRIMESTRE,
+        semana=1,
+        dia=taller["diaSemana"],
+        horario=taller["horario"],
+        empresa_id=base_id,
+        taller_id=taller["id"],
+    )
+
+    payload = {
+        "empresa_id": ep_id,
+        "semana": 1,
+        "dia": taller["diaSemana"],
+        "horario": taller["horario"],
+        "taller_id": taller["id"],
+        "programa": taller["programa"],
+        "notas": "Slot extra IBERIA semana piloto",
+    }
+    resp = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    # Response shape (SlotExtraResponse).
+    assert data["empresa_id"] == ep_id
+    assert data["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}POST_OK_EP"
+    assert data["taller_nombre"] == taller["nombre"]
+    assert data["semana"] == 1
+    assert data["dia"] == taller["diaSemana"]
+    assert data["horario"] == taller["horario"]
+    assert data["estado"] == "PLANIFICADO"
+    assert data["confirmado"] is False
+    assert data["notas"] == "Slot extra IBERIA semana piloto"
+    assert data["motivo_cambio"] is None
+
+    # DB shape: tipoAsignacion=EXTRA, empresaIdOriginal == empresa_id.
+    db_row = await db_session.execute(
+        text(
+            'SELECT "tipoAsignacion", "empresaId", "empresaIdOriginal", '
+            '"esContingencia", confirmado '
+            "FROM planificacion WHERE id = :id"
+        ),
+        {"id": data["id"]},
+    )
+    rec = db_row.mappings().first()
+    assert rec["tipoAsignacion"] == "EXTRA"
+    assert rec["empresaId"] == ep_id
+    assert rec["empresaIdOriginal"] == ep_id
+    assert rec["esContingencia"] is False
+    assert rec["confirmado"] is False
+
+
+@pytest.mark.asyncio
+async def test_crear_extra_rechaza_empresa_inexistente(client, db_session):
+    taller = await _pick_one_taller(db_session)
+    payload = {
+        "empresa_id": 99999999,
+        "semana": 1,
+        "dia": taller["diaSemana"],
+        "horario": taller["horario"],
+        "taller_id": taller["id"],
+        "programa": taller["programa"],
+    }
+    resp = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert resp.status_code == 404, resp.text
+    assert "no existe" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_crear_extra_rechaza_empresa_inactiva(client, db_session):
+    taller = await _pick_one_taller(db_session)
+
+    inactiva_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_INACTIVA"
+    )
+    # Mark inactive after creation.
+    await db_session.execute(
+        text("UPDATE empresa SET activa = false WHERE id = :id"),
+        {"id": inactiva_id},
+    )
+    await db_session.commit()
+
+    payload = {
+        "empresa_id": inactiva_id,
+        "semana": 1,
+        "dia": taller["diaSemana"],
+        "horario": taller["horario"],
+        "taller_id": taller["id"],
+        "programa": taller["programa"],
+    }
+    resp = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert resp.status_code == 422, resp.text
+    assert "inactiva" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_crear_extra_rechaza_taller_inexistente(client, db_session):
+    ep_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOTALLER_EP"
+    )
+    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+
+    payload = {
+        "empresa_id": ep_id,
+        "semana": 1,
+        "dia": "L",
+        "horario": "09:00-10:30",
+        "taller_id": 99999999,
+        "programa": "EF",
+    }
+    resp = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert resp.status_code == 404, resp.text
+    assert "taller" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_crear_extra_rechaza_empresa_no_ep(client, db_session):
+    """Empresa exists & active but escuelaPropia=false → 422 with EP message."""
+    taller = await _pick_one_taller(db_session)
+
+    base_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOEP_BASE"
+    )
+    no_ep_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOEP_TARGET"
+    )
+    await _set_config_trimestral(db_session, base_id, escuela_propia=False)
+    await _set_config_trimestral(db_session, no_ep_id, escuela_propia=False)
+
+    # Set up a collision so it would otherwise be valid.
+    await _insert_base_slot(
+        db_session,
+        trimestre=TEST_TRIMESTRE,
+        semana=1,
+        dia=taller["diaSemana"],
+        horario=taller["horario"],
+        empresa_id=base_id,
+        taller_id=taller["id"],
+    )
+
+    payload = {
+        "empresa_id": no_ep_id,
+        "semana": 1,
+        "dia": taller["diaSemana"],
+        "horario": taller["horario"],
+        "taller_id": taller["id"],
+        "programa": taller["programa"],
+    }
+    resp = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert resp.status_code == 422, resp.text
+    assert "escuela propia" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_crear_extra_rechaza_sin_colision(client, db_session):
+    """Empresa is EP but nothing else at that slot → 422 with collision message."""
+    taller = await _pick_one_taller(db_session)
+
+    ep_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOCOL_EP"
+    )
+    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+
+    payload = {
+        "empresa_id": ep_id,
+        "semana": 1,
+        "dia": taller["diaSemana"],
+        "horario": taller["horario"],
+        "taller_id": taller["id"],
+        "programa": taller["programa"],
+    }
+    resp = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"].lower()
+    assert "coli" in detail  # "colisionar" / "colisión"
+    assert "mismo horario" in detail
+
+
+@pytest.mark.asyncio
+async def test_crear_extra_rechaza_duplicado_exacto(client, db_session):
+    """Creating the same EXTRA twice → 422 with duplicate message + existing id."""
+    taller = await _pick_one_taller(db_session)
+
+    base_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_DUP_BASE"
+    )
+    ep_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}POST_DUP_EP")
+    await _set_config_trimestral(db_session, base_id, escuela_propia=False)
+    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+
+    await _insert_base_slot(
+        db_session,
+        trimestre=TEST_TRIMESTRE,
+        semana=1,
+        dia=taller["diaSemana"],
+        horario=taller["horario"],
+        empresa_id=base_id,
+        taller_id=taller["id"],
+    )
+
+    payload = {
+        "empresa_id": ep_id,
+        "semana": 1,
+        "dia": taller["diaSemana"],
+        "horario": taller["horario"],
+        "taller_id": taller["id"],
+        "programa": taller["programa"],
+    }
+
+    # First call: succeeds.
+    first = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert first.status_code == 200, first.text
+    first_id = first.json()["id"]
+
+    # Second call: same payload → 422 duplicate.
+    second = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
+    )
+    assert second.status_code == 422, second.text
+    detail = second.json()["detail"]
+    assert "ya existe" in detail.lower()
+    assert str(first_id) in detail  # existing id surfaced
+
+
+# ── V21: PATCH /api/planificacion/{slot_id}/extra ──────────────
+
+
+async def _create_extra_slot(db_session, client) -> tuple[int, int, dict]:
+    """Helper: create one EXTRA via POST and return (extra_id, ep_id, taller).
+
+    Yields back the empresa+taller ids so tests can build follow-up payloads.
+    """
+    taller = await _pick_one_taller(db_session)
+
+    base_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_BASE"
+    )
+    ep_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}PATCH_EP")
+    await _set_config_trimestral(db_session, base_id, escuela_propia=False)
+    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+
+    await _insert_base_slot(
+        db_session,
+        trimestre=TEST_TRIMESTRE,
+        semana=1,
+        dia=taller["diaSemana"],
+        horario=taller["horario"],
+        empresa_id=base_id,
+        taller_id=taller["id"],
+    )
+
+    resp = await client.post(
+        f"/api/planificacion/{TEST_TRIMESTRE}/extra",
+        json={
+            "empresa_id": ep_id,
+            "semana": 1,
+            "dia": taller["diaSemana"],
+            "horario": taller["horario"],
+            "taller_id": taller["id"],
+            "programa": taller["programa"],
+            "notas": "nota inicial",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["id"], ep_id, taller
+
+
+@pytest.mark.asyncio
+async def test_editar_extra_cambiar_empresa_a_otra_ep(client, db_session):
+    extra_id, ep_id, _ = await _create_extra_slot(db_session, client)
+
+    # New empresa, also EP.
+    other_ep_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_OTHER_EP"
+    )
+    await _set_config_trimestral(db_session, other_ep_id, escuela_propia=True)
+
+    resp = await client.patch(
+        f"/api/planificacion/{extra_id}/extra",
+        json={"empresa_id": other_ep_id},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["id"] == extra_id
+    assert data["empresa_id"] == other_ep_id
+    assert data["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}PATCH_OTHER_EP"
+    assert data["notas"] == "nota inicial"  # untouched
+
+    # empresaIdOriginal must remain the original empresa (write-once).
+    db_row = await db_session.execute(
+        text(
+            'SELECT "empresaId", "empresaIdOriginal", "tipoAsignacion" '
+            "FROM planificacion WHERE id = :id"
+        ),
+        {"id": extra_id},
+    )
+    rec = db_row.mappings().first()
+    assert rec["empresaId"] == other_ep_id
+    assert rec["empresaIdOriginal"] == ep_id  # untouched
+    assert rec["tipoAsignacion"] == "EXTRA"
+
+
+@pytest.mark.asyncio
+async def test_editar_extra_solo_notas(client, db_session):
+    extra_id, ep_id, _ = await _create_extra_slot(db_session, client)
+
+    resp = await client.patch(
+        f"/api/planificacion/{extra_id}/extra",
+        json={"notas": "nota actualizada"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["notas"] == "nota actualizada"
+    assert data["empresa_id"] == ep_id  # untouched
+
+
+@pytest.mark.asyncio
+async def test_editar_extra_notas_vacias_limpia(client, db_session):
+    extra_id, _, _ = await _create_extra_slot(db_session, client)
+
+    resp = await client.patch(
+        f"/api/planificacion/{extra_id}/extra",
+        json={"notas": ""},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["notas"] == ""
+
+    # In DB the value is the empty string (not NULL).
+    db_row = await db_session.execute(
+        text("SELECT notas FROM planificacion WHERE id = :id"),
+        {"id": extra_id},
+    )
+    assert db_row.scalar() == ""
+
+
+@pytest.mark.asyncio
+async def test_editar_extra_slot_inexistente(client, db_session):
+    resp = await client.patch(
+        "/api/planificacion/9999999/extra",
+        json={"notas": "x"},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_editar_extra_slot_es_base_no_extra(client, db_session):
+    """PATCH on a BASE slot → 400 with 'no es EXTRA'."""
+    taller = await _pick_one_taller(db_session)
+
+    base_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_BASE_ONLY"
+    )
+    await _set_config_trimestral(db_session, base_id, escuela_propia=False)
+
+    base_slot_id = await _insert_base_slot(
+        db_session,
+        trimestre=TEST_TRIMESTRE,
+        semana=1,
+        dia=taller["diaSemana"],
+        horario=taller["horario"],
+        empresa_id=base_id,
+        taller_id=taller["id"],
+    )
+
+    resp = await client.patch(
+        f"/api/planificacion/{base_slot_id}/extra",
+        json={"notas": "x"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "no es EXTRA" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_editar_extra_nueva_empresa_no_ep(client, db_session):
+    extra_id, _, _ = await _create_extra_slot(db_session, client)
+
+    no_ep_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_NOEP"
+    )
+    await _set_config_trimestral(db_session, no_ep_id, escuela_propia=False)
+
+    resp = await client.patch(
+        f"/api/planificacion/{extra_id}/extra",
+        json={"empresa_id": no_ep_id},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "escuela propia" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_editar_extra_body_vacio(client, db_session):
+    extra_id, _, _ = await _create_extra_slot(db_session, client)
+
+    resp = await client.patch(
+        f"/api/planificacion/{extra_id}/extra",
+        json={},
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "al menos" in detail.lower()

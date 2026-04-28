@@ -118,6 +118,20 @@ class ImportarExcelResponse(BaseModel):
     dry_run: bool
 
 
+# V21 / F3a: empresas EP del trimestre — feeds the "Añadir EXTRA" modal Select.
+class EmpresaEPOut(BaseModel):
+    id: int
+    nombre: str
+    tipo: str  # EF | IT | AMBAS
+    activa: bool
+
+
+class ListaEmpresasEPResponse(BaseModel):
+    trimestre: str
+    total: int
+    empresas: list[EmpresaEPOut]
+
+
 # ── Helper Functions ────────────────────────────────────────
 
 # Non-Madrid company suffixes to skip in legacy format
@@ -265,6 +279,51 @@ async def resumen_configs(
         "sin_frecuencia": row["sin_freq"] or 0,
         "escuela_propia": row["escuela_propia"] or 0,
     }
+
+
+@router.get("/{trimestre}/empresas-ep", response_model=ListaEmpresasEPResponse)
+async def listar_empresas_ep(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    V21 / F3a: lista empresas con escuelaPropia=true en el trimestre dado.
+    Filtra también por empresa.activa=true. Orden alfabético por nombre.
+    Usado por el modal "Añadir EXTRA" de Operación para poblar el Select.
+    Trimestre inexistente → 200 con lista vacía (no 404).
+    """
+    result = await db.execute(
+        text("""
+            SELECT
+                e.id,
+                e.nombre,
+                e.tipo,
+                e.activa
+            FROM "configTrimestral" ct
+            JOIN empresa e ON e.id = ct."empresaId"
+            WHERE ct.trimestre = :tri
+              AND ct."escuelaPropia" = true
+              AND e.activa = true
+            ORDER BY e.nombre ASC
+        """),
+        {"tri": trimestre},
+    )
+    rows = result.mappings().all()
+    empresas = [
+        EmpresaEPOut(
+            id=r["id"],
+            nombre=r["nombre"],
+            tipo=r["tipo"],
+            activa=r["activa"],
+        )
+        for r in rows
+    ]
+
+    return ListaEmpresasEPResponse(
+        trimestre=trimestre,
+        total=len(empresas),
+        empresas=empresas,
+    )
 
 
 @router.get("/{trimestre}/exportar-excel")

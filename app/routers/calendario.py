@@ -17,6 +17,7 @@ Tablas Prisma (camelCase):
 """
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +45,7 @@ from app.services.calendario.post_proceso import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -1358,9 +1360,16 @@ async def importar_excel_file(
         raise HTTPException(status_code=400, detail=f"Error al leer Excel: {str(e)}")
 
     # ── 2. Validar headers ────────────────────────────────────
-    # Include "Fecha" for new format but don't require it (backward compat)
+    # V21 / Deuda 4: "Empresa Original" + "Tipo" entran al col_map para
+    # desambiguar slots compartidos BASE+EXTRA. Ambas siguen siendo opcionales:
+    # un Excel viejo sin "Empresa Original" cae al fallback por empresa actual,
+    # y "Tipo" solo se usa para cross-validation (warning, nunca skip).
+    # V21 / Deuda 4 follow-up: "Motivo cambio" también opcional. Si la columna
+    # no existe o la celda viene vacía, NO se sobrescribe el motivoCambio en BD
+    # (re-importar un Excel "limpio" no debe borrar motivos previos).
     expected_headers = ["Semana", "Fecha", "Día", "Horario", "Turno", "Empresa",
-                        "Taller", "Programa", "Ciudad", "Tipo", "Estado", "Confirmado"]
+                        "Empresa Original", "Taller", "Programa", "Ciudad",
+                        "Tipo", "Estado", "Confirmado", "Motivo cambio"]
     actual_headers = [cell.value for cell in ws[1]]
 
     # Normalize headers (strip whitespace, case-insensitive match)
@@ -1391,12 +1400,17 @@ async def importar_excel_file(
     empresas_db = {r["nombre"].strip().lower(): r["id"] for r in emp_result.mappings().all()}
 
     # ── 4. Cargar slots existentes indexados ──────────────────
+    # V21 / Deuda 4: incluir tipoAsignacion para cross-validation contra col K.
+    # V21 / Deuda 4 follow-up: incluir motivoCambio para detectar diferencias
+    # contra col N y evitar UPDATEs ruidosos cuando el valor coincide.
     slots_result = await db.execute(
         text("""
             SELECT
                 p.id, p.semana, p.dia, p.horario,
                 p."empresaId" AS empresa_id,
                 p."empresaIdOriginal" AS empresa_id_original,
+                p."tipoAsignacion" AS tipo_asignacion,
+                p."motivoCambio" AS motivo_cambio,
                 e.nombre AS empresa_nombre,
                 t.nombre AS taller_nombre,
                 t.programa,
@@ -1417,11 +1431,13 @@ async def importar_excel_file(
             detail=f"No hay slots de planificacion para {trimestre}",
         )
 
-    # Index: (semana, taller_nombre_lower) -> slot
-    slot_index: dict[tuple[int, str], dict] = {}
+    # V21 / Deuda 4: index now keeps a list per (sem, taller) so shared slots
+    # (BASE + EXTRA at the same key) can be disambiguated downstream by empresa
+    # original / actual rather than collapsed to a single arbitrary row.
+    slot_index: dict[tuple[int, str], list[dict]] = {}
     for s in slots_db:
         key = (s["semana"], s["taller_nombre"].strip().lower())
-        slot_index[key] = s
+        slot_index.setdefault(key, []).append(s)
 
     # ── 5. Procesar filas del Excel ───────────────────────────
     # Estado normalization map (handles typos)
@@ -1435,6 +1451,14 @@ async def importar_excel_file(
         "PLANIFICADO": "PLANIFICADO",
         "PLANFICADO": "PLANIFICADO",  # typo
         "VACANTE": "VACANTE",
+    }
+
+    # V21 / Deuda 4 follow-up: mapping legible (col N) → enum BD. Same exact
+    # strings the exporter emits; planners typing free-form variants get a
+    # warning instead of silently mapping.
+    MOTIVO_LEGIBLE_TO_ENUM = {
+        "Empresa canceló": "EMPRESA_CANCELO",
+        "Decisión planificador": "DECISION_PLANIFICADOR",
     }
 
     updates_to_apply: list[dict] = []
@@ -1453,6 +1477,17 @@ async def importar_excel_file(
             empresa_val = row[col_map["Empresa"]]
             estado_val = row[col_map["Estado"]]
             confirmado_val = row[col_map["Confirmado"]]
+            # V21 / Deuda 4: optional disambiguation columns. None == column
+            # absent in this Excel (legacy export); empty string == column
+            # present but blank for this row.
+            empresa_original_val = (
+                row[col_map["Empresa Original"]] if "Empresa Original" in col_map else None
+            )
+            tipo_val = row[col_map["Tipo"]] if "Tipo" in col_map else None
+            # V21 / Deuda 4 follow-up: col N. Empty/missing → motivoCambio is
+            # NOT touched; only set when the planner explicitly provides one of
+            # the two legible values.
+            motivo_val = row[col_map["Motivo cambio"]] if "Motivo cambio" in col_map else None
 
             # Parse semana
             try:
@@ -1470,18 +1505,20 @@ async def importar_excel_file(
             # Normalize taller name
             taller_nombre = str(taller_val).strip().lower()
 
-            # Find matching slot
+            # Find candidate rows for this (sem, taller). May be 0, 1, or 2+.
             key = (semana, taller_nombre)
-            slot = slot_index.get(key)
+            candidates: list[dict] = slot_index.get(key, [])
 
-            if not slot:
+            if not candidates:
                 warnings.append(f"Fila {row_num}: Slot no encontrado (S{semana}, {taller_val})")
                 errores += 1
                 continue
 
-            # ── Process empresa ───────────────────────────────
+            # ── Process empresa (col F) ───────────────────────
+            # Resolve up-front: needed both as the "new empresa" if changed AND
+            # as a fallback disambiguation key when col G is absent / no match.
             empresa_nueva = str(empresa_val).strip() if empresa_val else ""
-            empresa_nueva_id = None
+            empresa_nueva_id: int | None = None
 
             if empresa_nueva:
                 empresa_nueva_lower = empresa_nueva.lower()
@@ -1489,7 +1526,110 @@ async def importar_excel_file(
                     empresa_nueva_id = empresas_db[empresa_nueva_lower]
                 else:
                     warnings.append(f"Fila {row_num}: Empresa '{empresa_nueva}' no encontrada")
-                    # Don't skip - we can still update estado/confirmado
+                    # Don't skip — disambiguation may still match by original,
+                    # and even if not we can still update estado/confirmado on
+                    # the resolved row.
+
+            # ── V21 / Deuda 4: resolve "Empresa Original" (col G) ────
+            # has_original_col tracks whether col G existed AND had a value.
+            # Empty string in present column = treated as missing (no constraint).
+            empresa_original_text = (
+                str(empresa_original_val).strip() if empresa_original_val else ""
+            )
+            empresa_id_original_excel: int | None = None
+            has_original_col = bool(empresa_original_text)
+
+            if has_original_col:
+                eo_lower = empresa_original_text.lower()
+                if eo_lower in empresas_db:
+                    empresa_id_original_excel = empresas_db[eo_lower]
+                else:
+                    # Hard-skip: if planner provided col G with a value we don't
+                    # recognise, refuse to guess — avoids silent mis-updates.
+                    warnings.append(
+                        f"Fila {row_num}: Empresa Original '{empresa_original_text}' "
+                        f"no encontrada — verifica el Excel"
+                    )
+                    errores += 1
+                    continue
+
+            # ── V21 / Deuda 4: disambiguate to a single slot row ─────
+            # Algorithm:
+            #   - 1 candidate                     → that's it (with cross-check).
+            #   - 2+ candidates + col G resolved  → match on empresa_id_original.
+            #   - 2+ candidates + col G missing   → match on empresa_id (actual).
+            #   - 2+ candidates and neither matches uniquely → warn + skip.
+            slot: dict | None = None
+            match_path: str = "single"
+
+            if len(candidates) == 1:
+                slot = candidates[0]
+            else:
+                if has_original_col and empresa_id_original_excel is not None:
+                    by_orig = [
+                        c for c in candidates
+                        if c["empresa_id_original"] == empresa_id_original_excel
+                    ]
+                    if len(by_orig) == 1:
+                        slot = by_orig[0]
+                        match_path = "by_original"
+                    elif len(by_orig) >= 2:
+                        warnings.append(
+                            f"Fila {row_num}: S{semana} {taller_val}: ambigüedad "
+                            f"inesperada — múltiples filas matchean. Reportar este caso."
+                        )
+                        errores += 1
+                        continue
+                    # else len(by_orig) == 0 → fall through to actual fallback
+
+                if slot is None:
+                    by_actual = [
+                        c for c in candidates if c["empresa_id"] == empresa_nueva_id
+                    ]
+                    if len(by_actual) == 1:
+                        slot = by_actual[0]
+                        match_path = (
+                            "fallback_actual_no_orig_col"
+                            if not has_original_col
+                            else "fallback_actual_after_orig_miss"
+                        )
+                    elif len(by_actual) >= 2:
+                        warnings.append(
+                            f"Fila {row_num}: S{semana} {taller_val}: ambigüedad "
+                            f"inesperada — múltiples filas matchean por actual. "
+                            f"Reportar este caso."
+                        )
+                        errores += 1
+                        continue
+                    else:
+                        # 0 by original AND 0 by actual.
+                        warnings.append(
+                            f"Fila {row_num}: S{semana} {taller_val}: ninguna fila "
+                            f"del slot tiene empresa original '{empresa_original_text or '—'}' "
+                            f"ni actual '{empresa_nueva or '—'}'. Posible Excel "
+                            f"desactualizado o reasignación manual — edita en tabla."
+                        )
+                        errores += 1
+                        continue
+
+            assert slot is not None  # exhausted by the branches above
+            logger.info(
+                "legacy_update row=%d sem=%d taller=%r path=%s slot_id=%d "
+                "tipo_bd=%s",
+                row_num, semana, taller_val, match_path, slot["id"],
+                slot.get("tipo_asignacion"),
+            )
+
+            # ── Cross-validate Tipo (col K) — informative warning, no skip.
+            if tipo_val is not None:
+                tipo_excel = str(tipo_val).strip().upper()
+                tipo_bd = (slot.get("tipo_asignacion") or "").strip().upper()
+                if tipo_excel and tipo_bd and tipo_excel != tipo_bd:
+                    warnings.append(
+                        f"Fila {row_num}: S{semana} {taller_val}: tipo del Excel "
+                        f"({tipo_excel}) no coincide con BD ({tipo_bd}). "
+                        f"Aplicado igualmente."
+                    )
 
             # ── Process estado (with typo normalization) ──────
             # V17: reject "OK" with a clear row-level error so the planner
@@ -1519,6 +1659,24 @@ async def importar_excel_file(
                 elif confirmado_str in ("NO", "FALSE", "0", ""):
                     confirmado_nuevo = False
 
+            # ── Process motivo cambio (col N) ─────────────────
+            # V21 / Deuda 4 follow-up. None == column missing or cell empty →
+            # don't touch motivoCambio in DB. Unknown free-form string → warn
+            # and leave untouched. Recognised legible value → mapped to enum.
+            motivo_nuevo: str | None = None
+            if motivo_val is not None:
+                motivo_text = str(motivo_val).strip()
+                if motivo_text:
+                    if motivo_text in MOTIVO_LEGIBLE_TO_ENUM:
+                        motivo_nuevo = MOTIVO_LEGIBLE_TO_ENUM[motivo_text]
+                    else:
+                        warnings.append(
+                            f"Fila {row_num}: S{semana} {taller_val}: motivo "
+                            f"'{motivo_text}' no reconocido — se ignora. "
+                            f"Valores válidos: 'Empresa canceló', "
+                            f"'Decisión planificador'."
+                        )
+
             # ── Get and normalize DB values ───────────────────
             empresa_anterior_id = slot["empresa_id"]
             empresa_anterior_nombre = slot["empresa_nombre"]
@@ -1526,6 +1684,7 @@ async def importar_excel_file(
             estado_anterior_raw = slot["estado"]
             estado_anterior = estado_anterior_raw.strip().upper() if estado_anterior_raw else "PLANIFICADO"
             confirmado_anterior = bool(slot["confirmado"])  # Ensure boolean
+            motivo_anterior = slot.get("motivo_cambio")
 
             # ── Check if anything changed ─────────────────────
             changes = {}
@@ -1552,6 +1711,15 @@ async def importar_excel_file(
             # Confirmado change (compare as booleans)
             if confirmado_nuevo is not None and confirmado_nuevo != confirmado_anterior:
                 changes["confirmado"] = confirmado_nuevo
+
+            # V21 / Deuda 4 follow-up: motivo change. Only added when col N
+            # produced a recognised value AND it differs from BD.
+            if motivo_nuevo is not None and motivo_nuevo != motivo_anterior:
+                changes["motivo_cambio"] = motivo_nuevo
+                logger.info(
+                    "legacy_update row=%d slot_id=%d motivo=%s",
+                    row_num, slot["id"], motivo_nuevo,
+                )
 
             if not changes:
                 sin_cambios += 1
@@ -1644,6 +1812,11 @@ async def importar_excel_file(
             if "confirmado" in changes:
                 set_parts.append("confirmado = :confirmado")
                 params["confirmado"] = changes["confirmado"]
+
+            # V21 / Deuda 4 follow-up: persist motivoCambio when set.
+            if "motivo_cambio" in changes:
+                set_parts.append('"motivoCambio" = :motivo_cambio')
+                params["motivo_cambio"] = changes["motivo_cambio"]
 
             set_parts.append('"updatedAt" = NOW()')
 
