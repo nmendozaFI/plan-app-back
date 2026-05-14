@@ -203,10 +203,29 @@ class FilaExtraInsertada(BaseModel):
     fila_excel: int
 
 
+class FilaDobleInsertada(BaseModel):
+    """V22 (Cambio A): detail of a DOBLE slot inserted via the bulk importer.
+
+    Same shape as FilaExtraInsertada — kept separate so consumers can
+    pattern-match on the bucket without sniffing tipoAsignacion. `planificacion_id`
+    is `None` in dry_run mode.
+    """
+    planificacion_id: int | None
+    semana: int
+    dia: str
+    horario: str
+    taller_nombre: str
+    empresa_nombre: str
+    fila_excel: int
+
+
 class ImportarExcelBulkResult(BaseModel):
     """V18: result of bulk INSERT calendar importer (POST /{trimestre}/importar-excel-bulk).
 
     V20: adds extras_insertados / extras_detalle for escuela-propia EXTRA rows.
+    V22 (Cambio A): adds dobles_insertados / dobles_detalle for ad-hoc DOBLE rows
+    (semana intensiva of escuela-propia empresas). The bulk no longer reclassifies
+    rows — Tipo comes literally from the Excel column.
     """
     trimestre: str
     total_procesados: int
@@ -214,6 +233,8 @@ class ImportarExcelBulkResult(BaseModel):
     vacantes: int
     extras_insertados: int = 0
     extras_detalle: list[FilaExtraInsertada] = Field(default_factory=list)
+    dobles_insertados: int = 0
+    dobles_detalle: list[FilaDobleInsertada] = Field(default_factory=list)
     empresa_no_encontrada: int
     taller_no_encontrado: int
     errores: int
@@ -270,6 +291,83 @@ class EditarSlotExtraInput(BaseModel):
     """
     empresa_id: int | None = None
     notas: str | None = None
+
+
+# ── V22 (Cambio A): DOBLE schemas ──────────────────────────────────
+
+
+class CrearSlotDobleInput(BaseModel):
+    """V22 (Cambio A): input for POST /api/planificacion/{trimestre}/doble.
+
+    DOBLE = ad-hoc semana intensiva of an escuela-propia empresa (IBERIA s3,
+    VERISURE s8, LDA s9-10 in Q2). The router validates only that the empresa
+    exists, is activa, has escuelaPropia=true in this trimestre, and the taller
+    exists. Decision 4: NO collision check, NO programa check, NO duplicate
+    check — full freedom for the planner.
+    """
+    empresa_id: int
+    semana: int = Field(..., ge=1, le=13)
+    dia: str
+    horario: str
+    taller_id: int
+    notas: str | None = None
+
+
+class EditarSlotDobleInput(BaseModel):
+    """V22 (Cambio A): input for PATCH /api/planificacion/{slot_id}/doble.
+
+    DOBLE PATCH is much more permissive than EXTRA: empresa, taller, semana, día,
+    horario and notas are all editable. At least one field must be provided
+    (router-level 422 check). Editing never validates collision/programa/dup.
+    """
+    empresa_id: int | None = None
+    taller_id: int | None = None
+    semana: int | None = Field(default=None, ge=1, le=13)
+    dia: str | None = None
+    horario: str | None = None
+    notas: str | None = None
+
+
+class SlotDobleResponse(BaseModel):
+    """V22 (Cambio A): one DOBLE row.
+
+    Same shape as SlotExtraResponse plus `taller_id` and `programa` (so the
+    frontend can render the programa badge without re-joining). Returned by
+    POST/PATCH/GET endpoints in `doble.py`.
+    """
+    id: int
+    semana: int
+    dia: str
+    horario: str
+    taller_id: int
+    taller_nombre: str
+    programa: str
+    empresa_id: int | None
+    empresa_nombre: str | None
+    estado: str
+    confirmado: bool
+    notas: str | None
+    created_at: datetime
+
+
+class ListaDoblesResponse(BaseModel):
+    """V22 (Cambio A): response for GET /api/planificacion/{trimestre}/dobles."""
+    trimestre: str
+    total: int
+    dobles: list[SlotDobleResponse]
+
+
+class CleanupExtrasDobleResult(BaseModel):
+    """V22 (Cambio A): response for DELETE /api/planificacion/{trimestre}/extras-doble.
+
+    Returns the number of rows actually deleted (split by tipo) so the caller
+    can confirm the cleanup happened. `confirmar` echoes the query param so the
+    response is self-describing in logs.
+    """
+    trimestre: str
+    confirmar: bool
+    extras_eliminados: int
+    dobles_eliminados: int
 
 
 class RecalcularScoresResult(BaseModel):

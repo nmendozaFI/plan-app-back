@@ -41,6 +41,7 @@ class ConfigTrimestralOut(BaseModel):
     empresa_nombre: str
     tipo_participacion: str  # EF, IT, AMBAS
     escuela_propia: bool
+    permite_extras: bool  # V22 (Cambio A): empresa puede recibir EXTRA en este trimestre.
     frecuencia_solicitada: Optional[int]
     disponibilidad_dias: str  # "L,M,X,J,V"
     turno_preferido: Optional[str]  # "M", "T", null
@@ -52,6 +53,7 @@ class ConfigTrimestralOut(BaseModel):
 class ConfigTrimestralUpdate(BaseModel):
     tipo_participacion: Optional[str] = None
     escuela_propia: Optional[bool] = None
+    permite_extras: Optional[bool] = None  # V22 (Cambio A)
     frecuencia_solicitada: Optional[int] = None
     disponibilidad_dias: Optional[str] = None
     turno_preferido: Optional[str] = None
@@ -64,6 +66,7 @@ class ConfigBatchUpdateItem(BaseModel):
     empresa_id: int
     tipo_participacion: Optional[str] = None
     escuela_propia: Optional[bool] = None
+    permite_extras: Optional[bool] = None  # V22 (Cambio A)
     frecuencia_solicitada: Optional[int] = None
     disponibilidad_dias: Optional[str] = None
     turno_preferido: Optional[str] = None
@@ -95,6 +98,7 @@ class ConfigResumen(BaseModel):
     con_frecuencia: int
     sin_frecuencia: int
     escuela_propia: int
+    permite_extras: int  # V22 (Cambio A): count of CTs with permiteExtras=true.
 
 
 class ImportPreviewItem(BaseModel):
@@ -209,6 +213,7 @@ async def obtener_configs_trimestre(
                 e.nombre AS empresa_nombre,
                 ct."tipoParticipacion" AS tipo_participacion,
                 ct."escuelaPropia" AS escuela_propia,
+                ct."permiteExtras" AS permite_extras,
                 ct."frecuenciaSolicitada" AS frecuencia_solicitada,
                 ct."disponibilidadDias" AS disponibilidad_dias,
                 ct."turnoPreferido" AS turno_preferido,
@@ -249,7 +254,8 @@ async def resumen_configs(
                 SUM(CASE WHEN "tipoParticipacion" = 'AMBAS' THEN 1 ELSE 0 END) AS ambas,
                 SUM(CASE WHEN "frecuenciaSolicitada" IS NOT NULL AND "frecuenciaSolicitada" > 0 THEN 1 ELSE 0 END) AS con_freq,
                 SUM(CASE WHEN "frecuenciaSolicitada" IS NULL OR "frecuenciaSolicitada" = 0 THEN 1 ELSE 0 END) AS sin_freq,
-                SUM(CASE WHEN "escuelaPropia" = true THEN 1 ELSE 0 END) AS escuela_propia
+                SUM(CASE WHEN "escuelaPropia" = true THEN 1 ELSE 0 END) AS escuela_propia,
+                SUM(CASE WHEN "permiteExtras" = true THEN 1 ELSE 0 END) AS permite_extras
             FROM "configTrimestral"
             WHERE trimestre = :tri
         """),
@@ -265,6 +271,7 @@ async def resumen_configs(
             "con_frecuencia": 0,
             "sin_frecuencia": 0,
             "escuela_propia": 0,
+            "permite_extras": 0,
         }
 
     return {
@@ -278,6 +285,7 @@ async def resumen_configs(
         "con_frecuencia": row["con_freq"] or 0,
         "sin_frecuencia": row["sin_freq"] or 0,
         "escuela_propia": row["escuela_propia"] or 0,
+        "permite_extras": row["permite_extras"] or 0,
     }
 
 
@@ -303,6 +311,57 @@ async def listar_empresas_ep(
             JOIN empresa e ON e.id = ct."empresaId"
             WHERE ct.trimestre = :tri
               AND ct."escuelaPropia" = true
+              AND e.activa = true
+            ORDER BY e.nombre ASC
+        """),
+        {"tri": trimestre},
+    )
+    rows = result.mappings().all()
+    empresas = [
+        EmpresaEPOut(
+            id=r["id"],
+            nombre=r["nombre"],
+            tipo=r["tipo"],
+            activa=r["activa"],
+        )
+        for r in rows
+    ]
+
+    return ListaEmpresasEPResponse(
+        trimestre=trimestre,
+        total=len(empresas),
+        empresas=empresas,
+    )
+
+
+@router.get(
+    "/{trimestre}/empresas-permite-extras",
+    response_model=ListaEmpresasEPResponse,
+)
+async def listar_empresas_permite_extras(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """V22 (Cambio A): lista empresas con permiteExtras=true en el trimestre.
+
+    Filtra también por empresa.activa=true. Orden alfabético por nombre.
+    Usado por el modal "Añadir EXTRA" de Operación (Fase 6) para poblar el Select
+    de empresas elegibles. Trimestre inexistente → 200 con lista vacía.
+
+    Análogo a /empresas-ep, pero el gate es permiteExtras en vez de escuelaPropia.
+    Reusa el mismo response model porque la forma de la fila es idéntica.
+    """
+    result = await db.execute(
+        text("""
+            SELECT
+                e.id,
+                e.nombre,
+                e.tipo,
+                e.activa
+            FROM "configTrimestral" ct
+            JOIN empresa e ON e.id = ct."empresaId"
+            WHERE ct.trimestre = :tri
+              AND ct."permiteExtras" = true
               AND e.activa = true
             ORDER BY e.nombre ASC
         """),
@@ -668,6 +727,10 @@ async def actualizar_configs_batch(
                 updates.append('"escuelaPropia" = :escuela')
                 params["escuela"] = item.escuela_propia
 
+            if item.permite_extras is not None:
+                updates.append('"permiteExtras" = :permite')
+                params["permite"] = item.permite_extras
+
             if item.frecuencia_solicitada is not None:
                 updates.append('"frecuenciaSolicitada" = :freq')
                 params["freq"] = item.frecuencia_solicitada
@@ -730,6 +793,7 @@ async def inicializar_configs(
 
     if body.origen_trimestre:
         # ── Modo clonar ──────────────────────────────────────
+        # V22 (Cambio A): permiteExtras se copia 1:1 desde el trimestre origen.
         rows = await db.execute(
             text("""
                 SELECT
@@ -738,6 +802,7 @@ async def inicializar_configs(
                     e.activa,
                     ct."tipoParticipacion",
                     ct."escuelaPropia",
+                    ct."permiteExtras",
                     ct."turnoPreferido",
                     ct."frecuenciaSolicitada",
                     ct."disponibilidadDias",
@@ -769,14 +834,14 @@ async def inicializar_configs(
                 text("""
                     INSERT INTO "configTrimestral" (
                         "empresaId", trimestre, "tipoParticipacion",
-                        "escuelaPropia", "disponibilidadDias",
+                        "escuelaPropia", "permiteExtras", "disponibilidadDias",
                         "turnoPreferido", "frecuenciaSolicitada",
                         "voluntariosDisponibles", "preferenciasTaller",
                         notas, "updatedAt"
                     )
                     VALUES (
                         :eid, :destino, :tipo,
-                        :escuela, :dias,
+                        :escuela, :permite, :dias,
                         :turno, :freq,
                         :vol, :pref,
                         :notas, NOW()
@@ -788,6 +853,7 @@ async def inicializar_configs(
                     "destino": trimestre,
                     "tipo": cfg["tipoParticipacion"],
                     "escuela": cfg["escuelaPropia"] or False,
+                    "permite": cfg["permiteExtras"] or False,
                     "dias": cfg["disponibilidadDias"] or "L,M,X,J,V",
                     "turno": cfg["turnoPreferido"],
                     "freq": cfg["frecuenciaSolicitada"],
@@ -807,10 +873,12 @@ async def inicializar_configs(
 
     else:
         # ── Modo crear por defecto ───────────────────────────
-        # Obtener empresas activas que no tienen config para este trimestre
+        # V22 (Cambio A): permiteExtras hereda de empresa.aceptaExtras (baseline
+        # maestro). El planificador puede después flipearlo per-trimestre desde
+        # la UI sin tocar la empresa maestra.
         rows = await db.execute(
             text("""
-                SELECT e.id, e.nombre, e.tipo, e."turnoPreferido"
+                SELECT e.id, e.nombre, e.tipo, e."turnoPreferido", e."aceptaExtras"
                 FROM empresa e
                 WHERE e.activa = true
                 AND NOT EXISTS (
@@ -828,13 +896,13 @@ async def inicializar_configs(
                 text("""
                     INSERT INTO "configTrimestral" (
                         "empresaId", trimestre, "tipoParticipacion",
-                        "escuelaPropia", "disponibilidadDias",
+                        "escuelaPropia", "permiteExtras", "disponibilidadDias",
                         "turnoPreferido", "voluntariosDisponibles",
                         "updatedAt"
                     )
                     VALUES (
                         :eid, :tri, :tipo,
-                        false, 'L,M,X,J,V',
+                        false, :permite, 'L,M,X,J,V',
                         :turno, 0,
                         NOW()
                     )
@@ -843,6 +911,7 @@ async def inicializar_configs(
                     "eid": emp["id"],
                     "tri": trimestre,
                     "tipo": emp["tipo"] or "AMBAS",
+                    "permite": bool(emp["aceptaExtras"]),
                     "turno": emp["turnoPreferido"],
                 },
             )
@@ -911,6 +980,10 @@ async def actualizar_config(
             updates.append('"escuelaPropia" = :escuela')
             params["escuela"] = body.escuela_propia
 
+        if body.permite_extras is not None:
+            updates.append('"permiteExtras" = :permite')
+            params["permite"] = body.permite_extras
+
         if body.frecuencia_solicitada is not None:
             updates.append('"frecuenciaSolicitada" = :freq')
             params["freq"] = body.frecuencia_solicitada
@@ -949,12 +1022,13 @@ async def actualizar_config(
             text("""
                 INSERT INTO "configTrimestral" (
                     "empresaId", trimestre, "tipoParticipacion",
-                    "escuelaPropia", "frecuenciaSolicitada", "disponibilidadDias",
-                    "turnoPreferido", "voluntariosDisponibles", "preferenciasTaller",
+                    "escuelaPropia", "permiteExtras", "frecuenciaSolicitada",
+                    "disponibilidadDias", "turnoPreferido",
+                    "voluntariosDisponibles", "preferenciasTaller",
                     notas, "updatedAt"
                 )
                 VALUES (
-                    :eid, :tri, :tipo, :escuela, :freq, :dias,
+                    :eid, :tri, :tipo, :escuela, :permite, :freq, :dias,
                     :turno, :vol, :pref, :notas, NOW()
                 )
             """),
@@ -963,6 +1037,7 @@ async def actualizar_config(
                 "tri": trimestre,
                 "tipo": body.tipo_participacion or "AMBAS",
                 "escuela": body.escuela_propia or False,
+                "permite": body.permite_extras or False,
                 "freq": body.frecuencia_solicitada,
                 "dias": body.disponibilidad_dias or "L,M,X,J,V",
                 "turno": body.turno_preferido if body.turno_preferido != "" else None,
@@ -983,6 +1058,7 @@ async def actualizar_config(
                 e.nombre AS empresa_nombre,
                 ct."tipoParticipacion" AS tipo_participacion,
                 ct."escuelaPropia" AS escuela_propia,
+                ct."permiteExtras" AS permite_extras,
                 ct."frecuenciaSolicitada" AS frecuencia_solicitada,
                 ct."disponibilidadDias" AS disponibilidad_dias,
                 ct."turnoPreferido" AS turno_preferido,

@@ -31,7 +31,7 @@ from app.schemas.calendario import (
     EmpresaAnalisis, CambioSlot, AnalisisResumen, AnalisisResponse,
     CerrarTrimestreInput, CerrarTrimestreResult,
     EmpresaCambiada, CambioDetalle, ImportarExcelResult, ImportarExcelInput,
-    ImportarExcelBulkResult, FilaExtraInsertada,
+    ImportarExcelBulkResult, FilaExtraInsertada, FilaDobleInsertada,
     ListaExtrasResponse, SlotExtraResponse,
     RecalcularScoresResult,
 )
@@ -315,6 +315,7 @@ async def obtener_calendario(
                    p."empresaId" AS empresa_id,
                    p."empresaIdOriginal" AS empresa_id_original,
                    e.nombre AS empresa_nombre,
+                   e_orig.nombre AS empresa_nombre_original,
                    t.programa,
                    p."tallerId" AS taller_id,
                    t.nombre AS taller_nombre,
@@ -328,6 +329,7 @@ async def obtener_calendario(
             FROM planificacion p
             JOIN taller t ON t.id = p."tallerId"
             LEFT JOIN empresa e ON e.id = p."empresaId"
+            LEFT JOIN empresa e_orig ON e_orig.id = p."empresaIdOriginal"
             LEFT JOIN ciudad c ON c.id = p."ciudadId"
             WHERE p.trimestre = :trimestre
             ORDER BY p.semana,
@@ -1852,7 +1854,7 @@ _BULK_ESTADO_NORMALIZE = {
     "VACANTE": "VACANTE",
 }
 
-_BULK_TIPO_VALID = {"BASE", "EXTRA", "CONTINGENCIA"}
+_BULK_TIPO_VALID = {"BASE", "EXTRA", "DOBLE", "CONTINGENCIA"}
 
 
 def _bulk_parse_bool(val) -> bool:
@@ -1910,10 +1912,10 @@ async def importar_excel_bulk(
     insertados = 0
     vacantes = 0
     extras_insertados = 0
+    dobles_insertados = 0  # V22 (Cambio A): rows with literal Tipo='DOBLE' in Excel.
     empresa_no_encontrada = 0
     taller_no_encontrado = 0
     errores = 0
-    extras_pending: list[dict] = []  # rows queued for EXTRA classification (post-INSERT)
 
     # ── 1. Read workbook ─────────────────────────────────────
     try:
@@ -1996,18 +1998,21 @@ async def importar_excel_bulk(
         )
         talleres_by_name_prog.setdefault(soft_key, []).append(r["id"])
 
-    # V20: escuelaPropia per empresa for THIS trimestre (true/false). Empresas
-    # without a configTrimestral row default to False.
-    ep_result = await db.execute(
+    # V22 (Cambio A): permiteExtras per empresa for THIS trimestre. Used ONLY to
+    # emit a warning when a row arrives tagged Tipo='EXTRA' for an empresa that
+    # doesn't have the flag. The row is inserted regardless (decision 7: the bulk
+    # trusts the Tipo column literally; the planner is the source of truth for
+    # the Excel). Empresas without a configTrimestral row default to False.
+    pe_result = await db.execute(
         text('''
-            SELECT "empresaId", "escuelaPropia"
+            SELECT "empresaId", "permiteExtras"
               FROM "configTrimestral"
              WHERE trimestre = :tri
         '''),
         {"tri": trimestre},
     )
-    escuela_propia_map: dict[int, bool] = {
-        r["empresaId"]: bool(r["escuelaPropia"]) for r in ep_result.mappings().all()
+    permite_extras_map: dict[int, bool] = {
+        r["empresaId"]: bool(r["permiteExtras"]) for r in pe_result.mappings().all()
     }
 
     ciudad_result = await db.execute(text("SELECT id, nombre FROM ciudad"))
@@ -2093,8 +2098,8 @@ async def importar_excel_bulk(
                     # a soft warning that inserted with empresaId=NULL). Required so
                     # counter buckets are mutually exclusive and the math invariant
                     # total_procesados = insertados + vacantes + extras_insertados
-                    #                  + empresa_no_encontrada + taller_no_encontrado
-                    #                  + errores
+                    #                  + dobles_insertados + empresa_no_encontrada
+                    #                  + taller_no_encontrado + errores
                     # holds. Previous behavior silently dropped empresa assignments
                     # on misspelled names — surfacing as a rejection is safer.
                     empresa_no_encontrada += 1
@@ -2133,9 +2138,11 @@ async def importar_excel_bulk(
             taller_id = talleres_map.get(taller_key)
             soft_match_used = False
             if taller_id is None:
-                # V20: fallback — match by (nombre, programa) only.
-                # If this softer match also fails, the row is genuinely invalid
-                # catalog and we keep the legacy reject behavior.
+                # V22 (Cambio A): soft fallback by (nombre, programa) is now ALWAYS
+                # allowed — no AND-AND classification anymore. The Tipo column
+                # comes from the Excel literally (BASE/EXTRA/DOBLE/HUECO), so an
+                # off-catalog day/horario combination is just data the planner
+                # entered; we trust it. A genuine off-catalog NAME still rejects.
                 soft_key = (str(taller_raw).strip().lower(), programa)
                 soft_candidates = talleres_by_name_prog.get(soft_key)
                 if not soft_candidates:
@@ -2143,22 +2150,6 @@ async def importar_excel_bulk(
                         warnings.append(
                             f"Fila {row_num}: Taller no encontrado para "
                             f"(nombre='{taller_raw}', día={dia}, horario={horario}, programa={programa})"
-                        )
-                        seen_taller_404.add(taller_key)
-                    # V20: counter buckets are mutually exclusive — only
-                    # taller_no_encontrado increments here (was previously
-                    # double-counted with errores too).
-                    taller_no_encontrado += 1
-                    continue
-                # Soft-matched: pick the first candidate. The row still has to
-                # qualify as EXTRA (escuelaPropia + collision) — see post-loop
-                # classification. Empresa is required for EXTRA classification:
-                # vacancies cannot be EXTRA.
-                if empresa_id is None:
-                    if taller_key not in seen_taller_404:
-                        warnings.append(
-                            f"Fila {row_num}: Taller no encontrado por (día,horario) y "
-                            f"sin empresa para clasificar como EXTRA — rechazado"
                         )
                         seen_taller_404.add(taller_key)
                     taller_no_encontrado += 1
@@ -2179,7 +2170,9 @@ async def importar_excel_bulk(
                         )
                         seen_ciudad_404.add(c_str.upper())
 
-            # Tipo asignación
+            # Tipo asignación — V22 (Cambio A): literal from Excel column.
+            # The bulk no longer reclassifies rows based on escuelaPropia + collision.
+            # Legacy "HUECO" alias kept for compat → CONTINGENCIA.
             tipo_raw = _cell(row, "Tipo")
             tipo_asig = "BASE"
             if tipo_raw is not None:
@@ -2189,6 +2182,20 @@ async def importar_excel_bulk(
                 elif t_str in _BULK_TIPO_VALID:
                     tipo_asig = t_str
             es_contingencia = (tipo_asig == "CONTINGENCIA")
+
+            # V22 (Cambio A): warn (don't block) when an EXTRA row lands on an
+            # empresa without permiteExtras=true in this trimestre. The row goes in
+            # — the planner controls the Excel — but we surface the inconsistency
+            # so they can fix the CT flag or the Excel.
+            if (
+                tipo_asig == "EXTRA"
+                and empresa_id is not None
+                and not permite_extras_map.get(empresa_id, False)
+            ):
+                warnings.append(
+                    f"Fila {row_num}: '{empresa_str}' tiene Tipo=EXTRA pero no tiene "
+                    f"permiteExtras=true en {trimestre}. La fila se inserta igualmente."
+                )
 
             # Confirmado
             confirmado = _bulk_parse_bool(_cell(row, "Confirmado"))
@@ -2214,17 +2221,27 @@ async def importar_excel_bulk(
                 "confirmado": confirmado,
                 "notas": notas_val,
                 "motivo": motivo_val,
-                # V20: bookkeeping for EXTRA classification (stripped before INSERT).
+                # Bookkeeping for detalle lists in section 6 (stripped before INSERT).
                 "_soft_match_used": soft_match_used,
                 "_row_num": row_num,
                 "_taller_nombre": str(taller_raw).strip(),
                 "_empresa_nombre": empresa_str,
             }
             inserts_to_apply.append(ins_row)
-            # V20 hotfix: counter accounting fully deferred to the post-loop
-            # classification pass — every row (strict OR soft match) must be
-            # evaluated against the EXTRA rule before we know which bucket it
-            # falls into (insertados / vacantes / extras_insertados / rejection).
+
+            # V22 (Cambio A): counter accounting inline (no more post-loop
+            # classification pass). Invariant:
+            #   total_procesados = insertados + vacantes + extras_insertados
+            #                    + dobles_insertados + empresa_no_encontrada
+            #                    + taller_no_encontrado + errores
+            if empresa_id is None:
+                vacantes += 1
+            elif tipo_asig == "EXTRA":
+                extras_insertados += 1
+            elif tipo_asig == "DOBLE":
+                dobles_insertados += 1
+            else:  # BASE or CONTINGENCIA
+                insertados += 1
 
         except Exception as e:
             warnings.append(f"Fila {row_num}: Error procesando: {str(e)}")
@@ -2232,96 +2249,13 @@ async def importar_excel_bulk(
 
     wb.close()
 
-    # ── 5b. EXTRA classification pass (V20, hotfix) ──────────
-    # EXTRA classification rule (V20, hotfix):
-    # EXTRA = (empresa has escuelaPropia=true in this trimestre) AND
-    #         (this row collides with another slot for same trimestre+semana+dia+horario
-    #          belonging to a different empresa).
-    #
-    # This rule applies to EVERY row that successfully resolved a taller, regardless of
-    # whether the catalog match was strict (nombre+día+horario+programa) or soft (nombre+programa).
-    #
-    # Rationale: extras are a semantic concept ("this slot was added on top of the standard
-    # calendar by an escuela propia company"), not a structural one. They show up in two flavors:
-    #   - Same workshop, same time, different company (most common — strict catalog match).
-    #   - Workshop moved to a different day/time (less common — soft fallback match).
-    # Both are EXTRA. The classification rule is the same for both.
-    #
-    # Both AND conditions are required. EP without collision = BASE. Collision without EP = BASE
-    # (or rejected if row only matched via fallback).
-    #
-    # Collisions are computed against (a) other rows in the SAME bulk batch and
-    # (b) rows already committed to planificacion for this trimestre. (b) is
-    # only relevant when wipe_first=False (otherwise the trimestre is wiped and
-    # cannot have pre-existing rows by construction of the 409 guard) — Option C.
-    occupancy: dict[tuple[int, str, str], set[int]] = {}
-    for ins in inserts_to_apply:
-        if ins["eid"] is None:
-            continue
-        key = (ins["sem"], ins["dia"], ins["horario"])
-        occupancy.setdefault(key, set()).add(ins["eid"])
-
-    # Pre-existing rows (only matters when wipe_first=False).
-    if not wipe_first:
-        existing_slots = await db.execute(
-            text('''
-                SELECT semana, dia, horario, "empresaId"
-                  FROM planificacion
-                 WHERE trimestre = :tri
-                   AND "empresaId" IS NOT NULL
-            '''),
-            {"tri": trimestre},
-        )
-        for r in existing_slots.mappings().all():
-            key = (r["semana"], r["dia"], r["horario"])
-            occupancy.setdefault(key, set()).add(r["empresaId"])
-
-    final_inserts: list[dict] = []
-    for ins in inserts_to_apply:
-        empresa_id_row = ins["eid"]
-
-        # Vacancies (no empresa) cannot be EXTRA — they are not soft-matched
-        # either (the soft-match path requires empresa_id), so they always
-        # come from a strict catalog match and go in as VACANTE.
-        if empresa_id_row is None:
-            final_inserts.append(ins)
-            vacantes += 1
-            continue
-
-        is_ep = bool(escuela_propia_map.get(empresa_id_row, False))
-        key = (ins["sem"], ins["dia"], ins["horario"])
-        others = occupancy.get(key, set()) - {empresa_id_row}
-        has_collision = len(others) > 0
-
-        if is_ep and has_collision:
-            ins["tipo"] = "EXTRA"
-            extras_pending.append(ins)
-            extras_insertados += 1
-            final_inserts.append(ins)
-            continue
-
-        # Not EXTRA. Strict-matched rows fall through to BASE. Soft-matched
-        # rows are rejected because they don't fit the catalog and don't
-        # qualify as EXTRA either.
-        if ins["_soft_match_used"]:
-            reason = []
-            if not is_ep:
-                reason.append("empresa no tiene escuelaPropia=true en este trimestre")
-            if not has_collision:
-                reason.append("sin colisión en (semana,día,horario)")
-            warnings.append(
-                f"Fila {ins['_row_num']}: Taller con día/horario fuera de catálogo "
-                f"para '{ins['_taller_nombre']}' rechazado — {' y '.join(reason)}"
-            )
-            taller_no_encontrado += 1
-        else:
-            final_inserts.append(ins)
-            insertados += 1
-
-    inserts_to_apply = final_inserts
+    # V22 (Cambio A): the post-loop AND-AND classification pass is gone.
+    # `tipo_asig` was set inline from the Excel column. Counters and detalle
+    # lists are built during section 6 from `ins["tipo"]` directly.
 
     # ── 6. Apply (skip in dry_run) ───────────────────────────
     extras_detalle: list[FilaExtraInsertada] = []
+    dobles_detalle: list[FilaDobleInsertada] = []
     _BK_KEYS = ("_soft_match_used", "_row_num", "_taller_nombre", "_empresa_nombre")
     if not dry_run:
         if wipe_first:
@@ -2349,7 +2283,9 @@ async def importar_excel_bulk(
                 params,
             )
             new_id = result.scalar()
-            if ins.get("tipo") == "EXTRA" and new_id is not None:
+            if new_id is None:
+                continue
+            if ins.get("tipo") == "EXTRA":
                 extras_detalle.append(
                     FilaExtraInsertada(
                         planificacion_id=new_id,
@@ -2361,14 +2297,38 @@ async def importar_excel_bulk(
                         fila_excel=ins["_row_num"],
                     )
                 )
+            elif ins.get("tipo") == "DOBLE":
+                dobles_detalle.append(
+                    FilaDobleInsertada(
+                        planificacion_id=new_id,
+                        semana=ins["sem"],
+                        dia=ins["dia"],
+                        horario=ins["horario"],
+                        taller_nombre=ins["_taller_nombre"],
+                        empresa_nombre=ins["_empresa_nombre"],
+                        fila_excel=ins["_row_num"],
+                    )
+                )
         await db.commit()
     else:
-        # Dry-run: surface the EXTRAs that *would* be inserted with id=None
-        # (row not committed, no real Planificacion.id exists yet).
+        # Dry-run: surface the EXTRAs/DOBLEs that *would* be inserted with id=None
+        # (no row committed, no real Planificacion.id exists yet).
         for ins in inserts_to_apply:
             if ins.get("tipo") == "EXTRA":
                 extras_detalle.append(
                     FilaExtraInsertada(
+                        planificacion_id=None,
+                        semana=ins["sem"],
+                        dia=ins["dia"],
+                        horario=ins["horario"],
+                        taller_nombre=ins["_taller_nombre"],
+                        empresa_nombre=ins["_empresa_nombre"],
+                        fila_excel=ins["_row_num"],
+                    )
+                )
+            elif ins.get("tipo") == "DOBLE":
+                dobles_detalle.append(
+                    FilaDobleInsertada(
                         planificacion_id=None,
                         semana=ins["sem"],
                         dia=ins["dia"],
@@ -2386,6 +2346,8 @@ async def importar_excel_bulk(
         vacantes=vacantes,
         extras_insertados=extras_insertados,
         extras_detalle=extras_detalle,
+        dobles_insertados=dobles_insertados,
+        dobles_detalle=dobles_detalle,
         empresa_no_encontrada=empresa_no_encontrada,
         taller_no_encontrado=taller_no_encontrado,
         errores=errores,

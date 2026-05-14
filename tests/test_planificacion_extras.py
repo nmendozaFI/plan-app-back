@@ -1,15 +1,23 @@
-"""V20: tests for the EXTRA classification path in the bulk calendar importer
-plus the listing and delete endpoints.
+"""V20 / V22: tests for the bulk calendar importer plus the EXTRA endpoints.
 
-The bulk endpoint must:
-  - Treat rows whose (taller.nombre, diaSemana, horario, programa) does NOT
-    match the catalog as candidates for EXTRA classification (soft match by
-    nombre+programa).
-  - Insert them with tipoAsignacion='EXTRA' iff the empresa has
-    configTrimestral.escuelaPropia=true AND the row collides on
-    (semana, dia, horario) with another row (in-batch or pre-existing) for
-    a different empresa.
-  - Otherwise reject the row as taller_no_encontrado.
+V22 (Cambio A) flipped the bulk semantics: the importer no longer reclassifies
+rows by the legacy AND-AND rule (escuelaPropia + collision). Tipo comes
+literally from the Excel column:
+  - 'EXTRA' literal → row inserts as tipoAsignacion='EXTRA'. If the empresa
+    doesn't have configTrimestral.permiteExtras=true, a warning is surfaced
+    (the row is still inserted — decision 7 of Cambio A).
+  - 'DOBLE' literal → row inserts as tipoAsignacion='DOBLE' (semana intensiva,
+    ad-hoc).
+  - 'HUECO' literal → CONTINGENCIA (back-compat alias).
+  - missing/blank/anything else → BASE.
+Soft-match by (nombre, programa) is always allowed when the strict 4-tuple
+(nombre, día, horario, programa) misses — no AND-AND gate, no rejection based
+on classification anymore.
+
+POST and PATCH /api/planificacion/.../extra (V21 → V22 Fase 5 + apéndice) gate
+by `permiteExtras=true` in CT (was `escuelaPropia` in Fase 4). Both endpoints
+share the same eligibility check so an empresa can never be valid for one and
+not the other. DELETE keeps the simple guard `tipoAsignacion='EXTRA'`.
 """
 
 import pytest
@@ -76,18 +84,36 @@ async def _create_empresa(db, nombre: str) -> int:
     return eid
 
 
-async def _set_config_trimestral(db, empresa_id: int, escuela_propia: bool):
-    """Create or update configTrimestral for (empresa, TEST_TRIMESTRE)."""
+async def _set_config_trimestral(
+    db,
+    empresa_id: int,
+    escuela_propia: bool,
+    *,
+    permite_extras: bool = False,
+):
+    """Create or update configTrimestral for (empresa, TEST_TRIMESTRE).
+
+    V22 (Cambio A): `permite_extras` is independent of `escuela_propia` —
+    escuela_propia gates the DOBLE CRUD, permite_extras gates EXTRA creation
+    via the POST /extra endpoint (in Fase 5) and silences the bulk warning.
+    Default False so existing call sites stay backward-compatible.
+    """
     await db.execute(
         text(
             'INSERT INTO "configTrimestral" '
             '("empresaId", trimestre, "tipoParticipacion", "escuelaPropia", '
-            '"disponibilidadDias", "updatedAt") '
-            "VALUES (:eid, :tri, 'AMBAS', :ep, 'L,M,X,J,V', NOW()) "
+            '"permiteExtras", "disponibilidadDias", "updatedAt") '
+            "VALUES (:eid, :tri, 'AMBAS', :ep, :pe, 'L,M,X,J,V', NOW()) "
             'ON CONFLICT ("empresaId", trimestre) DO UPDATE '
-            'SET "escuelaPropia" = EXCLUDED."escuelaPropia"'
+            'SET "escuelaPropia" = EXCLUDED."escuelaPropia", '
+            '    "permiteExtras" = EXCLUDED."permiteExtras"'
         ),
-        {"eid": empresa_id, "tri": TEST_TRIMESTRE, "ep": escuela_propia},
+        {
+            "eid": empresa_id,
+            "tri": TEST_TRIMESTRE,
+            "ep": escuela_propia,
+            "pe": permite_extras,
+        },
     )
     await db.commit()
 
@@ -188,36 +214,30 @@ async def _pick_two_talleres(db) -> tuple[dict, dict]:
 # ── Tests ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_extra_inserted_when_ep_and_collision(client, db_session):
-    """Positive: EP empresa + collision on (sem, dia, horario) → EXTRA inserted."""
-    catalog_anchor, base_anchor = await _pick_two_talleres(db_session)
+async def test_bulk_literal_tipo_extra_with_permite(client, db_session):
+    """V22 (Cambio A): literal Tipo='EXTRA' + empresa.permiteExtras=true → row
+    inserts as tipoAsignacion='EXTRA' with no warning.
 
-    ep_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}EXTRA_EP")
-    base_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}EXTRA_BASE")
-    await _set_config_trimestral(db_session, ep_empresa_id, escuela_propia=True)
-    await _set_config_trimestral(db_session, base_empresa_id, escuela_propia=False)
+    Replaces the legacy AND-AND positive test (was: soft-match + EP + collision).
+    Post-Cambio A there is no AND-AND classification; the Excel column drives it.
+    """
+    taller = await _pick_one_taller(db_session)
 
-    # Row 1 (BASE): base_empresa at base_anchor's catalog day/horario → matches strictly.
-    # Row 2 (EXTRA candidate): ep_empresa using catalog_anchor.nombre but base_anchor's
-    #   (dia, horario) → strict miss + soft hit + collision with row 1 → EXTRA.
+    ep_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}EXTRA_PE")
+    await _set_config_trimestral(
+        db_session, ep_empresa_id, escuela_propia=True, permite_extras=True,
+    )
+
     rows = [
         {
             "Semana": 1,
-            "Día": base_anchor["diaSemana"],
-            "Horario": base_anchor["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}EXTRA_BASE",
-            "Taller": base_anchor["nombre"],
-            "Programa": base_anchor["programa"],
+            "Día": taller["diaSemana"],
+            "Horario": taller["horario"],
+            "Empresa": f"{TEST_EMPRESA_PREFIX}EXTRA_PE",
+            "Taller": taller["nombre"],
+            "Programa": taller["programa"],
             "Estado": "PLANIFICADO",
-        },
-        {
-            "Semana": 1,
-            "Día": base_anchor["diaSemana"],
-            "Horario": base_anchor["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}EXTRA_EP",
-            "Taller": catalog_anchor["nombre"],
-            "Programa": catalog_anchor["programa"],
-            "Estado": "PLANIFICADO",
+            "Tipo": "EXTRA",
         },
     ]
     excel = _build_extras_excel(rows)
@@ -232,23 +252,22 @@ async def test_extra_inserted_when_ep_and_collision(client, db_session):
     data = resp.json()
 
     assert data["extras_insertados"] == 1, data
-    assert data["insertados"] == 1, data
+    assert data["insertados"] == 0, data
+    assert data["dobles_insertados"] == 0, data
     assert data["taller_no_encontrado"] == 0, data
     assert len(data["extras_detalle"]) == 1
     extra = data["extras_detalle"][0]
-    assert extra["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}EXTRA_EP"
-    assert extra["taller_nombre"] == catalog_anchor["nombre"]
+    assert extra["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}EXTRA_PE"
+    assert extra["taller_nombre"] == taller["nombre"]
     assert extra["semana"] == 1
-    assert extra["dia"] == base_anchor["diaSemana"]
-    assert extra["horario"] == base_anchor["horario"]
     assert extra["planificacion_id"] > 0
 
-    # Verify row was actually persisted with tipoAsignacion='EXTRA'.
+    # No "Tipo=EXTRA pero no permiteExtras" warning because the flag is set.
+    assert not any("permiteExtras" in w for w in data["warnings"]), data["warnings"]
+
+    # Verify the row landed with the right tipoAsignacion.
     db_row = await db_session.execute(
-        text(
-            'SELECT "tipoAsignacion", "empresaId" FROM planificacion '
-            "WHERE id = :id"
-        ),
+        text('SELECT "tipoAsignacion", "empresaId" FROM planificacion WHERE id = :id'),
         {"id": extra["planificacion_id"]},
     )
     rec = db_row.mappings().first()
@@ -256,11 +275,12 @@ async def test_extra_inserted_when_ep_and_collision(client, db_session):
     assert rec["tipoAsignacion"] == "EXTRA"
     assert rec["empresaId"] == ep_empresa_id
 
-    # Counter math invariant.
+    # Counter math invariant (V22 includes dobles_insertados).
     assert data["total_procesados"] == (
         data["insertados"]
         + data["vacantes"]
         + data["extras_insertados"]
+        + data["dobles_insertados"]
         + data["empresa_no_encontrada"]
         + data["taller_no_encontrado"]
         + data["errores"]
@@ -270,38 +290,36 @@ async def test_extra_inserted_when_ep_and_collision(client, db_session):
     list_resp = await client.get(f"/api/calendario/{TEST_TRIMESTRE}/extras")
     assert list_resp.status_code == 200
     list_data = list_resp.json()
-    assert list_data["total"] >= 1
     assert any(e["id"] == extra["planificacion_id"] for e in list_data["extras"])
 
 
 @pytest.mark.asyncio
-async def test_no_ep_no_extra(client, db_session):
-    """Negative: empresa is NOT escuelaPropia → row rejected as taller_no_encontrado."""
-    catalog_anchor, base_anchor = await _pick_two_talleres(db_session)
+async def test_bulk_literal_tipo_extra_without_permite_warns(client, db_session):
+    """V22 (Cambio A): literal Tipo='EXTRA' for an empresa WITHOUT
+    permiteExtras=true → row is still inserted (decision 7: bulk trusts the
+    Excel) but a warning surfaces so the planner can reconcile.
 
-    a_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}EXTRA_NOEP_A")
-    b_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}EXTRA_NOEP_B")
-    await _set_config_trimestral(db_session, a_empresa_id, escuela_propia=False)
-    await _set_config_trimestral(db_session, b_empresa_id, escuela_propia=False)
+    Replaces the legacy negative AND-AND test (was: NOT-EP empresa →
+    soft-match rejected). Post-Cambio A soft-match is never rejected and
+    classification depends on Tipo, not on the EP flag.
+    """
+    taller = await _pick_one_taller(db_session)
+
+    empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}EXTRA_NOPE")
+    await _set_config_trimestral(
+        db_session, empresa_id, escuela_propia=False, permite_extras=False,
+    )
 
     rows = [
         {
             "Semana": 1,
-            "Día": base_anchor["diaSemana"],
-            "Horario": base_anchor["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}EXTRA_NOEP_B",
-            "Taller": base_anchor["nombre"],
-            "Programa": base_anchor["programa"],
+            "Día": taller["diaSemana"],
+            "Horario": taller["horario"],
+            "Empresa": f"{TEST_EMPRESA_PREFIX}EXTRA_NOPE",
+            "Taller": taller["nombre"],
+            "Programa": taller["programa"],
             "Estado": "PLANIFICADO",
-        },
-        {
-            "Semana": 1,
-            "Día": base_anchor["diaSemana"],
-            "Horario": base_anchor["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}EXTRA_NOEP_A",
-            "Taller": catalog_anchor["nombre"],
-            "Programa": catalog_anchor["programa"],
-            "Estado": "PLANIFICADO",
+            "Tipo": "EXTRA",
         },
     ]
     excel = _build_extras_excel(rows)
@@ -315,14 +333,21 @@ async def test_no_ep_no_extra(client, db_session):
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
-    assert data["extras_insertados"] == 0
-    assert data["taller_no_encontrado"] == 1
-    assert data["errores"] == 0  # V20: taller rejection only increments taller_no_encontrado
-    assert data["insertados"] == 1  # only the BASE row went in
+    # Row inserts despite the missing flag.
+    assert data["extras_insertados"] == 1, data
+    assert data["taller_no_encontrado"] == 0, data
+    assert data["errores"] == 0, data
+    assert data["insertados"] == 0, data
+
+    # Warning surfaces. The exact wording isn't pinned, just the marker token.
+    assert any("permiteExtras" in w for w in data["warnings"]), data["warnings"]
+
+    # Counter math invariant (V22 includes dobles_insertados).
     assert data["total_procesados"] == (
         data["insertados"]
         + data["vacantes"]
         + data["extras_insertados"]
+        + data["dobles_insertados"]
         + data["empresa_no_encontrada"]
         + data["taller_no_encontrado"]
         + data["errores"]
@@ -330,20 +355,28 @@ async def test_no_ep_no_extra(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_ep_no_collision_no_extra(client, db_session):
-    """Negative: EP empresa but no collision → row rejected as taller_no_encontrado."""
+async def test_bulk_soft_match_always_allowed(client, db_session):
+    """V22 (Cambio A): soft-match by (nombre, programa) is always allowed when
+    the strict 4-tuple misses. No AND-AND gate, no rejection based on the
+    classification rule.
+
+    Replaces the legacy negative test (was: EP empresa, soft-match, no collision
+    → rejected as taller_no_encontrado). Post-Cambio A this row inserts cleanly
+    as BASE because the planner trusted the Excel.
+    """
     catalog_anchor, base_anchor = await _pick_two_talleres(db_session)
 
-    ep_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}EXTRA_NOCOL_EP")
-    await _set_config_trimestral(db_session, ep_empresa_id, escuela_propia=True)
+    empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}SOFT_OK")
+    await _set_config_trimestral(db_session, empresa_id, escuela_propia=False)
 
-    # Single row: EP empresa, soft-match only, no other row at (sem,dia,horario).
+    # catalog_anchor.nombre with base_anchor's (dia, horario) → strict miss →
+    # soft hit via (nombre, programa). No Tipo column → defaults to BASE.
     rows = [
         {
             "Semana": 1,
             "Día": base_anchor["diaSemana"],
             "Horario": base_anchor["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}EXTRA_NOCOL_EP",
+            "Empresa": f"{TEST_EMPRESA_PREFIX}SOFT_OK",
             "Taller": catalog_anchor["nombre"],
             "Programa": catalog_anchor["programa"],
             "Estado": "PLANIFICADO",
@@ -360,19 +393,36 @@ async def test_ep_no_collision_no_extra(client, db_session):
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
-    assert data["extras_insertados"] == 0
-    assert data["taller_no_encontrado"] == 1
-    assert data["insertados"] == 0
+    assert data["insertados"] == 1, data
+    assert data["extras_insertados"] == 0, data
+    assert data["dobles_insertados"] == 0, data
+    assert data["taller_no_encontrado"] == 0, data
+    assert data["errores"] == 0, data
+    assert data["total_procesados"] == (
+        data["insertados"]
+        + data["vacantes"]
+        + data["extras_insertados"]
+        + data["dobles_insertados"]
+        + data["empresa_no_encontrada"]
+        + data["taller_no_encontrado"]
+        + data["errores"]
+    )
 
 
 @pytest.mark.asyncio
 async def test_delete_extra_endpoint(client, db_session):
-    """DELETE /api/planificacion/{id}/extra removes EXTRA, 400s on BASE."""
+    """DELETE /api/planificacion/{id}/extra removes EXTRA, 400s on BASE.
+
+    V22 (Cambio A): the EXTRA row is driven by a literal Tipo='EXTRA' in the
+    Excel, not by the legacy AND-AND classification.
+    """
     catalog_anchor, base_anchor = await _pick_two_talleres(db_session)
 
     ep_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DEL_EP")
     base_empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DEL_BASE")
-    await _set_config_trimestral(db_session, ep_empresa_id, escuela_propia=True)
+    await _set_config_trimestral(
+        db_session, ep_empresa_id, escuela_propia=True, permite_extras=True,
+    )
     await _set_config_trimestral(db_session, base_empresa_id, escuela_propia=False)
 
     rows = [
@@ -393,6 +443,7 @@ async def test_delete_extra_endpoint(client, db_session):
             "Taller": catalog_anchor["nombre"],
             "Programa": catalog_anchor["programa"],
             "Estado": "PLANIFICADO",
+            "Tipo": "EXTRA",
         },
     ]
     excel = _build_extras_excel(rows)
@@ -485,11 +536,12 @@ async def test_empresa_no_encontrada_is_hard_reject(client, db_session):
     assert data["insertados"] == 1  # only the BASE row went in
     assert data["extras_insertados"] == 0
     assert data["taller_no_encontrado"] == 0
-    # Mutual-exclusivity invariant.
+    # Mutual-exclusivity invariant (V22: includes dobles_insertados).
     assert data["total_procesados"] == (
         data["insertados"]
         + data["vacantes"]
         + data["extras_insertados"]
+        + data["dobles_insertados"]
         + data["empresa_no_encontrada"]
         + data["taller_no_encontrado"]
         + data["errores"]
@@ -516,19 +568,26 @@ async def test_empresa_no_encontrada_is_hard_reject(client, db_session):
 
 @pytest.mark.asyncio
 async def test_get_extras_with_estado_filter(client, db_session):
-    """V20: GET /extras?estado=PLANIFICADO filters EXTRAs by estado."""
+    """V20: GET /extras?estado=PLANIFICADO filters EXTRAs by estado.
+
+    V22 (Cambio A): EXTRA rows now require a literal Tipo='EXTRA' in the Excel
+    (no more AND-AND classification). The test setup keeps the colliding-BASE
+    rows for realism but only the EP rows carry the literal Tipo.
+    """
     catalog_anchor, base_anchor = await _pick_two_talleres(db_session)
 
     ep_a = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}FILTER_EP_A")
     ep_b = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}FILTER_EP_B")
     base_a = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}FILTER_BASE_A")
     base_b = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}FILTER_BASE_B")
-    await _set_config_trimestral(db_session, ep_a, escuela_propia=True)
-    await _set_config_trimestral(db_session, ep_b, escuela_propia=True)
+    await _set_config_trimestral(db_session, ep_a, escuela_propia=True, permite_extras=True)
+    await _set_config_trimestral(db_session, ep_b, escuela_propia=True, permite_extras=True)
     await _set_config_trimestral(db_session, base_a, escuela_propia=False)
     await _set_config_trimestral(db_session, base_b, escuela_propia=False)
 
-    # Two collisions in two different weeks → two EXTRAs with different estados.
+    # Two EXTRA rows in different weeks with different estados, driven by literal
+    # Tipo='EXTRA' in the Excel column. The BASE rows next to them are kept for
+    # realism but no longer trigger any classification.
     rows = [
         # Sem 1: BASE_A + EP_A as EXTRA (PLANIFICADO).
         {
@@ -548,6 +607,7 @@ async def test_get_extras_with_estado_filter(client, db_session):
             "Taller": catalog_anchor["nombre"],
             "Programa": catalog_anchor["programa"],
             "Estado": "PLANIFICADO",
+            "Tipo": "EXTRA",
         },
         # Sem 2: BASE_B + EP_B as EXTRA (CANCELADO).
         {
@@ -567,6 +627,7 @@ async def test_get_extras_with_estado_filter(client, db_session):
             "Taller": catalog_anchor["nombre"],
             "Programa": catalog_anchor["programa"],
             "Estado": "CANCELADO",
+            "Tipo": "EXTRA",
         },
     ]
     excel = _build_extras_excel(rows)
@@ -612,38 +673,29 @@ async def test_get_extras_with_estado_filter(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_extra_classified_when_strict_match_and_ep_and_collision(client, db_session):
-    """V20 hotfix: strict-match rows can also be EXTRA when EP+collision.
+async def test_bulk_literal_tipo_doble(client, db_session):
+    """V22 (Cambio A): literal Tipo='DOBLE' → row inserts as tipoAsignacion='DOBLE'
+    and increments dobles_insertados / surfaces dobles_detalle. DOBLE rows have
+    no permiteExtras requirement (decision 4: ad-hoc, libertad total — the gate
+    for creating DOBLE via the CRUD lives in the future doble.py router).
 
-    Two rows on the SAME exact catalog tuple (sem, día, horario, taller, programa).
-    Both match the catalog strictly. Empresa A has EP=true, Empresa B has EP=false.
-    Expected: B inserts as BASE, A inserts as EXTRA.
+    Replaces the legacy strict-match AND-AND test.
     """
     taller = await _pick_one_taller(db_session)
 
-    a_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}STRICT_EP")
-    b_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}STRICT_BASE")
-    await _set_config_trimestral(db_session, a_id, escuela_propia=True)
-    await _set_config_trimestral(db_session, b_id, escuela_propia=False)
+    empresa_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_EP")
+    await _set_config_trimestral(db_session, empresa_id, escuela_propia=True)
 
     rows = [
         {
-            "Semana": 1,
+            "Semana": 3,
             "Día": taller["diaSemana"],
             "Horario": taller["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}STRICT_BASE",
+            "Empresa": f"{TEST_EMPRESA_PREFIX}DOBLE_EP",
             "Taller": taller["nombre"],
             "Programa": taller["programa"],
             "Estado": "PLANIFICADO",
-        },
-        {
-            "Semana": 1,
-            "Día": taller["diaSemana"],
-            "Horario": taller["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}STRICT_EP",
-            "Taller": taller["nombre"],
-            "Programa": taller["programa"],
-            "Estado": "PLANIFICADO",
+            "Tipo": "DOBLE",
         },
     ]
     excel = _build_extras_excel(rows)
@@ -656,64 +708,59 @@ async def test_extra_classified_when_strict_match_and_ep_and_collision(client, d
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
-    assert data["insertados"] == 1, data
-    assert data["extras_insertados"] == 1, data
-    assert data["total_procesados"] == 2
+    assert data["dobles_insertados"] == 1, data
+    assert data["extras_insertados"] == 0, data
+    assert data["insertados"] == 0, data
+    assert data["total_procesados"] == 1
+    assert len(data["dobles_detalle"]) == 1
+    detalle = data["dobles_detalle"][0]
+    assert detalle["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}DOBLE_EP"
+    assert detalle["semana"] == 3
+    assert detalle["planificacion_id"] > 0
+
+    # Counter math invariant (V22 includes dobles_insertados).
     assert data["total_procesados"] == (
         data["insertados"]
         + data["vacantes"]
         + data["extras_insertados"]
+        + data["dobles_insertados"]
         + data["empresa_no_encontrada"]
         + data["taller_no_encontrado"]
         + data["errores"]
     )
 
-    extra_id = data["extras_detalle"][0]["planificacion_id"]
     db_row = await db_session.execute(
-        text(
-            'SELECT "tipoAsignacion", "empresaId" FROM planificacion '
-            "WHERE id = :id"
-        ),
-        {"id": extra_id},
+        text('SELECT "tipoAsignacion", "empresaId" FROM planificacion WHERE id = :id'),
+        {"id": detalle["planificacion_id"]},
     )
     rec = db_row.mappings().first()
-    assert rec["tipoAsignacion"] == "EXTRA"
-    assert rec["empresaId"] == a_id
-
-    # GET /extras returns the strict-match EXTRA.
-    list_resp = await client.get(f"/api/calendario/{TEST_TRIMESTRE}/extras")
-    assert list_resp.status_code == 200
-    list_data = list_resp.json()
-    assert any(
-        e["id"] == extra_id and e["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}STRICT_EP"
-        for e in list_data["extras"]
-    )
+    assert rec["tipoAsignacion"] == "DOBLE"
+    assert rec["empresaId"] == empresa_id
 
 
 @pytest.mark.asyncio
-async def test_two_ep_companies_collision(client, db_session):
-    """V20 hotfix edge case: two EP companies colliding → BOTH go to EXTRA.
+async def test_bulk_no_and_and_classification(client, db_session):
+    """V22 (Cambio A): the legacy AND-AND rule is gone. Two empresas (both EP)
+    colliding at the same (semana, día, horario, taller) WITHOUT a literal
+    Tipo column → BOTH rows insert as BASE. The importer does not auto-classify
+    anymore.
 
-    By the rule (is_ep AND has_collision), each row sees the other as a
-    collision and qualifies independently. There is no "first row wins as
-    BASE" tiebreaker — that's deliberate; the rule is symmetric.
-
-    Probably never happens in real Q2 data, but documented to lock in the
-    semantics: insertados=0, extras_insertados=2.
+    Locks in the new semantics: classification is data-driven (Excel column),
+    not rule-driven. Replaces the legacy `test_two_ep_companies_collision`.
     """
     taller = await _pick_one_taller(db_session)
 
-    a_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}TWOEP_A")
-    b_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}TWOEP_B")
-    await _set_config_trimestral(db_session, a_id, escuela_propia=True)
-    await _set_config_trimestral(db_session, b_id, escuela_propia=True)
+    a_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}NORULE_A")
+    b_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}NORULE_B")
+    await _set_config_trimestral(db_session, a_id, escuela_propia=True, permite_extras=True)
+    await _set_config_trimestral(db_session, b_id, escuela_propia=True, permite_extras=True)
 
     rows = [
         {
             "Semana": 1,
             "Día": taller["diaSemana"],
             "Horario": taller["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}TWOEP_A",
+            "Empresa": f"{TEST_EMPRESA_PREFIX}NORULE_A",
             "Taller": taller["nombre"],
             "Programa": taller["programa"],
             "Estado": "PLANIFICADO",
@@ -722,7 +769,7 @@ async def test_two_ep_companies_collision(client, db_session):
             "Semana": 1,
             "Día": taller["diaSemana"],
             "Horario": taller["horario"],
-            "Empresa": f"{TEST_EMPRESA_PREFIX}TWOEP_B",
+            "Empresa": f"{TEST_EMPRESA_PREFIX}NORULE_B",
             "Taller": taller["nombre"],
             "Programa": taller["programa"],
             "Estado": "PLANIFICADO",
@@ -738,19 +785,22 @@ async def test_two_ep_companies_collision(client, db_session):
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
-    assert data["insertados"] == 0
-    assert data["extras_insertados"] == 2
+    # Pre-V22 behavior would have flagged BOTH as EXTRA. New behavior: BASE.
+    assert data["insertados"] == 2, data
+    assert data["extras_insertados"] == 0, data
+    assert data["dobles_insertados"] == 0, data
     assert data["total_procesados"] == 2
     assert data["total_procesados"] == (
         data["insertados"]
         + data["vacantes"]
         + data["extras_insertados"]
+        + data["dobles_insertados"]
         + data["empresa_no_encontrada"]
         + data["taller_no_encontrado"]
         + data["errores"]
     )
 
-    # Both rows in DB tagged EXTRA.
+    # Both rows in DB tagged BASE.
     rows_db = await db_session.execute(
         text(
             'SELECT "tipoAsignacion" FROM planificacion '
@@ -759,8 +809,8 @@ async def test_two_ep_companies_collision(client, db_session):
         ),
         {"tri": TEST_TRIMESTRE, "a": a_id, "b": b_id},
     )
-    types = [r["tipoAsignacion"] for r in rows_db.mappings().all()]
-    assert types == ["EXTRA", "EXTRA"]
+    types = sorted(r["tipoAsignacion"] for r in rows_db.mappings().all())
+    assert types == ["BASE", "BASE"]
 
 
 # ── V21: POST /api/planificacion/{trimestre}/extra ─────────────
@@ -768,13 +818,20 @@ async def test_two_ep_companies_collision(client, db_session):
 
 @pytest.mark.asyncio
 async def test_crear_extra_ok_con_colision_y_empresa_ep(client, db_session):
-    """POST creates an EXTRA when empresa is EP and there's a colliding row."""
+    """POST creates an EXTRA when empresa has permiteExtras + there's a collision.
+
+    V22 (Fase 5): the gate is `permiteExtras` (was `escuelaPropia` until Fase 4).
+    Test name kept for stability; the empresa is configured with both flags so
+    the test is explicit about which one matters.
+    """
     taller = await _pick_one_taller(db_session)
 
     base_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}POST_OK_BASE")
     ep_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}POST_OK_EP")
     await _set_config_trimestral(db_session, base_id, escuela_propia=False)
-    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+    await _set_config_trimestral(
+        db_session, ep_id, escuela_propia=True, permite_extras=True,
+    )
 
     # Pre-existing BASE slot at (sem=1, día, horario) — the collision target.
     await _insert_base_slot(
@@ -901,20 +958,29 @@ async def test_crear_extra_rechaza_taller_inexistente(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_crear_extra_rechaza_empresa_no_ep(client, db_session):
-    """Empresa exists & active but escuelaPropia=false → 422 with EP message."""
+async def test_crear_extra_rechaza_empresa_sin_permite_extras(client, db_session):
+    """V22 (Fase 5): empresa active but permiteExtras=false → 422 with PE message.
+
+    Replaces the old `test_crear_extra_rechaza_empresa_no_ep`. The gate changed
+    in Fase 5: an empresa without `permiteExtras=true` in CT can no longer be
+    the target of POST /extra, regardless of its `escuelaPropia` value.
+    """
     taller = await _pick_one_taller(db_session)
 
     base_id = await _create_empresa(
-        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOEP_BASE"
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOPE_BASE"
     )
-    no_ep_id = await _create_empresa(
-        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOEP_TARGET"
+    no_pe_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}POST_NOPE_TARGET"
     )
     await _set_config_trimestral(db_session, base_id, escuela_propia=False)
-    await _set_config_trimestral(db_session, no_ep_id, escuela_propia=False)
+    # Even with escuelaPropia=true (the old gate), permiteExtras=false rejects.
+    # That makes the test specifically about the new gate, not the old one.
+    await _set_config_trimestral(
+        db_session, no_pe_id, escuela_propia=True, permite_extras=False,
+    )
 
-    # Set up a collision so it would otherwise be valid.
+    # Set up a collision so it would otherwise be valid past the gate.
     await _insert_base_slot(
         db_session,
         trimestre=TEST_TRIMESTRE,
@@ -926,7 +992,7 @@ async def test_crear_extra_rechaza_empresa_no_ep(client, db_session):
     )
 
     payload = {
-        "empresa_id": no_ep_id,
+        "empresa_id": no_pe_id,
         "semana": 1,
         "dia": taller["diaSemana"],
         "horario": taller["horario"],
@@ -937,18 +1003,20 @@ async def test_crear_extra_rechaza_empresa_no_ep(client, db_session):
         f"/api/planificacion/{TEST_TRIMESTRE}/extra", json=payload
     )
     assert resp.status_code == 422, resp.text
-    assert "escuela propia" in resp.json()["detail"].lower()
+    assert "permite extras" in resp.json()["detail"].lower()
 
 
 @pytest.mark.asyncio
 async def test_crear_extra_rechaza_sin_colision(client, db_session):
-    """Empresa is EP but nothing else at that slot → 422 with collision message."""
+    """Empresa has permiteExtras but nothing else at that slot → 422 collision."""
     taller = await _pick_one_taller(db_session)
 
     ep_id = await _create_empresa(
         db_session, f"{TEST_EMPRESA_PREFIX}POST_NOCOL_EP"
     )
-    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+    await _set_config_trimestral(
+        db_session, ep_id, escuela_propia=True, permite_extras=True,
+    )
 
     payload = {
         "empresa_id": ep_id,
@@ -977,7 +1045,9 @@ async def test_crear_extra_rechaza_duplicado_exacto(client, db_session):
     )
     ep_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}POST_DUP_EP")
     await _set_config_trimestral(db_session, base_id, escuela_propia=False)
-    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+    await _set_config_trimestral(
+        db_session, ep_id, escuela_propia=True, permite_extras=True,
+    )
 
     await _insert_base_slot(
         db_session,
@@ -1030,7 +1100,11 @@ async def _create_extra_slot(db_session, client) -> tuple[int, int, dict]:
     )
     ep_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}PATCH_EP")
     await _set_config_trimestral(db_session, base_id, escuela_propia=False)
-    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+    # V22 (Fase 5): POST /extra requires permite_extras=true; escuela_propia=true
+    # is kept for the PATCH gate (which is unchanged per plan §4).
+    await _set_config_trimestral(
+        db_session, ep_id, escuela_propia=True, permite_extras=True,
+    )
 
     await _insert_base_slot(
         db_session,
@@ -1059,14 +1133,20 @@ async def _create_extra_slot(db_session, client) -> tuple[int, int, dict]:
 
 
 @pytest.mark.asyncio
-async def test_editar_extra_cambiar_empresa_a_otra_ep(client, db_session):
+async def test_editar_extra_cambiar_empresa_a_otra_con_permite_extras(client, db_session):
+    """V22 (Fase 5, apéndice): PATCH /extra to another empresa requires the new
+    empresa to also have permiteExtras=true (gate aligned with POST).
+    """
     extra_id, ep_id, _ = await _create_extra_slot(db_session, client)
 
-    # New empresa, also EP.
-    other_ep_id = await _create_empresa(
-        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_OTHER_EP"
+    # New empresa, also permiteExtras=true.
+    other_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_OTHER_PE"
     )
-    await _set_config_trimestral(db_session, other_ep_id, escuela_propia=True)
+    await _set_config_trimestral(
+        db_session, other_id, escuela_propia=True, permite_extras=True,
+    )
+    other_ep_id = other_id  # keep variable name below stable for assertions
 
     resp = await client.patch(
         f"/api/planificacion/{extra_id}/extra",
@@ -1076,7 +1156,7 @@ async def test_editar_extra_cambiar_empresa_a_otra_ep(client, db_session):
     data = resp.json()
     assert data["id"] == extra_id
     assert data["empresa_id"] == other_ep_id
-    assert data["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}PATCH_OTHER_EP"
+    assert data["empresa_nombre"] == f"{TEST_EMPRESA_PREFIX}PATCH_OTHER_PE"
     assert data["notas"] == "nota inicial"  # untouched
 
     # empresaIdOriginal must remain the original empresa (write-once).
@@ -1165,20 +1245,27 @@ async def test_editar_extra_slot_es_base_no_extra(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_editar_extra_nueva_empresa_no_ep(client, db_session):
+async def test_editar_extra_nueva_empresa_sin_permite_extras(client, db_session):
+    """V22 (Fase 5, apéndice): PATCH /extra changing empresa now gates by
+    permiteExtras (was escuelaPropia in V21). An empresa with escuelaPropia=true
+    but permiteExtras=false must be rejected — this asserts that.
+    """
     extra_id, _, _ = await _create_extra_slot(db_session, client)
 
-    no_ep_id = await _create_empresa(
-        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_NOEP"
+    target_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}PATCH_NOPE"
     )
-    await _set_config_trimestral(db_session, no_ep_id, escuela_propia=False)
+    # Even with escuelaPropia=true (the old gate), permiteExtras=false rejects.
+    await _set_config_trimestral(
+        db_session, target_id, escuela_propia=True, permite_extras=False,
+    )
 
     resp = await client.patch(
         f"/api/planificacion/{extra_id}/extra",
-        json={"empresa_id": no_ep_id},
+        json={"empresa_id": target_id},
     )
     assert resp.status_code == 422, resp.text
-    assert "escuela propia" in resp.json()["detail"].lower()
+    assert "permite extras" in resp.json()["detail"].lower()
 
 
 @pytest.mark.asyncio

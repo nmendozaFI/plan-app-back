@@ -10,7 +10,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import frecuencias, calendario, empresas, historico, health, importar, restricciones, talleres, config_trimestral, settings, calendario_anual, planificacion
+from app.routers import frecuencias, calendario, empresas, historico, health, importar, restricciones, talleres, config_trimestral, settings, calendario_anual, planificacion, doble
 # ── App ──────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -56,3 +56,4 @@ app.include_router(calendario_anual.router, prefix="/api/talleres/calendario-anu
 app.include_router(config_trimestral.router, prefix="/api/config-trimestral", tags=["Config Trimestral"])
 app.include_router(settings.router, prefix="/api/settings", tags=["Settings"])
 app.include_router(planificacion.router, prefix="/api/planificacion", tags=["Planificación"])
+app.include_router(doble.router, prefix="/api/planificacion", tags=["Planificación — Doble (V22)"])
