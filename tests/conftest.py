@@ -160,10 +160,22 @@ def create_festivos_excel(festivos: list[dict]) -> bytes:
 
 # ── Test Data Helpers ────────────────────────────────────────
 
-async def setup_test_config_trimestral(db, trimestre: str = TEST_TRIMESTRE, empresa_ids: list[int] = None):
+async def setup_test_config_trimestral(
+    db,
+    trimestre: str = TEST_TRIMESTRE,
+    empresa_ids: list[int] = None,
+    freq_ef: int | None = 2,
+    freq_it: int | None = 1,
+):
     """
     Creates configTrimestral entries for test trimestre.
     If empresa_ids not provided, uses first 5 active empresas.
+
+    V24 Cambio B: freq_ef y freq_it (defaults 2/1) se inyectan en frecuenciaEF y
+    frecuenciaIT del CT. La matriz semáforo (POST /api/frecuencias/calcular) ya
+    no genera frecuencia por algoritmo — necesita los EF/IT explícitos en CT
+    para que la empresa entre al cálculo. Tests que quieran probar el caso
+    "omitida" pasan freq_ef=None, freq_it=None explícitamente.
     """
     if empresa_ids is None:
         # Get first 5 active empresas
@@ -177,12 +189,15 @@ async def setup_test_config_trimestral(db, trimestre: str = TEST_TRIMESTRE, empr
             text("""
                 INSERT INTO "configTrimestral" (
                     "empresaId", trimestre, "tipoParticipacion",
+                    "frecuenciaEF", "frecuenciaIT",
                     "disponibilidadDias", "updatedAt"
                 )
-                VALUES (:eid, :tri, 'AMBAS', 'L,M,X,J,V', NOW())
-                ON CONFLICT ("empresaId", trimestre) DO NOTHING
+                VALUES (:eid, :tri, 'AMBAS', :ef, :it, 'L,M,X,J,V', NOW())
+                ON CONFLICT ("empresaId", trimestre) DO UPDATE SET
+                    "frecuenciaEF" = EXCLUDED."frecuenciaEF",
+                    "frecuenciaIT" = EXCLUDED."frecuenciaIT"
             """),
-            {"eid": eid, "tri": trimestre}
+            {"eid": eid, "tri": trimestre, "ef": freq_ef, "it": freq_it}
         )
 
     await db.commit()
