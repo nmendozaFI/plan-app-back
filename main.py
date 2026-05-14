@@ -2,6 +2,8 @@
 Fundación Integra — Planificador de Talleres
 Backend FastAPI · main.py
 """
+#.venv\Scripts\activate
+# uvicorn main:app --reload
 
 import os
 
