@@ -17,6 +17,10 @@ from app.schemas.calendario import (
     EditarSlotExtraInput,
     SlotExtraResponse,
 )
+from app.services.empresas.checks import (
+    check_empresa_activa as _check_empresa_activa,
+    check_empresa_permite_extras as _check_empresa_permite_extras,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,45 +79,10 @@ async def _fetch_extra_response(db: AsyncSession, slot_id: int) -> SlotExtraResp
     )
 
 
-async def _check_empresa_activa(db: AsyncSession, empresa_id: int) -> str:
-    """Return empresa.nombre if exists & activa; raise 404/422 otherwise."""
-    row = await db.execute(
-        text("SELECT id, nombre, activa FROM empresa WHERE id = :id"),
-        {"id": empresa_id},
-    )
-    rec = row.mappings().first()
-    if rec is None:
-        raise HTTPException(
-            status_code=404, detail=f"Empresa id={empresa_id} no existe"
-        )
-    if not rec["activa"]:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Empresa '{rec['nombre']}' (id={empresa_id}) está inactiva",
-        )
-    return rec["nombre"]
-
-
-async def _check_empresa_es_ep(
-    db: AsyncSession, empresa_id: int, empresa_nombre: str, trimestre: str
-) -> None:
-    """Raise 422 if empresa is not escuelaPropia=true in this trimestre."""
-    row = await db.execute(
-        text(
-            'SELECT "escuelaPropia" FROM "configTrimestral" '
-            'WHERE "empresaId" = :eid AND trimestre = :tri'
-        ),
-        {"eid": empresa_id, "tri": trimestre},
-    )
-    rec = row.mappings().first()
-    if rec is None or not rec["escuelaPropia"]:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"La empresa {empresa_nombre} no tiene escuela propia activada "
-                f"en {trimestre}. Solo empresas EP pueden tener slots EXTRA."
-            ),
-        )
+# V22 (Cambio A): empresa-level guards extracted to
+# `app/services/empresas/checks.py` and imported above. POST and PATCH /extra
+# now share the `permiteExtras` gate (Fase 5 + apéndice); `escuelaPropia` no
+# longer drives EXTRA eligibility — it gates DOBLE creation in doble.py.
 
 
 # ── DELETE EXTRA (V20) ──────────────────────────────────────────
@@ -165,12 +134,16 @@ async def crear_extra(
     body: CrearSlotExtraInput,
     db: AsyncSession = Depends(get_db),
 ):
-    """V21: create one EXTRA slot, validating the AND-rule.
+    """V21 / V22 (Cambio A, Fase 5): create one EXTRA slot.
 
     Validation order (first failure wins):
       1. Empresa exists (404) and is activa (422).
       2. Taller exists (404).
-      3. Empresa has escuelaPropia=true in this trimestre (422).
+      2.5. Programa body matches the taller's programa (422 — coherence).
+      3. Empresa has permiteExtras=true in this trimestre (422).
+         V22 change: was `escuelaPropia` until Fase 4. `permiteExtras` is the
+         explicit per-trimestre flag for EXTRA eligibility; `escuelaPropia` now
+         gates only DOBLE creation.
       4. There is at least one other slot in (trimestre, semana, dia, horario)
          belonging to a different empresa (422).
       5. No existing EXTRA already at (trimestre, semana, dia, horario, empresa)
@@ -205,8 +178,10 @@ async def crear_extra(
             ),
         )
 
-    # 3. Empresa is EP in trimestre.
-    await _check_empresa_es_ep(db, body.empresa_id, empresa_nombre, trimestre)
+    # 3. Empresa has permiteExtras=true in trimestre (V22, Fase 5).
+    await _check_empresa_permite_extras(
+        db, body.empresa_id, empresa_nombre, trimestre,
+    )
 
     # 4. At least one colliding row from a different empresa.
     coll = await db.execute(
@@ -372,7 +347,11 @@ async def editar_extra(
     # 4. Validate new empresa if provided.
     if body.empresa_id is not None:
         nueva_nombre = await _check_empresa_activa(db, body.empresa_id)
-        await _check_empresa_es_ep(
+        # V22 (Fase 5, apéndice): aligned to POST /extra. PATCH-empresa now
+        # uses permiteExtras too — the alternative would let an empresa be
+        # eligible for POST but not for PATCH (or vice versa) which is
+        # confusing for the planner.
+        await _check_empresa_permite_extras(
             db, body.empresa_id, nueva_nombre, trimestre
         )
 

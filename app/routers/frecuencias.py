@@ -340,26 +340,25 @@ async def calcular_frecuencias(
         es_nueva = bool(cfg.get("esNueva") or False)
 
         # ── Frecuencia base (SIN ajuste todavía) ──────────────
+        # V24 Cambio B (decisión D2): la matriz semáforo ya NO calcula frecuencia
+        # bruta por algoritmo ni reparte 70/30. Lee SOLO los números que la
+        # planificadora puso en CT (frecuenciaEF / frecuenciaIT). Empresa con
+        # AMBOS NULL → se omite del cálculo (decisión D2). Empresa con uno solo
+        # NULL → ese se trata como 0 (decisión D3).
         explicit_ef = cfg.get("frecuenciaEF")
         explicit_it = cfg.get("frecuenciaIT")
 
-        if explicit_ef is not None or explicit_it is not None:
-            # NEW format: use explicit EF/IT values from master import
-            ef = (explicit_ef or 0)
-            it = (explicit_it or 0)
-        elif cfg["frecuenciaSolicitada"] is not None:
-            # OLD format: total only, split proportionally
-            freq_total = cfg["frecuenciaSolicitada"]
-            ef, it = _repartir_ef_it(freq_total, cfg["tipoParticipacion"])
-        else:
-            # No explicit frequency: calculate from score/semaforo
-            freq_total = _calcular_frecuencia_base(
-                tipo=cfg["tipoParticipacion"],
-                semaforo=semaforo,
-                score=score,
-                escuela_propia=cfg["escuelaPropia"],
+        if explicit_ef is None and explicit_it is None:
+            # Decisión D2: ambos NULL → no entra a la matriz ni al solver.
+            logger.info(
+                f"[OMIT] {cfg['nombre']}: frecuenciaEF y frecuenciaIT NULL en CT — "
+                f"se omite del cálculo este trimestre"
             )
-            ef, it = _repartir_ef_it(freq_total, cfg["tipoParticipacion"])
+            continue
+
+        # Decisión D3: uno NULL se trata como 0. `or 0` cubre tanto None como 0.
+        ef = (explicit_ef or 0)
+        it = (explicit_it or 0)
 
         # ── Reducción -50% a empresas esNueva ─────────────────
         # Antes del ajuste por desempeño: empresa nueva recibe la mitad el primer año.
@@ -501,6 +500,10 @@ async def calcular_frecuencias(
             "prioridad_reduccion": cfg["prioridadReduccion"],
             "ciudades_activas": ciudades_map.get(eid, []),
             "restricciones": restricciones_map.get(eid, []),
+            # V24 Cambio B (decisión D4): tipoParticipacion necesario para filtrar
+            # receptores en _redistribuir_slots_liberados. None se trata como AMBAS
+            # (compat defensiva).
+            "_tipo_participacion": cfg["tipoParticipacion"],
             # Metadata para redistribución
             "_slots_it_liberados": slots_it_liberados,
             "_slots_ef_liberados": slots_ef_liberados,
@@ -528,6 +531,7 @@ async def calcular_frecuencias(
         e.pop("_slots_ef_liberados", None)
         e.pop("_max_extras_trimestre", None)
         e.pop("_extras_asignados", None)
+        e.pop("_tipo_participacion", None)  # V24 Cambio B
 
     # ── 6. Recorte para encajar en modelo trimestral ─────────
     # Límite = slots_por_semana × semanas_disponibles (no por semana)
@@ -638,8 +642,22 @@ async def confirmar_frecuencias(
     total_ef = 0
     total_it = 0
     persisted = []
+    empresas_omitidas = 0  # V24 Cambio B (decisión D5)
 
     for emp in params.empresas:
+        # V24 Cambio B (decisión D5): no insertar fila para empresas omitidas
+        # (ambos talleres en 0). El solver ya filtra por totalAsignado>0; con
+        # esto la invariante `frecuencia.rows == CTs activas` se rompe sólo en
+        # las empresas legítimamente sin frecuencia este trimestre.
+        if emp.talleres_ef == 0 and emp.talleres_it == 0:
+            empresas_omitidas += 1
+            e_info = emp_map.get(emp.empresa_id, {})
+            logger.debug(
+                f"[SKIP] {e_info.get('nombre', emp.empresa_id)}: "
+                f"talleres_ef=0 y talleres_it=0 — no se inserta en frecuencia"
+            )
+            continue
+
         total_ef += emp.talleres_ef
         total_it += emp.talleres_it
         total = emp.talleres_ef + emp.talleres_it
@@ -693,6 +711,7 @@ async def confirmar_frecuencias(
         "total_ef": total_ef,
         "total_it": total_it,
         "empresas": persisted,
+        "empresas_omitidas": empresas_omitidas,  # V24 Cambio B (decisión D5)
     }
 
 
@@ -846,48 +865,6 @@ def _calcular_semaforo(score: float) -> str:
     return "ROJO"
 
 
-def _calcular_frecuencia_base(
-    tipo: str,
-    semaforo: str,
-    score: float,
-    escuela_propia: bool,
-) -> int:
-    """
-    Base frequency per planner doc (recalibrated):
-      - AMBAS: 3 (was 4)
-      - EF: 3
-      - IT: 2
-      - Verde bonus: 0 (was +1; Verde ya protegida en recortes)
-      - Rojo penalty: -2 (was -1; reducción estructural más agresiva)
-      - Own-school bonus: +1
-    """
-    if tipo == "AMBAS":
-        base = 3
-    elif tipo == "EF":
-        base = 3
-    else:
-        base = 2
-
-    if semaforo == "ROJO":
-        base -= 2
-
-    if escuela_propia:
-        base += 1
-
-    return max(1, base)
-
-
-def _repartir_ef_it(total: int, tipo: str) -> tuple[int, int]:
-    if tipo == "EF":
-        return (total, 0)
-    elif tipo == "IT":
-        return (0, total)
-    else:
-        ef = max(1, round(total * 0.7))
-        it = total - ef
-        return (ef, max(0, it))
-
-
 def _resolver_programa_taller(
     nombre_taller: str,
     talleres_catalogo: list[dict],
@@ -931,7 +908,12 @@ def _redistribuir_slots_liberados(
             emp.get("restricciones", []),
         )
 
-    def _puede_recibir(emp: dict) -> bool:
+    def _puede_recibir(emp: dict, programa: str) -> bool:
+        """V24 Cambio B (decisión D4): añade filtro por tipoParticipacion.
+        Un slot EF liberado solo va a empresa con tipo ∈ {EF, AMBAS};
+        un slot IT solo va a empresa con tipo ∈ {IT, AMBAS}. tipoParticipacion
+        None/desconocido se trata como AMBAS por compat defensiva.
+        """
         if not emp.get("es_comodin"):
             return False
         if _tiene_no_comodin(emp.get("restricciones", [])):
@@ -940,6 +922,11 @@ def _redistribuir_slots_liberados(
             return False
         cap = _cap(emp)
         if cap is not None and emp.get("_extras_asignados", 0) >= cap:
+            return False
+        tipo = emp.get("_tipo_participacion") or "AMBAS"
+        if programa == "EF" and tipo not in ("EF", "AMBAS"):
+            return False
+        if programa == "IT" and tipo not in ("IT", "AMBAS"):
             return False
         return True
 
@@ -963,7 +950,7 @@ def _redistribuir_slots_liberados(
         for emp in candidatos:
             if pendiente <= 0:
                 break
-            if not _puede_recibir(emp):
+            if not _puede_recibir(emp, programa):
                 continue
             cap = _cap(emp)
             if cap is not None:

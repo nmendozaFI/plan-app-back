@@ -4,7 +4,13 @@ Tests for Frecuencias (Phase 1) endpoints.
 
 import pytest
 from sqlalchemy import text
-from .conftest import TEST_TRIMESTRE, setup_test_config_trimestral
+from .conftest import TEST_TRIMESTRE, TEST_EMPRESA_PREFIX, setup_test_config_trimestral
+
+# V24 Cambio B: real-format trimestre needed because /calcular parses
+# trimestre.split("-")[0] as int. TEST_TRIMESTRE="TEST-Q1" fails that parser.
+# Q3 2026 is fresh post-Cambio-A and has real talleres in SemanaConfig, so
+# max_ef/max_it capacity is real (no spurious recortes on small test setups).
+V24_TRIMESTRE_REAL = "2026-Q3"
 
 
 @pytest.mark.asyncio
@@ -154,3 +160,249 @@ async def test_frecuencias_empty_trimestre(client):
 
     # Should return 200 with empty data or 404
     assert response.status_code in (200, 404)
+
+
+# ── V24 Cambio B: matriz semáforo skip-when-NULL + redistribución ──
+#
+# Estos tests usan V24_TRIMESTRE_REAL (=2026-Q3, real-format) en lugar de
+# TEST_TRIMESTRE porque /calcular hace int(trimestre.split("-")[0]). Crean
+# TEST_EMPRESA_* dedicados con sede en MADRID y los enlazan a su propia CT en
+# Q3. El cleanup de conftest (DELETE FROM empresa WHERE nombre LIKE
+# TEST_EMPRESA_%) hace CASCADE a configTrimestral, frecuencia y
+# empresaCiudad → no deja residuo en Q3.
+
+
+async def _create_test_empresa_madrid(db, nombre: str) -> int:
+    """Insert TEST_EMPRESA_* + link to MADRID via empresaCiudad."""
+    res = await db.execute(
+        text(
+            'INSERT INTO empresa (nombre, tipo, activa, "updatedAt") '
+            "VALUES (:n, 'AMBAS', true, NOW()) "
+            'ON CONFLICT (nombre) DO UPDATE SET activa = true '
+            "RETURNING id"
+        ),
+        {"n": nombre},
+    )
+    eid = res.scalar()
+    # Link to MADRID (required by /calcular filter).
+    madrid = await db.execute(
+        text("SELECT id FROM ciudad WHERE UPPER(nombre) = 'MADRID' LIMIT 1")
+    )
+    madrid_id = madrid.scalar()
+    if madrid_id is not None:
+        await db.execute(
+            text(
+                'INSERT INTO "empresaCiudad" ("empresaId", "ciudadId", "activaReciente") '
+                'VALUES (:eid, :cid, true) '
+                'ON CONFLICT ("empresaId", "ciudadId") DO UPDATE SET "activaReciente" = true'
+            ),
+            {"eid": eid, "cid": madrid_id},
+        )
+    await db.commit()
+    return eid
+
+
+async def _upsert_ct_v24(
+    db,
+    eid: int,
+    *,
+    freq_ef,
+    freq_it,
+    tipo: str = "AMBAS",
+    trimestre: str = V24_TRIMESTRE_REAL,
+):
+    """Upsert CT for the V24 trimestre with explicit freq EF/IT + tipo."""
+    await db.execute(
+        text("""
+            INSERT INTO "configTrimestral" (
+                "empresaId", trimestre, "tipoParticipacion",
+                "frecuenciaEF", "frecuenciaIT",
+                "disponibilidadDias", "updatedAt"
+            ) VALUES (:eid, :tri, :tipo, :ef, :it, 'L,M,X,J,V', NOW())
+            ON CONFLICT ("empresaId", trimestre) DO UPDATE SET
+                "tipoParticipacion" = EXCLUDED."tipoParticipacion",
+                "frecuenciaEF" = EXCLUDED."frecuenciaEF",
+                "frecuenciaIT" = EXCLUDED."frecuenciaIT"
+        """),
+        {"eid": eid, "tri": trimestre, "tipo": tipo, "ef": freq_ef, "it": freq_it},
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_calcular_omits_empresa_when_both_freq_null(client, db_session):
+    """V24 Cambio B decisión D2: empresa con frecuenciaEF=NULL Y frecuenciaIT=NULL
+    se omite del cálculo (no aparece en la lista de empresas).
+    """
+    eid_with = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_OMIT_WITH"
+    )
+    eid_without = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_OMIT_WITHOUT"
+    )
+    await _upsert_ct_v24(db_session, eid_with, freq_ef=2, freq_it=1)
+    await _upsert_ct_v24(db_session, eid_without, freq_ef=None, freq_it=None)
+
+    resp = await client.post(
+        "/api/frecuencias/calcular",
+        json={"trimestre": V24_TRIMESTRE_REAL},
+    )
+    assert resp.status_code == 200, resp.text
+    empresas = resp.json()["empresas"]
+    ids = {e["empresa_id"] for e in empresas}
+
+    assert eid_with in ids, "empresa con freq explícita debería entrar"
+    assert eid_without not in ids, "empresa con ambos NULL debería omitirse"
+
+
+@pytest.mark.asyncio
+async def test_calcular_treats_one_null_as_zero(client, db_session):
+    """V24 Cambio B decisión D3: un NULL se trata como 0. Empresa con freqEF=3,
+    freqIT=NULL entra al cálculo con EF=3, IT=0.
+    """
+    eid = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_ONE_NULL"
+    )
+    await _upsert_ct_v24(db_session, eid, freq_ef=3, freq_it=None)
+
+    resp = await client.post(
+        "/api/frecuencias/calcular",
+        json={"trimestre": V24_TRIMESTRE_REAL},
+    )
+    assert resp.status_code == 200, resp.text
+    empresas = resp.json()["empresas"]
+    target = next((e for e in empresas if e["empresa_id"] == eid), None)
+    assert target is not None, "empresa con un solo NULL debería entrar"
+    assert target["talleres_ef"] == 3
+    assert target["talleres_it"] == 0
+
+
+@pytest.mark.asyncio
+async def test_redistribucion_respeta_tipo_participacion(client, db_session):
+    """V24 Cambio B decisión D4: el filtro de tipoParticipacion en
+    _redistribuir_slots_liberados garantiza que un slot IT liberado no termine
+    sumándole talleres_it a una empresa con tipoParticipacion=EF.
+
+    Verificación indirecta: una empresa con tipo=EF, freq_it=NULL (→0), tras
+    /calcular, debe seguir con talleres_it=0 (la redistribución no la elige
+    como receptora de slots IT liberados, si los hay).
+    """
+    eid = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_EF_ONLY"
+    )
+    await _upsert_ct_v24(db_session, eid, freq_ef=2, freq_it=None, tipo="EF")
+
+    resp = await client.post(
+        "/api/frecuencias/calcular",
+        json={"trimestre": V24_TRIMESTRE_REAL},
+    )
+    assert resp.status_code == 200, resp.text
+    empresas = resp.json()["empresas"]
+    target = next((e for e in empresas if e["empresa_id"] == eid), None)
+    assert target is not None
+    assert target["talleres_it"] == 0, (
+        f"empresa con tipo=EF tiene talleres_it={target['talleres_it']} — "
+        f"el filtro tipoParticipacion en redistribución no está bloqueando"
+    )
+
+
+@pytest.mark.asyncio
+async def test_e2e_freq_efit_persistido_pasa_a_frecuencia(client, db_session):
+    """V24 Cambio B B6 — validación E2E: CT con freq_ef=3 freq_it=2 → matriz
+    semáforo → confirmar → tabla `frecuencia` muestra talleresEF=3 talleresIT=2.
+
+    El último paso del plan ("solver genera plan exacto") queda cubierto por
+    los constraints H2 (sum(EF) == talleresEF) y H3 (sum(IT) == talleresIT) en
+    solver.py — no se replica aquí para mantener el test rápido.
+    """
+    eid = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_E2E",
+    )
+    await _upsert_ct_v24(db_session, eid, freq_ef=3, freq_it=2)
+
+    # 1. /calcular debe devolver la empresa con EF=3 e IT=2 (sin transformación
+    #    algorítmica — D2/D3).
+    resp = await client.post(
+        "/api/frecuencias/calcular",
+        json={"trimestre": V24_TRIMESTRE_REAL},
+    )
+    assert resp.status_code == 200, resp.text
+    target = next(
+        (e for e in resp.json()["empresas"] if e["empresa_id"] == eid),
+        None,
+    )
+    assert target is not None, "la empresa con freq explícita debió entrar al cálculo"
+    assert target["talleres_ef"] == 3
+    assert target["talleres_it"] == 2
+
+    # 2. /confirmar persiste en tabla `frecuencia` con los mismos valores.
+    body = {
+        "trimestre": V24_TRIMESTRE_REAL,
+        "empresas": [
+            {"empresa_id": eid, "talleres_ef": 3, "talleres_it": 2},
+        ],
+    }
+    resp = await client.post("/api/frecuencias/confirmar", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["empresas_omitidas"] == 0
+    assert data["total_ef"] >= 3 and data["total_it"] >= 2
+
+    # 3. BD cross-check directo en la tabla `frecuencia`.
+    row = await db_session.execute(
+        text(
+            'SELECT "talleresEF", "talleresIT", "totalAsignado" '
+            'FROM frecuencia '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": V24_TRIMESTRE_REAL},
+    )
+    rec = row.mappings().first()
+    assert rec is not None, "debió insertarse fila en `frecuencia`"
+    assert rec["talleresEF"] == 3
+    assert rec["talleresIT"] == 2
+    assert rec["totalAsignado"] == 5  # invariante EF+IT
+
+
+@pytest.mark.asyncio
+async def test_confirmar_skips_insert_when_both_zero(client, db_session):
+    """V24 Cambio B decisión D5: confirmar_frecuencias NO inserta fila en tabla
+    `frecuencia` para empresa con talleres_ef=0 Y talleres_it=0. Devuelve
+    contador empresas_omitidas.
+    """
+    eid_normal = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_CONF_NORMAL"
+    )
+    eid_zero = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_CONF_ZERO"
+    )
+    # CT rows requeridas por la query de empresa lookup en confirmar.
+    await _upsert_ct_v24(db_session, eid_normal, freq_ef=2, freq_it=1)
+    await _upsert_ct_v24(db_session, eid_zero, freq_ef=None, freq_it=None)
+
+    body = {
+        "trimestre": V24_TRIMESTRE_REAL,
+        "empresas": [
+            {"empresa_id": eid_normal, "talleres_ef": 2, "talleres_it": 1},
+            {"empresa_id": eid_zero, "talleres_ef": 0, "talleres_it": 0},
+        ],
+    }
+    resp = await client.post("/api/frecuencias/confirmar", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["empresas_omitidas"] == 1
+    persisted_ids = {e["empresa_id"] for e in data["empresas"]}
+    assert eid_normal in persisted_ids
+    assert eid_zero not in persisted_ids
+
+    # Cross-check directo en BD: la fila zero NO está; la normal SÍ.
+    res = await db_session.execute(
+        text(
+            'SELECT "empresaId" FROM frecuencia '
+            'WHERE trimestre = :tri AND "empresaId" IN (:a, :b)'
+        ),
+        {"tri": V24_TRIMESTRE_REAL, "a": eid_normal, "b": eid_zero},
+    )
+    eids_in_db = {r["empresaId"] for r in res.mappings().all()}
+    assert eid_normal in eids_in_db
+    assert eid_zero not in eids_in_db
