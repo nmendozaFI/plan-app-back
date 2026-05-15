@@ -307,6 +307,64 @@ async def test_redistribucion_respeta_tipo_participacion(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_e2e_freq_efit_persistido_pasa_a_frecuencia(client, db_session):
+    """V24 Cambio B B6 — validación E2E: CT con freq_ef=3 freq_it=2 → matriz
+    semáforo → confirmar → tabla `frecuencia` muestra talleresEF=3 talleresIT=2.
+
+    El último paso del plan ("solver genera plan exacto") queda cubierto por
+    los constraints H2 (sum(EF) == talleresEF) y H3 (sum(IT) == talleresIT) en
+    solver.py — no se replica aquí para mantener el test rápido.
+    """
+    eid = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_E2E",
+    )
+    await _upsert_ct_v24(db_session, eid, freq_ef=3, freq_it=2)
+
+    # 1. /calcular debe devolver la empresa con EF=3 e IT=2 (sin transformación
+    #    algorítmica — D2/D3).
+    resp = await client.post(
+        "/api/frecuencias/calcular",
+        json={"trimestre": V24_TRIMESTRE_REAL},
+    )
+    assert resp.status_code == 200, resp.text
+    target = next(
+        (e for e in resp.json()["empresas"] if e["empresa_id"] == eid),
+        None,
+    )
+    assert target is not None, "la empresa con freq explícita debió entrar al cálculo"
+    assert target["talleres_ef"] == 3
+    assert target["talleres_it"] == 2
+
+    # 2. /confirmar persiste en tabla `frecuencia` con los mismos valores.
+    body = {
+        "trimestre": V24_TRIMESTRE_REAL,
+        "empresas": [
+            {"empresa_id": eid, "talleres_ef": 3, "talleres_it": 2},
+        ],
+    }
+    resp = await client.post("/api/frecuencias/confirmar", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["empresas_omitidas"] == 0
+    assert data["total_ef"] >= 3 and data["total_it"] >= 2
+
+    # 3. BD cross-check directo en la tabla `frecuencia`.
+    row = await db_session.execute(
+        text(
+            'SELECT "talleresEF", "talleresIT", "totalAsignado" '
+            'FROM frecuencia '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": V24_TRIMESTRE_REAL},
+    )
+    rec = row.mappings().first()
+    assert rec is not None, "debió insertarse fila en `frecuencia`"
+    assert rec["talleresEF"] == 3
+    assert rec["talleresIT"] == 2
+    assert rec["totalAsignado"] == 5  # invariante EF+IT
+
+
+@pytest.mark.asyncio
 async def test_confirmar_skips_insert_when_both_zero(client, db_session):
     """V24 Cambio B decisión D5: confirmar_frecuencias NO inserta fila en tabla
     `frecuencia` para empresa con talleres_ef=0 Y talleres_it=0. Devuelve

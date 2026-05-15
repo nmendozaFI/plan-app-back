@@ -43,6 +43,8 @@ class ConfigTrimestralOut(BaseModel):
     escuela_propia: bool
     permite_extras: bool  # V22 (Cambio A): empresa puede recibir EXTRA en este trimestre.
     frecuencia_solicitada: Optional[int]
+    frecuencia_ef: Optional[int]  # V24 (Cambio B): input planificadora para matriz semáforo
+    frecuencia_it: Optional[int]  # V24 (Cambio B): input planificadora para matriz semáforo
     disponibilidad_dias: str  # "L,M,X,J,V"
     turno_preferido: Optional[str]  # "M", "T", null
     voluntarios_disponibles: int
@@ -55,6 +57,8 @@ class ConfigTrimestralUpdate(BaseModel):
     escuela_propia: Optional[bool] = None
     permite_extras: Optional[bool] = None  # V22 (Cambio A)
     frecuencia_solicitada: Optional[int] = None
+    frecuencia_ef: Optional[int] = None  # V24 (Cambio B)
+    frecuencia_it: Optional[int] = None  # V24 (Cambio B)
     disponibilidad_dias: Optional[str] = None
     turno_preferido: Optional[str] = None
     voluntarios_disponibles: Optional[int] = None
@@ -68,6 +72,8 @@ class ConfigBatchUpdateItem(BaseModel):
     escuela_propia: Optional[bool] = None
     permite_extras: Optional[bool] = None  # V22 (Cambio A)
     frecuencia_solicitada: Optional[int] = None
+    frecuencia_ef: Optional[int] = None  # V24 (Cambio B)
+    frecuencia_it: Optional[int] = None  # V24 (Cambio B)
     disponibilidad_dias: Optional[str] = None
     turno_preferido: Optional[str] = None
     voluntarios_disponibles: Optional[int] = None
@@ -102,19 +108,32 @@ class ConfigResumen(BaseModel):
 
 
 class ImportPreviewItem(BaseModel):
+    """V24 (Cambio B, decisiones D2/D3/D9): preview item del bulk CT importer
+    en formato 10-columnas. Una fila por empresa con freqEF/freqIT separados,
+    EP/PE explícitos, sin frecuencia única.
+    """
     empresa_id: int
     nombre: str
-    frecuencia: int
-    tipo: Optional[str] = None
+    # V24: split EF/IT (NULL permitido si la fila los deja vacíos).
+    frecuencia_ef: Optional[int] = None
+    frecuencia_it: Optional[int] = None
+    tipo: Optional[str] = None  # EF | IT | AMBAS
+    dias: Optional[str] = None
+    turno: Optional[str] = None  # M | T | null
+    voluntarios: Optional[int] = None
+    # V24 D3: override total — Excel manda. Cell vacío se interpreta como False.
+    escuela_propia: bool = False
+    permite_extras: bool = False
     notas: Optional[str] = None
-    # Legacy-only extra fields:
-    detalle_ef: Optional[int] = None
-    detalle_it: Optional[int] = None
 
 
 class ImportarExcelResponse(BaseModel):
+    """V24 (Cambio B): response del bulk CT importer. `formato_detectado`
+    queda fijo en "v24-split-efit" — los formatos legacy/ideal fueron
+    eliminados (decisión D2: NO mantener compat con formato viejo).
+    """
     trimestre: str
-    formato_detectado: str  # "ideal" | "legacy"
+    formato_detectado: str  # siempre "v24-split-efit" en V24+
     total_procesados: int
     aplicados: int  # 0 if dry_run
     preview: list[ImportPreviewItem]
@@ -138,39 +157,11 @@ class ListaEmpresasEPResponse(BaseModel):
 
 # ── Helper Functions ────────────────────────────────────────
 
-# Non-Madrid company suffixes to skip in legacy format
-LEGACY_SKIP_SUFFIXES = ("BCN", "SEV", "VLC", "ZGZ", "BAL")
-
-
-def detect_config_format(ws) -> str:
-    """
-    Auto-detect the Excel format.
-
-    Returns "ideal" if row 1 headers contain "empresa" AND "frecuencia".
-    Returns "legacy" if rows 1-3 contain "trim" or "escuela" or "fortalecimiento".
-    Defaults to "ideal".
-    """
-    rows = []
-    for row in ws.iter_rows(min_row=1, max_row=3, values_only=True):
-        rows.append([str(c).strip().lower() if c else "" for c in row])
-
-    if len(rows) >= 1:
-        header_text = " ".join(rows[0])
-        if "empresa" in header_text and "frecuencia" in header_text:
-            return "ideal"
-
-    for row in rows:
-        row_text = " ".join(row)
-        if "trim" in row_text or "escuela" in row_text or "fortalecimiento" in row_text:
-            return "legacy"
-
-    return "ideal"
-
-
 def parse_legacy_frequency(value) -> int:
     """
-    Parse legacy format frequency strings like "3 + MP" → 3.
+    Parse frequency strings like "3 + MP" → 3.
     Extracts first integer found, or 0 if none.
+    Used by V24 import (10-col) and by other consumers of "first int in cell".
     """
     if value is None:
         return 0
@@ -181,6 +172,33 @@ def parse_legacy_frequency(value) -> int:
         return 0
     match = re.search(r"\d+", s)
     return int(match.group()) if match else 0
+
+
+def _parse_freq_or_null(value) -> Optional[int]:
+    """V24: int o None. Empty/whitespace → None (no participa en ese tipo).
+    Distinto de parse_legacy_frequency que devuelve 0 para vacíos.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    match = re.search(r"\d+", s)
+    return int(match.group()) if match else None
+
+
+def _parse_bool_strict(value) -> bool:
+    """V24: SI/NO/TRUE/FALSE/1/0 → bool. Empty/desconocido → False
+    (decisión D3: Excel manda, ausencia interpretada como False)."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().upper() in ("SI", "SÍ", "YES", "TRUE", "1", "X")
 
 
 def normalize_empresa_name(name: str) -> str:
@@ -215,6 +233,8 @@ async def obtener_configs_trimestre(
                 ct."escuelaPropia" AS escuela_propia,
                 ct."permiteExtras" AS permite_extras,
                 ct."frecuenciaSolicitada" AS frecuencia_solicitada,
+                ct."frecuenciaEF" AS frecuencia_ef,
+                ct."frecuenciaIT" AS frecuencia_it,
                 ct."disponibilidadDias" AS disponibilidad_dias,
                 ct."turnoPreferido" AS turno_preferido,
                 ct."voluntariosDisponibles" AS voluntarios_disponibles,
@@ -391,18 +411,26 @@ async def exportar_excel(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Exporta las configuraciones trimestrales a Excel (formato ideal).
-    Columns: Empresa, Frecuencia, Tipo, Dias, Turno, Voluntarios, Notas
+    Exporta las configuraciones trimestrales a Excel.
+    V24 (Cambio B, decisión D9): la columna única "Frecuencia" se reemplaza por
+    "Frecuencia EF" y "Frecuencia IT". Se añaden "Escuela Propia" y
+    "Permite Extras" como SI/NO.
+    Orden de columnas:
+      Empresa | Frecuencia EF | Frecuencia IT | Tipo | Dias | Turno |
+      Voluntarios | Escuela Propia | Permite Extras | Notas
     """
     result = await db.execute(
         text("""
             SELECT
                 e.nombre AS empresa,
-                ct."frecuenciaSolicitada" AS frecuencia,
+                ct."frecuenciaEF" AS frecuencia_ef,
+                ct."frecuenciaIT" AS frecuencia_it,
                 ct."tipoParticipacion" AS tipo,
                 ct."disponibilidadDias" AS dias,
                 ct."turnoPreferido" AS turno,
                 ct."voluntariosDisponibles" AS voluntarios,
+                ct."escuelaPropia" AS escuela_propia,
+                ct."permiteExtras" AS permite_extras,
                 ct.notas
             FROM "configTrimestral" ct
             JOIN empresa e ON e.id = ct."empresaId"
@@ -429,8 +457,11 @@ async def exportar_excel(
         bottom=Side(style="thin"),
     )
 
-    # Headers
-    headers = ["Empresa", "Frecuencia", "Tipo", "Dias", "Turno", "Voluntarios", "Notas"]
+    # Headers — V24 (Cambio B, decisión D9): 10 columnas, sin "Frecuencia" single.
+    headers = [
+        "Empresa", "Frecuencia EF", "Frecuencia IT", "Tipo", "Dias", "Turno",
+        "Voluntarios", "Escuela Propia", "Permite Extras", "Notas",
+    ]
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=header)
         cell.font = header_font
@@ -438,24 +469,36 @@ async def exportar_excel(
         cell.alignment = header_alignment
         cell.border = thin_border
 
-    # Data rows
+    def _bool_str(v: object) -> str:
+        """Render bool as SI/NO; None as NO."""
+        return "SI" if bool(v) else "NO"
+
+    # Data rows. Frecuencia EF / IT pueden ser NULL → celda vacía (decisión D2 +
+    # D7: NULL no se baja como 0 en el export, así el bulk import distingue
+    # "no tocar" de "explícitamente cero" si lo necesita más adelante).
     for row_idx, row_data in enumerate(rows, 2):
         ws.cell(row=row_idx, column=1, value=row_data["empresa"])
-        ws.cell(row=row_idx, column=2, value=row_data["frecuencia"] or 0)
-        ws.cell(row=row_idx, column=3, value=row_data["tipo"] or "AMBAS")
-        ws.cell(row=row_idx, column=4, value=row_data["dias"] or "L,M,X,J,V")
-        ws.cell(row=row_idx, column=5, value=row_data["turno"] or "-")
-        ws.cell(row=row_idx, column=6, value=row_data["voluntarios"] or 0)
-        ws.cell(row=row_idx, column=7, value=row_data["notas"] or "")
+        ws.cell(row=row_idx, column=2, value=row_data["frecuencia_ef"])  # may be NULL
+        ws.cell(row=row_idx, column=3, value=row_data["frecuencia_it"])  # may be NULL
+        ws.cell(row=row_idx, column=4, value=row_data["tipo"] or "AMBAS")
+        ws.cell(row=row_idx, column=5, value=row_data["dias"] or "L,M,X,J,V")
+        ws.cell(row=row_idx, column=6, value=row_data["turno"] or "-")
+        ws.cell(row=row_idx, column=7, value=row_data["voluntarios"] or 0)
+        ws.cell(row=row_idx, column=8, value=_bool_str(row_data["escuela_propia"]))
+        ws.cell(row=row_idx, column=9, value=_bool_str(row_data["permite_extras"]))
+        ws.cell(row=row_idx, column=10, value=row_data["notas"] or "")
 
     # Adjust column widths
     ws.column_dimensions["A"].width = 35  # Empresa
-    ws.column_dimensions["B"].width = 12  # Frecuencia
-    ws.column_dimensions["C"].width = 10  # Tipo
-    ws.column_dimensions["D"].width = 15  # Dias
-    ws.column_dimensions["E"].width = 8   # Turno
-    ws.column_dimensions["F"].width = 12  # Voluntarios
-    ws.column_dimensions["G"].width = 40  # Notas
+    ws.column_dimensions["B"].width = 14  # Frecuencia EF
+    ws.column_dimensions["C"].width = 14  # Frecuencia IT
+    ws.column_dimensions["D"].width = 10  # Tipo
+    ws.column_dimensions["E"].width = 15  # Dias
+    ws.column_dimensions["F"].width = 8   # Turno
+    ws.column_dimensions["G"].width = 12  # Voluntarios
+    ws.column_dimensions["H"].width = 16  # Escuela Propia
+    ws.column_dimensions["I"].width = 16  # Permite Extras
+    ws.column_dimensions["J"].width = 40  # Notas
 
     # Save to buffer
     buffer = BytesIO()
@@ -470,7 +513,45 @@ async def exportar_excel(
     )
 
 
-@router.post("/{trimestre}/importar-excel")
+# V24 (Cambio B, D2): formato único 10 columnas. Mapping de header → canon
+# (case-insensitive, espacios/guion-bajo ignorados).
+_V24_HEADER_MAP: dict[str, str] = {
+    "empresa": "empresa",
+    "frecuenciaef": "freq_ef",
+    "frecef": "freq_ef",
+    "freqef": "freq_ef",
+    "freq_ef": "freq_ef",
+    "frecuenciait": "freq_it",
+    "frecit": "freq_it",
+    "freqit": "freq_it",
+    "freq_it": "freq_it",
+    "tipo": "tipo",
+    "dias": "dias",
+    "días": "dias",
+    "turno": "turno",
+    "voluntarios": "voluntarios",
+    "escuelapropia": "escuela_propia",
+    "escuela_propia": "escuela_propia",
+    "ep": "escuela_propia",
+    "permiteextras": "permite_extras",
+    "permite_extras": "permite_extras",
+    "pe": "permite_extras",
+    "notas": "notas",
+}
+
+_V24_REQUIRED_HEADERS = {
+    "empresa", "freq_ef", "freq_it", "escuela_propia", "permite_extras",
+}
+
+
+def _normalize_header(raw: object) -> str:
+    """Normaliza un header de Excel: strip + lowercase + quita espacios y guion bajo."""
+    if raw is None:
+        return ""
+    return str(raw).strip().lower().replace(" ", "").replace("_", "")
+
+
+@router.post("/{trimestre}/importar-excel", response_model=ImportarExcelResponse)
 async def importar_excel(
     trimestre: str,
     file: UploadFile = File(...),
@@ -478,212 +559,260 @@ async def importar_excel(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Importa configuraciones desde Excel.
-    Auto-detecta formato:
-      - "ideal": sistema propio (Empresa, Frecuencia, Tipo, Dias, Turno, Voluntarios, Notas)
-      - "legacy": Excel planificador anual (multi-quarter EF/IT split)
+    V24 (Cambio B, decisiones D2/D3/D9): bulk import de configTrimestral en
+    formato único 10-columnas.
 
-    dry_run=True returns preview without applying. dry_run=False applies changes.
+    Columnas requeridas (case-insensitive, espacios/guion-bajo ignorados):
+      - Empresa
+      - Frecuencia EF (vacío = NULL = no participa en EF este trimestre)
+      - Frecuencia IT (vacío = NULL = no participa en IT este trimestre)
+      - Escuela Propia (SI / NO — override total, Excel manda, D3)
+      - Permite Extras (SI / NO — override total, Excel manda, D3)
+
+    Columnas opcionales: Tipo, Dias, Turno, Voluntarios, Notas. Si la columna
+    falta o la celda está vacía, el UPDATE no toca ese campo en el CT existente;
+    el INSERT usa defaults razonables.
+
+    Comportamiento:
+      - dry_run=true  → preview sin aplicar (cliente puede mostrarlo y pedir
+        confirmación al planificador).
+      - dry_run=false → UPSERT en `configTrimestral`. CT existente: UPDATE de
+        freqEF/freqIT/EP/PE (siempre) + opcionales si vienen. CT no existente:
+        INSERT con defaults para los campos no provistos.
+
+    Los formatos legacy/ideal anteriores ya NO se aceptan (decisión D2).
     """
-    # Load the Excel file
+    # ── Cargar Excel ─────────────────────────────────────────
     try:
         content = await file.read()
         wb = load_workbook(BytesIO(content), data_only=True)
         ws = wb.active
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error reading Excel file: {e}")
+        raise HTTPException(status_code=400, detail=f"Error leyendo Excel: {e}")
 
-    # Detect format
-    formato = detect_config_format(ws)
+    # ── Resolver headers ─────────────────────────────────────
+    headers: dict[str, int] = {}  # canon → col_index (1-based)
+    for col_idx, cell in enumerate(ws[1], 1):
+        canon = _V24_HEADER_MAP.get(_normalize_header(cell.value))
+        if canon:
+            headers[canon] = col_idx
 
-    # Load empresas for matching
+    missing = _V24_REQUIRED_HEADERS - set(headers.keys())
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Columnas requeridas no encontradas: {sorted(missing)}. "
+                f"Formato esperado V24 (Cambio B): Empresa, Frecuencia EF, "
+                f"Frecuencia IT, Tipo (opcional), Dias (opc.), Turno (opc.), "
+                f"Voluntarios (opc.), Escuela Propia, Permite Extras, "
+                f"Notas (opc.). Los formatos legacy/ideal anteriores ya no se "
+                f"aceptan."
+            ),
+        )
+
+    # ── Cargar empresas activas para matching ────────────────
     emp_result = await db.execute(
-        text("""
-            SELECT id, nombre FROM empresa WHERE activa = true
-        """)
+        text("SELECT id, nombre FROM empresa WHERE activa = true")
     )
-    empresas = {normalize_empresa_name(r["nombre"]): {"id": r["id"], "nombre": r["nombre"]}
-                for r in emp_result.mappings().all()}
+    empresas = {
+        normalize_empresa_name(r["nombre"]): {"id": r["id"], "nombre": r["nombre"]}
+        for r in emp_result.mappings().all()
+    }
 
-    preview = []
-    warnings = []
+    preview: list[ImportPreviewItem] = []
+    warnings: list[str] = []
     total_procesados = 0
 
-    if formato == "ideal":
-        # ── Process Ideal Format ──────────────────────────────
-        # Find header row (should be row 1)
-        headers = {}
-        for col_idx, cell in enumerate(ws[1], 1):
-            if cell.value:
-                headers[str(cell.value).strip().lower()] = col_idx
+    def _cell(row: tuple, canon: str) -> object:
+        col = headers.get(canon)
+        if col is None:
+            return None
+        # row es 0-indexado, headers son 1-indexado.
+        if col - 1 >= len(row):
+            return None
+        return row[col - 1]
 
-        # Required column
-        empresa_col = headers.get("empresa")
-        if not empresa_col:
-            raise HTTPException(status_code=400, detail="Columna 'Empresa' no encontrada")
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
+        empresa_raw = _cell(row, "empresa")
+        if not row or not empresa_raw:
+            continue
 
-        freq_col = headers.get("frecuencia")
-        tipo_col = headers.get("tipo")
-        dias_col = headers.get("dias")
-        turno_col = headers.get("turno")
-        vol_col = headers.get("voluntarios")
-        notas_col = headers.get("notas")
+        empresa_name = str(empresa_raw).strip()
+        normalized = normalize_empresa_name(empresa_name)
+        total_procesados += 1
 
-        # Process data rows
-        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
-            if not row or not row[empresa_col - 1]:
-                continue
+        # Match empresa por nombre (exacto + fuzzy).
+        match = empresas.get(normalized)
+        if not match:
+            for key, val in empresas.items():
+                if normalized in key or key in normalized:
+                    match = val
+                    break
+        if not match:
+            warnings.append(f"Fila {row_idx}: Empresa '{empresa_name}' no encontrada")
+            continue
 
-            empresa_name = str(row[empresa_col - 1]).strip()
-            normalized = normalize_empresa_name(empresa_name)
-            total_procesados += 1
+        # Parseo de campos.
+        freq_ef = _parse_freq_or_null(_cell(row, "freq_ef"))
+        freq_it = _parse_freq_or_null(_cell(row, "freq_it"))
+        ep_val = _parse_bool_strict(_cell(row, "escuela_propia"))
+        pe_val = _parse_bool_strict(_cell(row, "permite_extras"))
 
-            # Find empresa
-            match = empresas.get(normalized)
-            if not match:
-                # Try fuzzy: check if any empresa contains this name or vice versa
-                for key, val in empresas.items():
-                    if normalized in key or key in normalized:
-                        match = val
-                        break
-            if not match:
-                warnings.append(f"Fila {row_idx}: Empresa '{empresa_name}' no encontrada")
-                continue
-
-            # Parse values
-            frecuencia = parse_legacy_frequency(row[freq_col - 1] if freq_col else None)
-            tipo = str(row[tipo_col - 1]).strip().upper() if tipo_col and row[tipo_col - 1] else None
-            dias = str(row[dias_col - 1]).strip() if dias_col and row[dias_col - 1] else None
-            turno = str(row[turno_col - 1]).strip() if turno_col and row[turno_col - 1] else None
-            voluntarios = int(row[vol_col - 1]) if vol_col and row[vol_col - 1] else None
-            notas = str(row[notas_col - 1]).strip() if notas_col and row[notas_col - 1] else None
-
-            # Validate tipo
-            if tipo and tipo not in ("EF", "IT", "AMBAS"):
-                tipo = None
-
-            # Validate turno
-            if turno and turno not in ("M", "T"):
-                turno = None
-
-            preview.append(ImportPreviewItem(
-                empresa_id=match["id"],
-                nombre=match["nombre"],
-                frecuencia=frecuencia,
-                tipo=tipo,
-                notas=notas,
-            ))
-
-    else:
-        # ── Process Legacy Format ─────────────────────────────
-        # Parse quarter number from trimestre (e.g., "2026-Q2" → 2)
-        quarter_match = re.search(r"Q(\d)", trimestre)
-        if not quarter_match:
-            raise HTTPException(status_code=400, detail=f"Cannot parse quarter from '{trimestre}'")
-        quarter_num = int(quarter_match.group(1))  # 1-4
-
-        # Legacy columns (0-indexed):
-        # A=empresa, B-E=EF Q1-Q4, F=obs EF, G-J=IT Q1-Q4, K=obs IT
-        ef_col = 1 + quarter_num  # B=Q1, C=Q2, D=Q3, E=Q4 → 2,3,4,5
-        it_col = 6 + quarter_num  # G=Q1, H=Q2, I=Q3, J=Q4 → 7,8,9,10
-        obs_ef_col = 6   # F
-        obs_it_col = 11  # K
-
-        # Data starts at row 4
-        for row_idx, row in enumerate(ws.iter_rows(min_row=4, values_only=True), 4):
-            if not row or not row[0]:
-                continue
-
-            empresa_name = str(row[0]).strip()
-            total_procesados += 1
-
-            # Skip non-Madrid companies
-            upper_name = empresa_name.upper()
-            if any(upper_name.endswith(f" {suf}") or upper_name.endswith(f"_{suf}") for suf in LEGACY_SKIP_SUFFIXES):
-                continue
-
-            # Normalize (remove MAD suffix)
-            normalized = normalize_empresa_name(empresa_name)
-
-            # Find empresa
-            match = empresas.get(normalized)
-            if not match:
-                # Fuzzy match
-                for key, val in empresas.items():
-                    if normalized in key or key in normalized:
-                        match = val
-                        break
-            if not match:
-                warnings.append(f"Fila {row_idx}: Empresa '{empresa_name}' no encontrada")
-                continue
-
-            # Parse EF and IT frequencies
-            ef_freq = parse_legacy_frequency(row[ef_col - 1] if len(row) > ef_col - 1 else None)
-            it_freq = parse_legacy_frequency(row[it_col - 1] if len(row) > it_col - 1 else None)
-            total_freq = ef_freq + it_freq
-
-            # Derive tipo
-            if ef_freq > 0 and it_freq > 0:
-                tipo = "AMBAS"
-            elif ef_freq > 0:
-                tipo = "EF"
-            elif it_freq > 0:
-                tipo = "IT"
+        # Tipo opcional. Si viene, debe ser EF/IT/AMBAS.
+        tipo_raw = _cell(row, "tipo")
+        tipo: Optional[str] = None
+        if tipo_raw not in (None, ""):
+            tipo_candidate = str(tipo_raw).strip().upper()
+            if tipo_candidate in ("EF", "IT", "AMBAS"):
+                tipo = tipo_candidate
             else:
-                tipo = None
+                warnings.append(
+                    f"Fila {row_idx}: Tipo '{tipo_raw}' inválido — se ignora (debe ser EF/IT/AMBAS)"
+                )
 
-            # Merge observations
-            obs_ef = str(row[obs_ef_col - 1]).strip() if len(row) > obs_ef_col - 1 and row[obs_ef_col - 1] else ""
-            obs_it = str(row[obs_it_col - 1]).strip() if len(row) > obs_it_col - 1 and row[obs_it_col - 1] else ""
-            notas_parts = []
-            if obs_ef:
-                notas_parts.append(f"EF: {obs_ef}")
-            if obs_it:
-                notas_parts.append(f"IT: {obs_it}")
-            notas = " | ".join(notas_parts) if notas_parts else None
+        # Dias opcional.
+        dias_raw = _cell(row, "dias")
+        dias = str(dias_raw).strip() if dias_raw not in (None, "") else None
 
-            preview.append(ImportPreviewItem(
-                empresa_id=match["id"],
-                nombre=match["nombre"],
-                frecuencia=total_freq,
-                tipo=tipo,
-                notas=notas,
-                detalle_ef=ef_freq if ef_freq > 0 else None,
-                detalle_it=it_freq if it_freq > 0 else None,
-            ))
+        # Turno opcional (M/T).
+        turno_raw = _cell(row, "turno")
+        turno: Optional[str] = None
+        if turno_raw not in (None, ""):
+            turno_candidate = str(turno_raw).strip().upper()
+            if turno_candidate in ("M", "T"):
+                turno = turno_candidate
+            else:
+                warnings.append(
+                    f"Fila {row_idx}: Turno '{turno_raw}' inválido — se ignora (debe ser M/T)"
+                )
 
+        # Voluntarios opcional.
+        vol_raw = _cell(row, "voluntarios")
+        voluntarios: Optional[int] = None
+        if vol_raw not in (None, ""):
+            try:
+                voluntarios = int(vol_raw)
+            except (ValueError, TypeError):
+                warnings.append(
+                    f"Fila {row_idx}: Voluntarios '{vol_raw}' inválido — se ignora"
+                )
+
+        # Notas opcional.
+        notas_raw = _cell(row, "notas")
+        notas = str(notas_raw).strip() if notas_raw not in (None, "") else None
+
+        preview.append(ImportPreviewItem(
+            empresa_id=match["id"],
+            nombre=match["nombre"],
+            frecuencia_ef=freq_ef,
+            frecuencia_it=freq_it,
+            tipo=tipo,
+            dias=dias,
+            turno=turno,
+            voluntarios=voluntarios,
+            escuela_propia=ep_val,
+            permite_extras=pe_val,
+            notas=notas,
+        ))
+
+    # ── Apply (solo si !dry_run) ─────────────────────────────
     aplicados = 0
     if not dry_run and preview:
-        # Apply changes
         for item in preview:
-            updates = ['"frecuenciaSolicitada" = :freq', '"updatedAt" = NOW()']
-            params = {"eid": item.empresa_id, "tri": trimestre, "freq": item.frecuencia}
+            # Comprobar si existe CT para esta empresa+trimestre.
+            existing = await db.execute(
+                text(
+                    'SELECT id FROM "configTrimestral" '
+                    'WHERE "empresaId" = :eid AND trimestre = :tri'
+                ),
+                {"eid": item.empresa_id, "tri": trimestre},
+            )
+            ct_exists = existing.first() is not None
 
-            if item.tipo:
-                updates.append('"tipoParticipacion" = :tipo')
-                params["tipo"] = item.tipo
+            if ct_exists:
+                # UPDATE dinámico. freqEF, freqIT, EP, PE SIEMPRE se setean
+                # (override total, decisión D3). Opcionales: solo si la fila
+                # del Excel los trae (campo no-None).
+                updates = [
+                    '"frecuenciaEF" = :freq_ef',
+                    '"frecuenciaIT" = :freq_it',
+                    '"escuelaPropia" = :ep',
+                    '"permiteExtras" = :pe',
+                    '"updatedAt" = NOW()',
+                ]
+                params: dict = {
+                    "eid": item.empresa_id,
+                    "tri": trimestre,
+                    "freq_ef": item.frecuencia_ef,
+                    "freq_it": item.frecuencia_it,
+                    "ep": item.escuela_propia,
+                    "pe": item.permite_extras,
+                }
+                if item.tipo is not None:
+                    updates.append('"tipoParticipacion" = :tipo')
+                    params["tipo"] = item.tipo
+                if item.dias is not None:
+                    updates.append('"disponibilidadDias" = :dias')
+                    params["dias"] = item.dias
+                if item.turno is not None:
+                    updates.append('"turnoPreferido" = :turno')
+                    params["turno"] = item.turno
+                if item.voluntarios is not None:
+                    updates.append('"voluntariosDisponibles" = :vol')
+                    params["vol"] = item.voluntarios
+                if item.notas is not None:
+                    updates.append("notas = :notas")
+                    params["notas"] = item.notas
 
-            if item.notas:
-                updates.append("notas = :notas")
-                params["notas"] = item.notas
-
-            query = f"""
-                UPDATE "configTrimestral"
-                SET {', '.join(updates)}
-                WHERE "empresaId" = :eid AND trimestre = :tri
-            """
-            result = await db.execute(text(query), params)
-            if result.rowcount > 0:
+                query = (
+                    'UPDATE "configTrimestral" SET '
+                    + ", ".join(updates)
+                    + ' WHERE "empresaId" = :eid AND trimestre = :tri'
+                )
+                result = await db.execute(text(query), params)
+                if result.rowcount > 0:
+                    aplicados += 1
+            else:
+                # INSERT con defaults para los campos opcionales no provistos.
+                await db.execute(
+                    text("""
+                        INSERT INTO "configTrimestral" (
+                            "empresaId", trimestre, "tipoParticipacion",
+                            "escuelaPropia", "permiteExtras",
+                            "frecuenciaEF", "frecuenciaIT",
+                            "disponibilidadDias", "turnoPreferido",
+                            "voluntariosDisponibles", notas, "updatedAt"
+                        ) VALUES (
+                            :eid, :tri, :tipo, :ep, :pe,
+                            :freq_ef, :freq_it,
+                            :dias, :turno, :vol, :notas, NOW()
+                        )
+                    """),
+                    {
+                        "eid": item.empresa_id,
+                        "tri": trimestre,
+                        "tipo": item.tipo or "AMBAS",
+                        "ep": item.escuela_propia,
+                        "pe": item.permite_extras,
+                        "freq_ef": item.frecuencia_ef,
+                        "freq_it": item.frecuencia_it,
+                        "dias": item.dias or "L,M,X,J,V",
+                        "turno": item.turno,
+                        "vol": item.voluntarios if item.voluntarios is not None else 0,
+                        "notas": item.notas,
+                    },
+                )
                 aplicados += 1
 
         await db.commit()
 
     return ImportarExcelResponse(
         trimestre=trimestre,
-        formato_detectado=formato,
+        formato_detectado="v24-split-efit",
         total_procesados=total_procesados,
         aplicados=aplicados,
-        preview=[p.model_dump() for p in preview],
+        preview=preview,
         warnings=warnings,
         dry_run=dry_run,
     )
@@ -734,6 +863,18 @@ async def actualizar_configs_batch(
             if item.frecuencia_solicitada is not None:
                 updates.append('"frecuenciaSolicitada" = :freq')
                 params["freq"] = item.frecuencia_solicitada
+
+            # V24 (Cambio B): EF e IT son los inputs reales de la matriz
+            # semáforo. None significa "no tocar este campo"; explícito None
+            # se manda via PUT específico si la planificadora quiere NULL-ear
+            # una empresa para sacarla del cálculo.
+            if item.frecuencia_ef is not None:
+                updates.append('"frecuenciaEF" = :freq_ef')
+                params["freq_ef"] = item.frecuencia_ef
+
+            if item.frecuencia_it is not None:
+                updates.append('"frecuenciaIT" = :freq_it')
+                params["freq_it"] = item.frecuencia_it
 
             if item.disponibilidad_dias is not None:
                 updates.append('"disponibilidadDias" = :dias')
@@ -794,6 +935,7 @@ async def inicializar_configs(
     if body.origen_trimestre:
         # ── Modo clonar ──────────────────────────────────────
         # V22 (Cambio A): permiteExtras se copia 1:1 desde el trimestre origen.
+        # V24 (Cambio B): frecuenciaEF / frecuenciaIT también se copian 1:1.
         rows = await db.execute(
             text("""
                 SELECT
@@ -805,6 +947,8 @@ async def inicializar_configs(
                     ct."permiteExtras",
                     ct."turnoPreferido",
                     ct."frecuenciaSolicitada",
+                    ct."frecuenciaEF",
+                    ct."frecuenciaIT",
                     ct."disponibilidadDias",
                     ct."voluntariosDisponibles",
                     ct."preferenciasTaller",
@@ -836,6 +980,7 @@ async def inicializar_configs(
                         "empresaId", trimestre, "tipoParticipacion",
                         "escuelaPropia", "permiteExtras", "disponibilidadDias",
                         "turnoPreferido", "frecuenciaSolicitada",
+                        "frecuenciaEF", "frecuenciaIT",
                         "voluntariosDisponibles", "preferenciasTaller",
                         notas, "updatedAt"
                     )
@@ -843,6 +988,7 @@ async def inicializar_configs(
                         :eid, :destino, :tipo,
                         :escuela, :permite, :dias,
                         :turno, :freq,
+                        :freq_ef, :freq_it,
                         :vol, :pref,
                         :notas, NOW()
                     )
@@ -857,6 +1003,8 @@ async def inicializar_configs(
                     "dias": cfg["disponibilidadDias"] or "L,M,X,J,V",
                     "turno": cfg["turnoPreferido"],
                     "freq": cfg["frecuenciaSolicitada"],
+                    "freq_ef": cfg["frecuenciaEF"],  # V24 (Cambio B): puede ser NULL
+                    "freq_it": cfg["frecuenciaIT"],  # V24 (Cambio B): puede ser NULL
                     "vol": cfg["voluntariosDisponibles"] or 0,
                     "pref": cfg["preferenciasTaller"],
                     "notas": cfg["notas"],
@@ -988,6 +1136,15 @@ async def actualizar_config(
             updates.append('"frecuenciaSolicitada" = :freq')
             params["freq"] = body.frecuencia_solicitada
 
+        # V24 (Cambio B): EF/IT — inputs reales de la matriz semáforo.
+        if body.frecuencia_ef is not None:
+            updates.append('"frecuenciaEF" = :freq_ef')
+            params["freq_ef"] = body.frecuencia_ef
+
+        if body.frecuencia_it is not None:
+            updates.append('"frecuenciaIT" = :freq_it')
+            params["freq_it"] = body.frecuencia_it
+
         if body.disponibilidad_dias is not None:
             updates.append('"disponibilidadDias" = :dias')
             params["dias"] = body.disponibilidad_dias
@@ -1018,18 +1175,21 @@ async def actualizar_config(
             await db.execute(text(query), params)
     else:
         # Crear nueva config
+        # V24 (Cambio B): freqEF/freqIT en INSERT, default NULL si el body no los manda.
         await db.execute(
             text("""
                 INSERT INTO "configTrimestral" (
                     "empresaId", trimestre, "tipoParticipacion",
                     "escuelaPropia", "permiteExtras", "frecuenciaSolicitada",
+                    "frecuenciaEF", "frecuenciaIT",
                     "disponibilidadDias", "turnoPreferido",
                     "voluntariosDisponibles", "preferenciasTaller",
                     notas, "updatedAt"
                 )
                 VALUES (
-                    :eid, :tri, :tipo, :escuela, :permite, :freq, :dias,
-                    :turno, :vol, :pref, :notas, NOW()
+                    :eid, :tri, :tipo, :escuela, :permite, :freq,
+                    :freq_ef, :freq_it,
+                    :dias, :turno, :vol, :pref, :notas, NOW()
                 )
             """),
             {
@@ -1039,6 +1199,8 @@ async def actualizar_config(
                 "escuela": body.escuela_propia or False,
                 "permite": body.permite_extras or False,
                 "freq": body.frecuencia_solicitada,
+                "freq_ef": body.frecuencia_ef,
+                "freq_it": body.frecuencia_it,
                 "dias": body.disponibilidad_dias or "L,M,X,J,V",
                 "turno": body.turno_preferido if body.turno_preferido != "" else None,
                 "vol": body.voluntarios_disponibles or 0,
@@ -1060,6 +1222,8 @@ async def actualizar_config(
                 ct."escuelaPropia" AS escuela_propia,
                 ct."permiteExtras" AS permite_extras,
                 ct."frecuenciaSolicitada" AS frecuencia_solicitada,
+                ct."frecuenciaEF" AS frecuencia_ef,
+                ct."frecuenciaIT" AS frecuencia_it,
                 ct."disponibilidadDias" AS disponibilidad_dias,
                 ct."turnoPreferido" AS turno_preferido,
                 ct."voluntariosDisponibles" AS voluntarios_disponibles,

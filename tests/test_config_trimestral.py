@@ -451,3 +451,495 @@ async def test_inicializar_clonar_copia_permite_extras(client, db_session):
         {"o": origen_tri, "d": destino_tri},
     )
     await db_session.commit()
+
+
+# ── V24 (Cambio B): frecuenciaEF / frecuenciaIT en endpoints CT ────
+
+
+async def _set_ct_with_freq(
+    db,
+    empresa_id: int,
+    *,
+    freq_ef: int | None,
+    freq_it: int | None,
+    trimestre: str = TEST_TRIMESTRE,
+):
+    """Upsert CT with explicit freqEF/freqIT (and the V22 flags neutral)."""
+    await db.execute(
+        text(
+            'INSERT INTO "configTrimestral" '
+            '("empresaId", trimestre, "tipoParticipacion", "escuelaPropia", '
+            '"permiteExtras", "frecuenciaEF", "frecuenciaIT", '
+            '"disponibilidadDias", "updatedAt") '
+            "VALUES (:eid, :tri, 'AMBAS', false, false, :ef, :it, 'L,M,X,J,V', NOW()) "
+            'ON CONFLICT ("empresaId", trimestre) DO UPDATE SET '
+            '    "frecuenciaEF" = EXCLUDED."frecuenciaEF", '
+            '    "frecuenciaIT" = EXCLUDED."frecuenciaIT"'
+        ),
+        {"eid": empresa_id, "tri": trimestre, "ef": freq_ef, "it": freq_it},
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_get_trimestre_returns_freq_ef_it(client, db_session):
+    """V24 Cambio B (T4): GET /{trimestre} expone frecuencia_ef y frecuencia_it
+    para cada config en el JSON.
+    """
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_GET")
+    await _set_ct_with_freq(db_session, eid, freq_ef=4, freq_it=2)
+
+    resp = await client.get(f"/api/config-trimestral/{TEST_TRIMESTRE}")
+    assert resp.status_code == 200, resp.text
+    configs = resp.json()["configs"]
+    target = next(c for c in configs if c["empresa_id"] == eid)
+    assert target["frecuencia_ef"] == 4
+    assert target["frecuencia_it"] == 2
+
+
+@pytest.mark.asyncio
+async def test_put_empresa_updates_freq_ef_it(client, db_session):
+    """V24 Cambio B (T5): PUT /{trimestre}/{empresa_id} persiste
+    frecuencia_ef y frecuencia_it cuando vienen en el body.
+    """
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_PUT")
+    await _set_ct_with_freq(db_session, eid, freq_ef=None, freq_it=None)
+
+    resp = await client.put(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/{eid}",
+        json={"frecuencia_ef": 5, "frecuencia_it": 3},
+    )
+    assert resp.status_code == 200, resp.text
+    config = resp.json()["config"]
+    assert config["frecuencia_ef"] == 5
+    assert config["frecuencia_it"] == 3
+
+    # DB cross-check
+    row = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF", "frecuenciaIT" FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    rec = row.mappings().first()
+    assert rec["frecuenciaEF"] == 5
+    assert rec["frecuenciaIT"] == 3
+
+
+@pytest.mark.asyncio
+async def test_batch_update_freq_ef_it(client, db_session):
+    """V24 Cambio B (T6): PUT /batch acepta frecuencia_ef y frecuencia_it.
+    Toggle via batch para una empresa, DB cross-check.
+    """
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_BATCH")
+    await _set_ct_with_freq(db_session, eid, freq_ef=1, freq_it=0)
+
+    resp = await client.put(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/batch",
+        json={
+            "updates": [
+                {"empresa_id": eid, "frecuencia_ef": 6, "frecuencia_it": 4},
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] == 1
+
+    row = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF", "frecuenciaIT" FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    rec = row.mappings().first()
+    assert rec["frecuenciaEF"] == 6
+    assert rec["frecuenciaIT"] == 4
+
+
+@pytest.mark.asyncio
+async def test_inicializar_clonar_copies_freq_ef_it(client, db_session):
+    """V24 Cambio B (T7): POST /inicializar modo clonar copia freqEF/freqIT 1:1
+    desde el trimestre origen.
+    """
+    origen_tri = "TEST-V24-CLONE-ORIG-EFIT"
+    destino_tri = "TEST-V24-CLONE-DEST-EFIT"
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_CLONE_EFIT")
+
+    # Seed origen with freq_ef=7, freq_it=2.
+    await _set_ct_with_freq(
+        db_session, eid, freq_ef=7, freq_it=2, trimestre=origen_tri,
+    )
+    # Pre-clean destino.
+    await db_session.execute(
+        text('DELETE FROM "configTrimestral" WHERE trimestre = :tri'),
+        {"tri": destino_tri},
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/config-trimestral/{destino_tri}/inicializar",
+        json={"origen_trimestre": origen_tri},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF", "frecuenciaIT" FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": destino_tri},
+    )
+    rec = row.mappings().first()
+    assert rec["frecuenciaEF"] == 7
+    assert rec["frecuenciaIT"] == 2
+
+    # Cleanup the bespoke trimestres.
+    await db_session.execute(
+        text('DELETE FROM "configTrimestral" WHERE trimestre IN (:o, :d)'),
+        {"o": origen_tri, "d": destino_tri},
+    )
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_inicializar_defaults_leaves_freq_ef_it_null(client, db_session):
+    """V24 Cambio B (T7.2): POST /inicializar modo defaults NO rellena
+    frecuenciaEF/IT (quedan NULL para que la planificadora los meta a mano).
+    """
+    new_tri = "TEST-V24-INIT-DEFAULTS-EFIT"
+    eid = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}V24_INIT_DEFAULTS_EFIT",
+    )
+
+    # Asegurarse de que la empresa NO tiene CT previa en new_tri.
+    await db_session.execute(
+        text(
+            'DELETE FROM "configTrimestral" WHERE trimestre = :tri AND "empresaId" = :eid'
+        ),
+        {"tri": new_tri, "eid": eid},
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/config-trimestral/{new_tri}/inicializar",
+        json={},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF", "frecuenciaIT" FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": new_tri},
+    )
+    rec = row.mappings().first()
+    assert rec["frecuenciaEF"] is None
+    assert rec["frecuenciaIT"] is None
+
+    await db_session.execute(
+        text('DELETE FROM "configTrimestral" WHERE trimestre = :tri'),
+        {"tri": new_tri},
+    )
+    await db_session.commit()
+
+
+# ── V24 (Cambio B, B4.5): bulk CT importer formato 10-col ─────────
+
+
+def _build_v24_ct_excel(rows: list[dict], include_optional: bool = True) -> bytes:
+    """Build a 10-col CT Excel for the V24 importer.
+    `rows` items: {empresa, freq_ef, freq_it, escuela_propia, permite_extras,
+                   tipo?, dias?, turno?, voluntarios?, notas?}
+    `include_optional=False` → solo las 5 columnas requeridas (sirve para
+    verificar que el importer acepta el mínimo).
+    """
+    import openpyxl
+    from io import BytesIO
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "ConfigTrimestral"
+
+    if include_optional:
+        headers = [
+            "Empresa", "Frecuencia EF", "Frecuencia IT", "Tipo", "Dias",
+            "Turno", "Voluntarios", "Escuela Propia", "Permite Extras", "Notas",
+        ]
+    else:
+        headers = [
+            "Empresa", "Frecuencia EF", "Frecuencia IT",
+            "Escuela Propia", "Permite Extras",
+        ]
+    ws.append(headers)
+
+    for r in rows:
+        if include_optional:
+            ws.append([
+                r["empresa"],
+                r.get("freq_ef"),
+                r.get("freq_it"),
+                r.get("tipo"),
+                r.get("dias"),
+                r.get("turno"),
+                r.get("voluntarios"),
+                "SI" if r.get("escuela_propia") else "NO",
+                "SI" if r.get("permite_extras") else "NO",
+                r.get("notas"),
+            ])
+        else:
+            ws.append([
+                r["empresa"],
+                r.get("freq_ef"),
+                r.get("freq_it"),
+                "SI" if r.get("escuela_propia") else "NO",
+                "SI" if r.get("permite_extras") else "NO",
+            ])
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_importar_excel_ct_format_nuevo(client, db_session):
+    """V24 B4.5: el importer acepta el nuevo formato 10-columnas y devuelve
+    `formato_detectado='v24-split-efit'`. Verifica dry_run + apply en el
+    mismo test contra un CT pre-existente (UPDATE path)."""
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_IMP_UPDATE")
+    # Sembrar un CT en TEST_TRIMESTRE para forzar la rama UPDATE.
+    await _set_ct_with_freq(db_session, eid, freq_ef=None, freq_it=None)
+
+    excel = _build_v24_ct_excel([{
+        "empresa": f"{TEST_EMPRESA_PREFIX}V24_IMP_UPDATE",
+        "freq_ef": 4, "freq_it": 2, "tipo": "AMBAS",
+        "dias": "L,M,X,J,V", "turno": "M", "voluntarios": 1,
+        "escuela_propia": False, "permite_extras": True, "notas": "Test V24",
+    }])
+
+    # dry_run=True → preview, no aplica.
+    resp = await client.post(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/importar-excel",
+        files={
+            "file": (
+                "ct_v24.xlsx", excel,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"dry_run": "true"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["formato_detectado"] == "v24-split-efit"
+    assert data["total_procesados"] == 1
+    assert data["aplicados"] == 0
+    assert data["dry_run"] is True
+
+    target = next(p for p in data["preview"] if p["empresa_id"] == eid)
+    assert target["frecuencia_ef"] == 4
+    assert target["frecuencia_it"] == 2
+    assert target["permite_extras"] is True
+    assert target["escuela_propia"] is False
+
+    # BD inalterada por el dry-run.
+    row = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF", "frecuenciaIT", "permiteExtras" '
+            'FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    rec = row.mappings().first()
+    assert rec["frecuenciaEF"] is None  # sigue NULL por _set_ct_with_freq inicial
+    assert rec["frecuenciaIT"] is None
+    assert rec["permiteExtras"] is False
+
+    # dry_run=False → aplica.
+    resp = await client.post(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/importar-excel",
+        files={
+            "file": (
+                "ct_v24.xlsx", excel,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"dry_run": "false"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["aplicados"] == 1
+
+    # BD post-aplicación: valores persistidos.
+    row = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF", "frecuenciaIT", "permiteExtras", "escuelaPropia" '
+            'FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    rec = row.mappings().first()
+    assert rec["frecuenciaEF"] == 4
+    assert rec["frecuenciaIT"] == 2
+    assert rec["permiteExtras"] is True
+    assert rec["escuelaPropia"] is False
+
+
+@pytest.mark.asyncio
+async def test_importar_excel_ep_pe_override_total(client, db_session):
+    """V24 B4.5 (D3): EP y PE override total — Excel manda incluso si el CT
+    existente ya tenía un valor distinto. Pasar SI/NO sobreescribe."""
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_IMP_OVERRIDE")
+    # CT inicial con EP=true, PE=true.
+    await db_session.execute(
+        text(
+            'INSERT INTO "configTrimestral" '
+            '("empresaId", trimestre, "tipoParticipacion", "escuelaPropia", '
+            '"permiteExtras", "disponibilidadDias", "updatedAt") '
+            "VALUES (:eid, :tri, 'AMBAS', true, true, 'L,M,X,J,V', NOW()) "
+            'ON CONFLICT ("empresaId", trimestre) DO UPDATE SET '
+            '    "escuelaPropia" = true, "permiteExtras" = true'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    await db_session.commit()
+
+    # Excel manda EP=NO, PE=NO → debe ganar.
+    excel = _build_v24_ct_excel([{
+        "empresa": f"{TEST_EMPRESA_PREFIX}V24_IMP_OVERRIDE",
+        "freq_ef": 1, "freq_it": 0,
+        "escuela_propia": False, "permite_extras": False,
+    }])
+    resp = await client.post(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/importar-excel",
+        files={
+            "file": (
+                "ct_v24.xlsx", excel,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"dry_run": "false"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = await db_session.execute(
+        text(
+            'SELECT "escuelaPropia", "permiteExtras" FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    rec = row.mappings().first()
+    assert rec["escuelaPropia"] is False, "Excel debió sobreescribir EP=true → false"
+    assert rec["permiteExtras"] is False, "Excel debió sobreescribir PE=true → false"
+
+
+@pytest.mark.asyncio
+async def test_importar_excel_freq_null_se_persiste_como_null(client, db_session):
+    """V24 B4.5: si una celda Freq EF / Freq IT viene vacía → NULL en BD
+    (D2 + D7: NULL significa 'no participa en ese tipo')."""
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_IMP_NULL")
+    await _set_ct_with_freq(db_session, eid, freq_ef=99, freq_it=99)  # ruido previo
+
+    excel = _build_v24_ct_excel([{
+        "empresa": f"{TEST_EMPRESA_PREFIX}V24_IMP_NULL",
+        "freq_ef": None, "freq_it": 3,  # EF vacío, IT=3
+        "escuela_propia": False, "permite_extras": False,
+    }])
+    resp = await client.post(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/importar-excel",
+        files={
+            "file": (
+                "ct_v24.xlsx", excel,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"dry_run": "false"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF", "frecuenciaIT" FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    rec = row.mappings().first()
+    assert rec["frecuenciaEF"] is None
+    assert rec["frecuenciaIT"] == 3
+
+
+@pytest.mark.asyncio
+async def test_importar_excel_rechaza_formato_viejo(client):
+    """V24 B4.5 (D2): el formato legacy/ideal anterior (columna 'Frecuencia'
+    única, sin EF/IT split, sin EP/PE) debe ser rechazado con 400 y mensaje
+    claro sobre las columnas requeridas."""
+    import openpyxl
+    from io import BytesIO
+
+    # Excel formato viejo "ideal": Empresa | Frecuencia | Tipo | Dias | ...
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Empresa", "Frecuencia", "Tipo", "Dias", "Turno", "Voluntarios", "Notas"])
+    ws.append(["ACME", 5, "AMBAS", "L,M,X,J,V", "M", 1, "legacy row"])
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    resp = await client.post(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/importar-excel",
+        files={
+            "file": (
+                "legacy.xlsx", buf.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"dry_run": "true"},
+    )
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"].lower()
+    assert "freq_ef" in detail or "frecuencia ef" in detail or "requeridas" in detail
+
+
+@pytest.mark.asyncio
+async def test_export_excel_includes_freq_ef_it_ep_pe_columns(client, db_session):
+    """V24 Cambio B (T8, decisión D9): GET /exportar-excel devuelve un xlsx
+    con la nueva fila de headers (10 cols), sin "Frecuencia" single, con
+    "Frecuencia EF", "Frecuencia IT", "Escuela Propia", "Permite Extras".
+    """
+    from io import BytesIO
+    import openpyxl
+
+    # Sembrar al menos 1 fila para que el export tenga data.
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}V24_EXPORT")
+    await _set_ct_with_freq(db_session, eid, freq_ef=4, freq_it=2)
+
+    resp = await client.get(f"/api/config-trimestral/{TEST_TRIMESTRE}/exportar-excel")
+    assert resp.status_code == 200, resp.text
+
+    wb = openpyxl.load_workbook(BytesIO(resp.content), data_only=True)
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+
+    assert headers == [
+        "Empresa", "Frecuencia EF", "Frecuencia IT", "Tipo", "Dias", "Turno",
+        "Voluntarios", "Escuela Propia", "Permite Extras", "Notas",
+    ]
+    assert "Frecuencia" not in headers, "la columna single 'Frecuencia' fue eliminada en D9"
+
+    # Verifica que la fila de la empresa de test trae los valores correctos.
+    found = False
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0] == f"{TEST_EMPRESA_PREFIX}V24_EXPORT":
+            assert row[1] == 4   # Frecuencia EF
+            assert row[2] == 2   # Frecuencia IT
+            assert row[7] == "NO"  # Escuela Propia (false → NO)
+            assert row[8] == "NO"  # Permite Extras (false → NO)
+            found = True
+            break
+    assert found, "la empresa de test no aparece en el xlsx"

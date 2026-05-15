@@ -118,6 +118,13 @@ HEADER_MAP = {
     "escuelapropia": "escuelaPropia",
     "escuela_propia": "escuelaPropia",
     "escuela": "escuelaPropia",
+    # permiteExtras (V24 Cambio B, decisión D8): simetría con escuelaPropia.
+    # El maestro Excel puede ahora setear PE per-trimestre via la columna
+    # correspondiente. Si no viene → no toca el flag en UPDATE; default false
+    # en INSERT (paralelo a escuelaPropia).
+    "permiteextras": "permiteExtras",
+    "permite_extras": "permiteExtras",
+    "pe": "permiteExtras",
     # disponibilidadDias (V18)
     "disponibilidaddias": "disponibilidadDias",
     "disponibilidad": "disponibilidadDias",
@@ -387,6 +394,12 @@ async def importar_empresas(
             _bool(escuela_propia_raw) if escuela_propia_raw is not None else None
         )
 
+        # V24 Cambio B (decisión D8): permiteExtras simétrico a escuelaPropia.
+        permite_extras_raw = _get("permiteExtras")
+        permite_extras_val = (
+            _bool(permite_extras_raw) if permite_extras_raw is not None else None
+        )
+
         disponibilidad_raw = _get("disponibilidadDias")
         disponibilidad_val = (
             _normalizar_dias(disponibilidad_raw) if disponibilidad_raw else None
@@ -417,6 +430,7 @@ async def importar_empresas(
                 "frecuenciaIT": freq_it,
                 # ConfigTrimestral fields (V18) — None means "not provided"
                 "escuelaPropia": escuela_propia_val,
+                "permiteExtras": permite_extras_val,  # V24 Cambio B (D8)
                 "disponibilidadDias": disponibilidad_val,
                 "voluntariosDisponibles": voluntarios_val,
             }
@@ -584,6 +598,11 @@ async def importar_empresas(
                 update_fragments.append('"escuelaPropia" = :escuela')
                 update_params["escuela"] = emp["escuelaPropia"]
 
+            # V24 Cambio B (D8): permiteExtras simétrico a escuelaPropia.
+            if emp.get("permiteExtras") is not None:
+                update_fragments.append('"permiteExtras" = :pe')
+                update_params["pe"] = emp["permiteExtras"]
+
             if emp.get("disponibilidadDias") is not None:
                 update_fragments.append('"disponibilidadDias" = :dias')
                 update_params["dias"] = emp["disponibilidadDias"]
@@ -605,8 +624,12 @@ async def importar_empresas(
             # Create new config
             # V18: bind escuelaPropia / disponibilidadDias / voluntariosDisponibles,
             # falling back to legacy defaults when the Excel did not provide them.
+            # V24 Cambio B (D8): permiteExtras paralelo (default false en INSERT).
             escuela_val = (
                 emp["escuelaPropia"] if emp.get("escuelaPropia") is not None else False
+            )
+            permite_val = (
+                emp["permiteExtras"] if emp.get("permiteExtras") is not None else False
             )
             dias_val = (
                 emp["disponibilidadDias"]
@@ -623,11 +646,13 @@ async def importar_empresas(
                 text("""
                     INSERT INTO "configTrimestral" (
                         "empresaId", trimestre, "tipoParticipacion",
-                        "escuelaPropia", "disponibilidadDias", "turnoPreferido",
+                        "escuelaPropia", "permiteExtras",
+                        "disponibilidadDias", "turnoPreferido",
                         "frecuenciaSolicitada", "frecuenciaEF", "frecuenciaIT",
                         "voluntariosDisponibles", "notas", "createdAt", "updatedAt"
                     ) VALUES (
-                        :eid, :tri, :tipo, :escuela, :dias, :turno,
+                        :eid, :tri, :tipo, :escuela, :pe,
+                        :dias, :turno,
                         :freq, :freq_ef, :freq_it, :vol, :notas, NOW(), NOW()
                     )
                 """),
@@ -636,6 +661,7 @@ async def importar_empresas(
                     "tri": trimestre,
                     "tipo": tipo_calc,
                     "escuela": escuela_val,
+                    "pe": permite_val,  # V24 Cambio B (D8)
                     "dias": dias_val,
                     "turno": emp["turnoPreferido"],
                     "freq": emp.get("frecuenciaSolicitada"),
