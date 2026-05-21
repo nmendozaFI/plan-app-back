@@ -1,9 +1,11 @@
-"""V22 (Cambio A): tests for the DOBLE CRUD endpoints.
+"""V22 (Cambio A) + V25 Cambio C (Capa 3): tests for the DOBLE CRUD endpoints.
 
-DOBLE is ad-hoc — the only gate is escuelaPropia=true in CT. Decisions 3 & 4 of
-Cambio A say there is NO collision check, NO programa coherence, NO duplicate
-check. PATCH allows changing semana/día/horario/empresa/taller. The bulk
-cleanup `DELETE /{trimestre}/extras-doble` wipes EXTRA+DOBLE but never touches
+DOBLE is ad-hoc. V25 Capa 3 migró el gate de elegibilidad de
+`CT.escuelaPropia=true` al flag estructural `empresa.puedeSerDoble=true`
+(ficha persistente). La regla de decisiones 3 & 4 sigue intacta: NO collision
+check, NO programa coherence, NO duplicate check. PATCH allows changing
+semana/día/horario/empresa/taller. The bulk cleanup
+`DELETE /{trimestre}/extras-doble` wipes EXTRA+DOBLE but never touches
 BASE/CONTINGENCIA.
 
 Module-scoped engine cascade-fail (deuda 6) means these tests should be run
@@ -57,6 +59,17 @@ async def _set_config_trimestral(
             "ep": escuela_propia,
             "pe": permite_extras,
         },
+    )
+    await db.commit()
+
+
+async def _set_puede_ser_doble(db, empresa_id: int, value: bool = True):
+    """V25 Cambio C (Capa 3): setea el flag estructural en la ficha de
+    empresa. Reemplaza el viejo patrón de "marcar CT.escuelaPropia=true para
+    habilitar Doble" — ahora el gate es por ficha, no por trimestre."""
+    await db.execute(
+        text('UPDATE empresa SET "puedeSerDoble" = :v WHERE id = :id'),
+        {"id": empresa_id, "v": value},
     )
     await db.commit()
 
@@ -140,7 +153,7 @@ async def test_crear_doble_ok_con_empresa_ep(client, db_session):
     """Happy path: empresa with escuelaPropia=true + valid taller → 200, DOBLE row."""
     taller = await _pick_one_taller(db_session)
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_OK")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
 
     body = {
         "empresa_id": eid,
@@ -194,7 +207,7 @@ async def test_crear_doble_rechaza_empresa_inactiva(client, db_session):
     eid = await _create_empresa(
         db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_INACTIVE", activa=False,
     )
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
 
     body = {
         "empresa_id": eid,
@@ -209,10 +222,15 @@ async def test_crear_doble_rechaza_empresa_inactiva(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_crear_doble_rechaza_empresa_no_ep(client, db_session):
+async def test_crear_doble_rechaza_empresa_no_puede_ser_doble(client, db_session):
+    """V25 Cambio C (Capa 3): el gate del POST /doble es `empresa.puedeSerDoble`.
+    Empresa sin ese flag → 422, sin importar el estado de CT."""
     taller = await _pick_one_taller(db_session)
-    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_NOEP")
-    await _set_config_trimestral(db_session, eid, escuela_propia=False)
+    eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_NODOBLE")
+    # NO se pinta puedeSerDoble en la ficha (default false).
+    # Una CT con escuelaPropia=true es deliberadamente irrelevante ahora —
+    # el gate vive en empresa, no en CT.
+    await _set_config_trimestral(db_session, eid, escuela_propia=True)
 
     body = {
         "empresa_id": eid,
@@ -223,13 +241,13 @@ async def test_crear_doble_rechaza_empresa_no_ep(client, db_session):
     }
     resp = await client.post(f"/api/planificacion/{TEST_TRIMESTRE}/doble", json=body)
     assert resp.status_code == 422
-    assert "escuela propia" in resp.json()["detail"].lower()
+    assert "puedeserdoble" in resp.json()["detail"].lower().replace(" ", "")
 
 
 @pytest.mark.asyncio
 async def test_crear_doble_rechaza_taller_inexistente(client, db_session):
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_NOTALLER")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
 
     body = {
         "empresa_id": eid,
@@ -253,7 +271,10 @@ async def test_crear_doble_no_valida_colision(client, db_session):
     taller = await _pick_one_taller(db_session)
     ep_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_COL_EP")
     other_id = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_COL_OTHER")
-    await _set_config_trimestral(db_session, ep_id, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, ep_id)
+    # other_id: no requiere puedeSerDoble (no participa en la creación DOBLE).
+    # Mantenemos una CT con escuela_propia=false por simetría con el test
+    # original — el solver no se entera (Capa 5).
     await _set_config_trimestral(db_session, other_id, escuela_propia=False)
 
     # Pre-existing BASE row for the OTHER empresa at the same slot.
@@ -280,7 +301,7 @@ async def test_crear_doble_no_valida_duplicado(client, db_session):
     """Decision 4: two identical DOBLE rows are allowed."""
     taller = await _pick_one_taller(db_session)
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_DUP")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
 
     body = {
         "empresa_id": eid,
@@ -305,8 +326,8 @@ async def test_listar_dobles_filtros(client, db_session):
     taller = await _pick_one_taller(db_session)
     a = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_LIST_A")
     b = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_LIST_B")
-    await _set_config_trimestral(db_session, a, escuela_propia=True)
-    await _set_config_trimestral(db_session, b, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, a)
+    await _set_puede_ser_doble(db_session, b)
 
     # 2 DOBLEs for A (sem 5 + sem 6) and 1 DOBLE for B (sem 5).
     for sem, emp in [(5, a), (6, a), (5, b)]:
@@ -353,8 +374,8 @@ async def test_editar_doble_libertad_total(client, db_session):
     t1, t2 = await _pick_two_talleres_any(db_session)
     a = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_EDIT_A")
     b = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_EDIT_B")
-    await _set_config_trimestral(db_session, a, escuela_propia=True)
-    await _set_config_trimestral(db_session, b, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, a)
+    await _set_puede_ser_doble(db_session, b)
 
     created = await client.post(
         f"/api/planificacion/{TEST_TRIMESTRE}/doble",
@@ -391,7 +412,7 @@ async def test_editar_doble_libertad_total(client, db_session):
 async def test_editar_doble_body_vacio_es_422(client, db_session):
     t = await _pick_one_taller(db_session)
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_EMPTY")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
     created = await client.post(
         f"/api/planificacion/{TEST_TRIMESTRE}/doble",
         json={
@@ -417,7 +438,7 @@ async def test_editar_doble_slot_no_es_doble(client, db_session):
     """A BASE row cannot be PATCHed via /doble — must be DOBLE."""
     t = await _pick_one_taller(db_session)
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_NOTDOBLE")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
     base_id = await _insert_slot(
         db_session,
         semana=1, dia="L", horario="10:00",
@@ -438,7 +459,7 @@ async def test_editar_doble_slot_no_es_doble(client, db_session):
 async def test_eliminar_doble_ok(client, db_session):
     t = await _pick_one_taller(db_session)
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_DEL")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
     created = await client.post(
         f"/api/planificacion/{TEST_TRIMESTRE}/doble",
         json={
@@ -464,7 +485,7 @@ async def test_eliminar_doble_no_borra_extra(client, db_session):
     """The DELETE /doble guard rejects EXTRA rows with 400."""
     t = await _pick_one_taller(db_session)
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_GUARD")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
     extra_id = await _insert_slot(
         db_session,
         semana=11, dia="X", horario="10:00",
@@ -497,7 +518,7 @@ async def test_cleanup_extras_doble_borra_extra_y_doble_pero_no_base(client, db_
     """confirmar=true → wipes only EXTRA and DOBLE; BASE survives."""
     t = await _pick_one_taller(db_session)
     eid = await _create_empresa(db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_CLEAN")
-    await _set_config_trimestral(db_session, eid, escuela_propia=True)
+    await _set_puede_ser_doble(db_session, eid)
 
     base_id = await _insert_slot(
         db_session,

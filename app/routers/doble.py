@@ -1,7 +1,10 @@
 """V22 (Cambio A): CRUD for DOBLE slots (ad-hoc semana intensiva).
+V25 Cambio C (Capa 3): gate de elegibilidad migrado de CT.escuelaPropia al
+flag estructural empresa.puedeSerDoble. DOBLE y EP son ahora conceptos
+ortogonales — una empresa puede serDoble sin serEP y viceversa.
 
-DOBLE = semana intensiva of an escuela-propia empresa. Conceptually separate
-from EXTRA — the planner adds talleres on top of the regular schedule for one
+DOBLE = 2+ talleres misma empresa misma semana. Conceptually separate from
+EXTRA — the planner adds talleres on top of the regular schedule for one
 specific week, without the constraints that apply to EXTRA:
 
   - NO collision check (decision 4): a DOBLE can land on a slot already used
@@ -9,7 +12,7 @@ specific week, without the constraints that apply to EXTRA:
   - NO programa coherence check: the taller's programa is used as-is.
   - NO duplicate check: the planner may legitimately need multiple DOBLE rows
     at the same (semana, día, horario) for the same empresa.
-  - NO permiteExtras gate: only escuelaPropia=true matters.
+  - NO permiteExtras gate: only empresa.puedeSerDoble=true matters.
 
 Endpoints:
   POST   /{trimestre}/doble           → create one DOBLE
@@ -39,7 +42,7 @@ from app.schemas.calendario import (
 )
 from app.services.empresas.checks import (
     check_empresa_activa,
-    check_empresa_es_ep,
+    check_empresa_puede_ser_doble,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,13 +130,15 @@ async def crear_doble(
 
     Validation order (first failure wins):
       1. Empresa exists (404) and is activa (422).
-      2. Empresa has escuelaPropia=true in this trimestre (422).
+      2. Empresa has puedeSerDoble=true en su ficha (422).
+         V25 Cambio C (Capa 3): gate migrado de CT.escuelaPropia al flag
+         estructural empresa.puedeSerDoble. Doble dejó de mezclarse con EP.
       3. Taller exists (404).
 
     NO collision check, NO programa check, NO duplicate check (decision 4).
     """
     empresa_nombre = await check_empresa_activa(db, body.empresa_id)
-    await check_empresa_es_ep(db, body.empresa_id, empresa_nombre, trimestre)
+    await check_empresa_puede_ser_doble(db, body.empresa_id, empresa_nombre)
     taller = await _fetch_taller_or_404(db, body.taller_id)
 
     notas_val = body.notas if (body.notas is not None and body.notas.strip()) else None
@@ -256,7 +261,8 @@ async def editar_doble(
     Editable: empresa_id, taller_id, semana, día, horario, notas.
     Body must have at least one field (422 otherwise).
     Slot must exist (404) and be DOBLE (400).
-    If empresa_id provided: must exist+activa and be EP in slot's trimestre.
+    If empresa_id provided: must exist+activa and have puedeSerDoble=true.
+        (V25 Cambio C, Capa 3: gate migrado de CT.escuelaPropia a la ficha.)
     If taller_id provided: must exist.
 
     Never touches empresaIdOriginal, tipoAsignacion, estado, confirmado,
@@ -292,12 +298,14 @@ async def editar_doble(
             ),
         )
 
-    trimestre = rec["trimestre"]
+    trimestre = rec["trimestre"]  # solo para logging; el gate ya no depende de él.
 
     # Validate new empresa if provided.
+    # V25 Cambio C (Capa 3): gate ahora por empresa.puedeSerDoble (ficha),
+    # no por CT.escuelaPropia del trimestre.
     if "empresa_id" in fields and fields["empresa_id"] is not None:
         nueva_nombre = await check_empresa_activa(db, fields["empresa_id"])
-        await check_empresa_es_ep(db, fields["empresa_id"], nueva_nombre, trimestre)
+        await check_empresa_puede_ser_doble(db, fields["empresa_id"], nueva_nombre)
 
     # Validate new taller if provided.
     if "taller_id" in fields and fields["taller_id"] is not None:

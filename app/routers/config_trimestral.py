@@ -309,44 +309,114 @@ async def resumen_configs(
     }
 
 
-@router.get("/{trimestre}/empresas-ep", response_model=ListaEmpresasEPResponse)
-async def listar_empresas_ep(
-    trimestre: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def _listar_empresas_con_flag(
+    db: AsyncSession,
+    flag_spec: dict,
+) -> list[EmpresaEPOut]:
+    """V25 Cambio C (Capa 3): helper genérico para los 3 endpoints
+    `/empresas-{ep,doble,permite-extras}`. Evita la triple copia-pega que
+    detectó AUDITORIA_V25.md §7.
+
+    `flag_spec` admite dos formas:
+      - `{"source": "empresa", "field": "puedeSerEP"}`
+            → SELECT directo sobre empresa, filtro por el flag estructural.
+        El trimestre que reciben los endpoints es decorativo (path retenido
+        por compat con frontend) y NO interviene en la query.
+      - `{"source": "ct", "field": "permiteExtras", "trimestre": "2026-Q2"}`
+            → JOIN con configTrimestral, filtro por el flag por-trimestre.
+        Para flags que viven en CT (hoy: solo permiteExtras).
+
+    Devuelve siempre `e.activa = true` y orden alfabético por nombre.
+    Trimestre inexistente (caso CT) → lista vacía, no 404.
     """
-    V21 / F3a: lista empresas con escuelaPropia=true en el trimestre dado.
-    Filtra también por empresa.activa=true. Orden alfabético por nombre.
-    Usado por el modal "Añadir EXTRA" de Operación para poblar el Select.
-    Trimestre inexistente → 200 con lista vacía (no 404).
-    """
-    result = await db.execute(
-        text("""
-            SELECT
-                e.id,
-                e.nombre,
-                e.tipo,
-                e.activa
-            FROM "configTrimestral" ct
-            JOIN empresa e ON e.id = ct."empresaId"
-            WHERE ct.trimestre = :tri
-              AND ct."escuelaPropia" = true
-              AND e.activa = true
-            ORDER BY e.nombre ASC
-        """),
-        {"tri": trimestre},
-    )
-    rows = result.mappings().all()
-    empresas = [
+    source = flag_spec.get("source")
+    field = flag_spec["field"]
+
+    if source == "empresa":
+        # Flag estructural en empresa. No tocar CT.
+        sql = f"""
+            SELECT e.id, e.nombre, e.tipo, e.activa
+              FROM empresa e
+             WHERE e."{field}" = true
+               AND e.activa = true
+             ORDER BY e.nombre ASC
+        """
+        params: dict = {}
+    elif source == "ct":
+        # Flag por-trimestre en configTrimestral.
+        sql = f"""
+            SELECT e.id, e.nombre, e.tipo, e.activa
+              FROM "configTrimestral" ct
+              JOIN empresa e ON e.id = ct."empresaId"
+             WHERE ct.trimestre = :tri
+               AND ct."{field}" = true
+               AND e.activa = true
+             ORDER BY e.nombre ASC
+        """
+        params = {"tri": flag_spec["trimestre"]}
+    else:
+        raise ValueError(f"flag_spec.source inválido: {source!r}")
+
+    result = await db.execute(text(sql), params)
+    return [
         EmpresaEPOut(
             id=r["id"],
             nombre=r["nombre"],
             tipo=r["tipo"],
             activa=r["activa"],
         )
-        for r in rows
+        for r in result.mappings().all()
     ]
 
+
+@router.get("/{trimestre}/empresas-ep", response_model=ListaEmpresasEPResponse)
+async def listar_empresas_ep(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """V21 / F3a: lista empresas elegibles para asignación EP.
+
+    V25 Cambio C (Capa 3): el gate de elegibilidad migró de CT.escuelaPropia
+    al flag estructural `empresa.puedeSerEP` (ficha persistente). El path
+    mantiene `{trimestre}` por compat con frontend, pero el filtro ya NO
+    depende del trimestre. CT.escuelaPropia sigue existiendo y se usa
+    SOLO dentro del solver (Capa 5) para decidir concentración total en
+    una semana — el gate de operación pasa por puedeSerEP.
+
+    Filtra también por `empresa.activa=true`. Orden alfabético por nombre.
+    Trimestre inexistente → 200 con lista vacía (no 404).
+    """
+    empresas = await _listar_empresas_con_flag(
+        db, {"source": "empresa", "field": "puedeSerEP"}
+    )
+    return ListaEmpresasEPResponse(
+        trimestre=trimestre,
+        total=len(empresas),
+        empresas=empresas,
+    )
+
+
+@router.get("/{trimestre}/empresas-doble", response_model=ListaEmpresasEPResponse)
+async def listar_empresas_doble(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """V25 Cambio C (Capa 3): lista empresas elegibles para asignación DOBLE.
+
+    Análogo a `/empresas-ep`: filtra por el flag estructural
+    `empresa.puedeSerDoble=true`. Decisión §11.3 V25: Doble NO tiene
+    contraparte en CT — el solver no genera DOBLE automáticamente; siempre
+    es manual desde `/planificacion/doble`.
+
+    Path mantiene `{trimestre}` por consistencia con `/empresas-ep` y
+    `/empresas-permite-extras`; queda decorativo (el filtro no depende del
+    trimestre). Reusa `ListaEmpresasEPResponse` porque la forma es idéntica.
+
+    Filtra también por `empresa.activa=true`. Orden alfabético por nombre.
+    """
+    empresas = await _listar_empresas_con_flag(
+        db, {"source": "empresa", "field": "puedeSerDoble"}
+    )
     return ListaEmpresasEPResponse(
         trimestre=trimestre,
         total=len(empresas),
@@ -368,36 +438,15 @@ async def listar_empresas_permite_extras(
     Usado por el modal "Añadir EXTRA" de Operación (Fase 6) para poblar el Select
     de empresas elegibles. Trimestre inexistente → 200 con lista vacía.
 
-    Análogo a /empresas-ep, pero el gate es permiteExtras en vez de escuelaPropia.
-    Reusa el mismo response model porque la forma de la fila es idéntica.
+    A diferencia de `/empresas-ep` y `/empresas-doble` (V25 Capa 3), aquí el
+    gate vive en CT — `permiteExtras` es decisión por trimestre, no flag
+    estructural. Reusa `ListaEmpresasEPResponse` (forma idéntica) y pasa por
+    el helper `_listar_empresas_con_flag` con `source="ct"`.
     """
-    result = await db.execute(
-        text("""
-            SELECT
-                e.id,
-                e.nombre,
-                e.tipo,
-                e.activa
-            FROM "configTrimestral" ct
-            JOIN empresa e ON e.id = ct."empresaId"
-            WHERE ct.trimestre = :tri
-              AND ct."permiteExtras" = true
-              AND e.activa = true
-            ORDER BY e.nombre ASC
-        """),
-        {"tri": trimestre},
+    empresas = await _listar_empresas_con_flag(
+        db,
+        {"source": "ct", "field": "permiteExtras", "trimestre": trimestre},
     )
-    rows = result.mappings().all()
-    empresas = [
-        EmpresaEPOut(
-            id=r["id"],
-            nombre=r["nombre"],
-            tipo=r["tipo"],
-            activa=r["activa"],
-        )
-        for r in rows
-    ]
-
     return ListaEmpresasEPResponse(
         trimestre=trimestre,
         total=len(empresas),

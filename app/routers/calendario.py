@@ -60,15 +60,28 @@ async def generar_calendario(
     warnings: list[str] = []
 
     # ── 1. Cargar frecuencias confirmadas (output Fase 1) ────
+    # V25 Cambio C (Capa 5): se añaden 3 campos al payload del solver:
+    #   - `empresa.esContratante`: usado por la regla C7 (priorización catálogo
+    #     contratante — implementación en Capa 7).
+    #   - `empresa.puedeSerEP`: capacidad estructural (informativa hoy).
+    #   - `CT.escuelaPropia` (vía LEFT JOIN configTrimestral, COALESCE a false):
+    #     decisión por trimestre que el solver lee para H6 (concentración total)
+    #     y S5 (excluir variedad). Reemplaza la heurística rota `total>=6` que
+    #     había en solver.py 107/516/659.
     freq_result = await db.execute(
         text("""
             SELECT f."empresaId", e.nombre,
                    f."talleresEF", f."talleresIT", f."totalAsignado",
                    f."semaforoCalculado", f."scoreCalculado",
                    f."esNueva",
-                   e."esComodin", e."turnoPreferido"
+                   e."esComodin", e."turnoPreferido",
+                   e."esContratante", e."puedeSerEP",
+                   COALESCE(ct."escuelaPropia", false) AS "escuelaPropia"
             FROM frecuencia f
             JOIN empresa e ON e.id = f."empresaId"
+            LEFT JOIN "configTrimestral" ct
+              ON ct."empresaId" = f."empresaId"
+             AND ct.trimestre   = f.trimestre
             WHERE f.trimestre = :trimestre
         """),
         {"trimestre": trimestre},
@@ -107,6 +120,9 @@ async def generar_calendario(
         iso_week = iso_week_start + semana_rel - 1
         talleres_semana = await cargar_talleres_semana(db, anio, iso_week)
         # Convert to solver format (id, diaSemana, etc.)
+        # V25 Cambio C (Capa 5): propaga `esContratante` desde cargar_talleres_semana
+        # para que el solver lo lea en la regla C7. None defensivo si la función
+        # upstream no lo trae (no debería tras la edición V25 a calendario_anual.py).
         talleres_por_semana[semana_rel] = [
             {
                 "id": t["taller_id"],
@@ -115,6 +131,7 @@ async def generar_calendario(
                 "diaSemana": t["dia_semana"],
                 "horario": t["horario"],
                 "turno": t["turno"],
+                "esContratante": t.get("es_contratante", False),
                 "es_extra": t.get("es_extra", False),
                 "extra_id": t.get("extra_id"),
             }
@@ -125,9 +142,10 @@ async def generar_calendario(
 
     # For backward compatibility, create a "union" list of all talleres (for summary)
     # Get base talleres info for the union
+    # V25 Cambio C (Capa 5): incluye esContratante en el SELECT base.
     base_talleres_result = await db.execute(
         text("""
-            SELECT id, nombre, programa, "diaSemana", horario, turno
+            SELECT id, nombre, programa, "diaSemana", horario, turno, "esContratante"
             FROM taller WHERE activo = true ORDER BY id
         """)
     )
@@ -223,6 +241,30 @@ async def generar_calendario(
     except Exception:
         pass  # table may not exist yet
 
+    # V25 Cambio C (Capa 5): mapas de flags estructurales pasados al solver.
+    #   - escuela_propia_map: empresa_id -> CT.escuelaPropia. USADO YA en H6
+    #     (concentración) y S5 (variedad apagada) — reemplaza la heurística
+    #     rota `total>=6`. `COALESCE(..., false)` en la query original
+    #     garantiza bool nunca null.
+    #   - empresa_contratante_map: empresa_id -> empresa.esContratante.
+    #     RESERVADO para Capa 7 (priorización catálogo contratante). Se pasa
+    #     al solver para no romper la firma cuando Capa 7 lo active; en Capa
+    #     5 no se consume.
+    #   - taller_contratante_map: taller_id -> taller.esContratante.
+    #     RESERVADO para Capa 7 también. Mismo motivo.
+    escuela_propia_map: dict[int, bool] = {
+        f["empresaId"]: bool(f.get("escuelaPropia", False))
+        for f in frecuencias
+    }
+    empresa_contratante_map: dict[int, bool] = {
+        f["empresaId"]: bool(f.get("esContratante", False))
+        for f in frecuencias
+    }
+    taller_contratante_map: dict[int, bool] = {
+        t["id"]: bool(t.get("esContratante", False))
+        for t in talleres
+    }
+
     # ── 7. Ejecutar solver (en thread separado para no bloquear event loop) ───
     resultado = await asyncio.to_thread(
         _ejecutar_solver,
@@ -234,6 +276,9 @@ async def generar_calendario(
         semanas_excluidas=semanas_excluidas,
         dias_excluidos=dias_excluidos,
         params=params,
+        escuela_propia_map=escuela_propia_map,
+        empresa_contratante_map=empresa_contratante_map,
+        taller_contratante_map=taller_contratante_map,
     )
 
     if resultado["status"] in ("INFEASIBLE", "TIMEOUT"):

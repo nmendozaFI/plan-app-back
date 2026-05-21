@@ -80,10 +80,15 @@ def _generate_hints(
     taller_map: dict,
     taller_ids_ef: list[int],
     taller_ids_it: list[int],
+    escuela_propia_map: dict[int, bool],
 ) -> dict:
     """
     Generates a greedy initial solution to warm-start the solver.
     Returns dict of (empresa, semana, taller) -> 1 for hinted assignments.
+
+    V25 Cambio C (Capa 5): el modo "varias por semana" lo decide
+    `escuela_propia_map[e]` (lectura de `CT.escuelaPropia`), no la heurística
+    rota `total>=6` que confundía freq alta con EP (bug INDRA).
     """
     hints = {}
 
@@ -104,8 +109,8 @@ def _generate_hints(
         it_needed = int(empresas[e].get("talleresIT", 0) or 0)
         total_needed = int(empresas[e].get("totalAsignado", 0) or 0)
 
-        # Empresas with >= 6 talleres (escuela propia) can have multiple per week
-        max_per_week = 20 if total_needed >= 6 else 1
+        # V25 Cambio C (Capa 5): EP por CT, no por umbral de frecuencia.
+        max_per_week = 20 if escuela_propia_map.get(e, False) else 1
 
         # Collect available slots for this company
         available_ef = []
@@ -165,6 +170,9 @@ def _ejecutar_solver(
     semanas_excluidas: set[int],
     dias_excluidos: set[tuple[int, str]],
     params: CalendarioInput,
+    escuela_propia_map: dict[int, bool] | None = None,
+    empresa_contratante_map: dict[int, bool] | None = None,
+    taller_contratante_map: dict[int, bool] | None = None,
 ) -> dict:
     """
     Asigna empresas a slots fijos semanales.
@@ -172,7 +180,26 @@ def _ejecutar_solver(
 
     Variables: assign[empresa_id, semana, taller_id] ∈ {0,1}
     Solo se crean variables para combinaciones POSIBLES.
+
+    V25 Cambio C (Capa 5): `escuela_propia_map[empresa_id] -> bool` reemplaza
+    la heurística rota `totalAsignado>=6` en H6 (concentración) y S5 (variedad
+    apagada). El mapa lo construye el caller leyendo CT.escuelaPropia con
+    LEFT JOIN. Default None → dict vacío → toda empresa es no-EP (compat
+    defensiva si alguien invoca el solver sin pasar el mapa).
+
+    `empresa_contratante_map` y `taller_contratante_map` se reciben en Capa 5
+    pero NO se consumen aquí — se reservan para Capa 7 (priorización del
+    catálogo contratante, regla C7). Pasarlos ya evita romper la firma cuando
+    Capa 7 los active.
     """
+    if escuela_propia_map is None:
+        escuela_propia_map = {}
+    # V25 Capa 5: mapas reservados para Capa 7. No se usan en este archivo aún.
+    # Defaults vacíos por simetría con escuela_propia_map.
+    if empresa_contratante_map is None:
+        empresa_contratante_map = {}
+    if taller_contratante_map is None:
+        taller_contratante_map = {}
     from ortools.sat.python import cp_model
     import time
     import math
@@ -508,19 +535,76 @@ def _ejecutar_solver(
     # H4, H5, H7, H8 are handled implicitly by pre-filtering (no variables created)
     print(f"H4, H5, H7, H8: handled by pre-filtering ({debug_stats['vars_filtered_out']:,} vars eliminated)")
 
-    # H6. Max 1 taller por empresa por semana (planificación base)
-    # Excepción: empresas con escuela propia pueden tener hasta 20 (toda la semana)
+    # H6. Max 1 taller por empresa por semana (planificación base).
+    # V25 Cambio C (Capa 5): la excepción "varias por semana" la decide
+    # `CT.escuelaPropia` (vía escuela_propia_map), no la heurística rota
+    # `totalAsignado>=6`. Esto es el fix del bug INDRA (V25 sec. 7.5 Caso 1):
+    # una empresa freq=10 sin EP ya NO puede meter varias por semana — el
+    # solver fuerza max_per_week=1 y respeta diversidad.
     for e in empresa_ids:
-        max_per_week = 1  # Default: regla inviolable
-        total_empresa = int(empresas[e].get("totalAsignado", 0) or 0)
-        if total_empresa >= 6:
-            max_per_week = 20  # Sin límite práctico (escuela propia)
+        max_per_week = 20 if escuela_propia_map.get(e, False) else 1
         for s in SEMANAS:
             week_vars = [assign[(e, s, t_id)] for t_id in taller_ids if (e, s, t_id) in possible]
             if week_vars:
                 model.add(sum(week_vars) <= max_per_week)
                 debug_stats["H6_constraints"] += 1
     print(f"H6: {debug_stats['H6_constraints']} max-per-week constraints")
+
+    # H6b. Concentración EP (V25 Cambio C, decisión C5).
+    # Para empresas con `CT.escuelaPropia=true`: TODAS las asignaciones deben
+    # caer en una sola semana ("escuela propia" = semana intensiva).
+    #
+    # Sin este constraint, H6 solo PERMITE hasta 20/semana, pero las penalties
+    # S1 (equilibrio mensual) y S2 (no consecutivas) empujan a dispersar. El
+    # warm-start de _generate_hints ya concentra, pero el solver lo descarta
+    # al minimizar. Resultado documentado en AUDITORIA_V25.md §5 Caso 1:
+    # 'el solver no tiene siquiera variable de "esta empresa es EP"'.
+    #
+    # Implementación: una bool var `ep_week_used[e][s]` por semana. Hard
+    # constraint: `sum_s ep_week_used[e][s] == 1`. Vinculación con `assign`:
+    # si la semana NO se usa, todas las assign[e,s,t] son 0; si SÍ se usa,
+    # puede llevar hasta `total_e` (que H2/H3 obligarán a cumplir exacto).
+    debug_stats["H6b_EP_constraints"] = 0
+    debug_stats["H6b_EP_empresas"] = 0
+    for e in empresa_ids:
+        if not escuela_propia_map.get(e, False):
+            continue
+        total_e = int(empresas[e].get("totalAsignado", 0) or 0)
+        if total_e == 0:
+            continue
+        debug_stats["H6b_EP_empresas"] += 1
+
+        ep_week_used: dict[int, "cp_model.IntVar"] = {}
+        for s in SEMANAS:
+            week_vars = [
+                assign[(e, s, t_id)]
+                for t_id in taller_ids
+                if (e, s, t_id) in possible
+            ]
+            wu = model.new_bool_var(f"ep_wu_{e}_{s}")
+            ep_week_used[s] = wu
+            if not week_vars:
+                # Sin slots posibles esta semana → forzar wu=0 explícitamente.
+                model.add(wu == 0)
+                continue
+            # Si wu=0 → suma=0 (no asignar nada). Si wu=1 → suma ≤ total_e.
+            model.add(sum(week_vars) <= total_e * wu)
+            # Si CUALQUIER assign[e,s,t]=1 → wu=1.
+            for v in week_vars:
+                model.add(wu >= v)
+            debug_stats["H6b_EP_constraints"] += 1
+
+        # Exactamente UNA semana usada para esta empresa EP.
+        model.add(sum(ep_week_used.values()) == 1)
+    print(
+        f"H6b: {debug_stats['H6b_EP_constraints']} concentración EP constraints "
+        f"({debug_stats['H6b_EP_empresas']} empresas EP)"
+    )
+    if debug_stats["H6b_EP_empresas"] > 0:
+        warnings.append(
+            f"H6b Concentración EP: {debug_stats['H6b_EP_empresas']} empresa(s) "
+            f"con CT.escuelaPropia=true → todos los talleres en una sola semana"
+        )
 
     # Log empresas nuevas warning (even though H7 is handled by pre-filter)
     empresas_nuevas = [e for e in empresa_ids if empresas[e].get("esNueva", False)]
@@ -563,11 +647,17 @@ def _ejecutar_solver(
 
     # S2. Penalizar semanas consecutivas para misma empresa
     # OPTIMIZED: Linear formulation, only for companies with >= 2 talleres
+    # V25 Cambio C (Capa 5): excluir EP — concentran por diseño (H6b). Sin
+    # esta exclusión la bound `[0, 2]` de `consec_penalty` rompe el modelo
+    # cuando una EP concentra >3 talleres (suma de dos semanas consecutivas
+    # puede superar la bound, → INFEASIBLE). Análogo al patrón de S5.
     s2_empresas = 0
     for e in empresa_ids:
         total = int(empresas[e].get("totalAsignado", 0) or 0)
         if total < 2:  # Can't have consecutives with 0-1 talleres
             continue
+        if escuela_propia_map.get(e, False):
+            continue  # EP concentra — S2 no aplica
         s2_empresas += 1
         for i in range(len(SEMANAS) - 1):
             s1 = SEMANAS[i]
@@ -649,14 +739,19 @@ def _ejecutar_solver(
 
     # S5. Diversidad de talleres — penalizar repetición del mismo taller
     # OPTIMIZED: Only check REACHABLE talleres for each company
+    # V25 Cambio C (Capa 5): la exclusión "repiten por diseño" es para
+    # escuelas propias (CT.escuelaPropia=true), no para "freq alta".
+    # Antes: heurística `total>=6` apagaba diversidad de cualquier empresa
+    # con frecuencia alta aunque no fuera EP — bug que dejaba caer la
+    # diversidad de INDRA freq=10 no-EP. Ahora la regla mira el flag real.
     empresas_diversidad = 0
     for e in empresa_ids:
         total = int(empresas[e].get("totalAsignado", 0) or 0)
         # Skip empresas with < 3 talleres (1-2 talleres can't meaningfully repeat anyway)
         if total < 3:
             continue
-        # Excluir escuelas propias / alta frecuencia (>=6 talleres) — repiten por diseño
-        if total >= 6:
+        # Excluir solo escuelas propias — concentran y repiten por diseño.
+        if escuela_propia_map.get(e, False):
             continue
 
         empresas_diversidad += 1
@@ -693,9 +788,9 @@ def _ejecutar_solver(
                 penalties.append(repeat * params.peso_diversidad_talleres)
                 debug_stats["S5_penalties"] += 1
 
-    print(f"S5: {debug_stats['S5_penalties']} diversidad penalties ({empresas_diversidad} empresas 3-5 talleres) [OPTIMIZED]")
+    print(f"S5: {debug_stats['S5_penalties']} diversidad penalties ({empresas_diversidad} empresas con freq>=3 no-EP) [OPTIMIZED]")
     if empresas_diversidad > 0:
-        warnings.append(f"S5 Diversidad talleres: {empresas_diversidad} empresas (excluye escuelas propias >=6 talleres)")
+        warnings.append(f"S5 Diversidad talleres: {empresas_diversidad} empresas (excluye escuelas propias por CT.escuelaPropia=true)")
 
     # ─── V16 ─ SOFT franja_horaria / franja_por_dia penalty ──
     # Mirrors S3 (turno preferido) magnitude — `peso_turno_preferido` —
@@ -753,6 +848,7 @@ def _ejecutar_solver(
         taller_map=taller_map,
         taller_ids_ef=taller_ids_ef,
         taller_ids_it=taller_ids_it,
+        escuela_propia_map=escuela_propia_map,
     )
     debug_stats["hints_generated"] = len(hints)
 

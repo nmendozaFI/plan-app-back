@@ -29,30 +29,56 @@ async def check_empresa_activa(db: AsyncSession, empresa_id: int) -> str:
     return rec["nombre"]
 
 
-async def check_empresa_es_ep(
-    db: AsyncSession, empresa_id: int, empresa_nombre: str, trimestre: str
+async def check_empresa_puede_ser_ep(
+    db: AsyncSession, empresa_id: int, empresa_nombre: str
 ) -> None:
-    """Raise 422 if empresa is not escuelaPropia=true in this trimestre.
+    """Raise 422 if empresa is not flagged as puedeSerEP=true in its ficha.
 
-    EP (Escuela Propia) is the gate for DOBLE creation (semana intensiva,
-    decision 3 of Cambio A). Also used by PATCH /extra when changing the empresa
-    of an existing EXTRA — that endpoint keeps EP semantics (plan §4: "Sin
-    cambios en PATCH /extra"), even though POST /extra now uses permiteExtras.
+    V25 Cambio C (Capa 3): gate de elegibilidad EP migrado de CT.escuelaPropia
+    al flag estructural empresa.puedeSerEP. La elegibilidad es ahora persistente
+    por empresa, no por trimestre. CT.escuelaPropia sigue existiendo pero solo
+    se usa dentro del solver (Capa 5) para decidir concentración total en una
+    semana — el gate de operación pasa por puedeSerEP.
+
+    El parámetro `trimestre` que aceptaba la versión vieja (`check_empresa_es_ep`)
+    se eliminó porque ya no participa en el filtro.
     """
     row = await db.execute(
-        text(
-            'SELECT "escuelaPropia" FROM "configTrimestral" '
-            'WHERE "empresaId" = :eid AND trimestre = :tri'
-        ),
-        {"eid": empresa_id, "tri": trimestre},
+        text('SELECT "puedeSerEP" FROM empresa WHERE id = :eid'),
+        {"eid": empresa_id},
     )
     rec = row.mappings().first()
-    if rec is None or not rec["escuelaPropia"]:
+    if rec is None or not rec["puedeSerEP"]:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"La empresa {empresa_nombre} no tiene escuela propia activada "
-                f"en {trimestre}."
+                f"La empresa {empresa_nombre} no tiene puedeSerEP activado "
+                f"según ficha de empresa."
+            ),
+        )
+
+
+async def check_empresa_puede_ser_doble(
+    db: AsyncSession, empresa_id: int, empresa_nombre: str
+) -> None:
+    """Raise 422 if empresa is not flagged as puedeSerDoble=true in its ficha.
+
+    V25 Cambio C (Capa 3): gate de elegibilidad DOBLE.
+    Decisión §11.3: Doble se gatea por flag estructural en empresa, sin
+    contraparte en CT. El solver NO genera DOBLE automáticamente; siempre es
+    manual desde /planificacion/doble (POST/PATCH gating aquí).
+    """
+    row = await db.execute(
+        text('SELECT "puedeSerDoble" FROM empresa WHERE id = :eid'),
+        {"eid": empresa_id},
+    )
+    rec = row.mappings().first()
+    if rec is None or not rec["puedeSerDoble"]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"La empresa {empresa_nombre} no tiene puedeSerDoble activado "
+                f"según ficha de empresa."
             ),
         )
 

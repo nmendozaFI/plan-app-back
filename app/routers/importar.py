@@ -125,6 +125,19 @@ HEADER_MAP = {
     "permiteextras": "permiteExtras",
     "permite_extras": "permiteExtras",
     "pe": "permiteExtras",
+    # V25 Cambio C: 3 flags estructurales en empresa (migration 0006).
+    # Si la columna falta en el Excel → default false (silent, sin warning).
+    # Si viene con valor explícito → la fuente de verdad es el Excel
+    # (sobreescribe lo que haya en BD, incluido el backfill de puedeSerEP).
+    "escontratante": "esContratante",
+    "es_contratante": "esContratante",
+    "contratante": "esContratante",
+    "puedeserep": "puedeSerEP",
+    "puede_ser_ep": "puedeSerEP",
+    "pep": "puedeSerEP",
+    "puedeserdoble": "puedeSerDoble",
+    "puede_ser_doble": "puedeSerDoble",
+    "pdoble": "puedeSerDoble",
     # disponibilidadDias (V18)
     "disponibilidaddias": "disponibilidadDias",
     "disponibilidad": "disponibilidadDias",
@@ -409,6 +422,21 @@ async def importar_empresas(
 
         # NOTE: scoreV3, semaforo, fiabilidadReciente are IGNORED from Excel
         # These fields are now auto-calculated from historical data
+
+        # V25 Cambio C: 3 flags estructurales empresa con semántica tripartita,
+        # igual al patrón histórico de escuelaPropia pre-V24 (V25 Capa 2 fix).
+        #   - Columna ausente del Excel → None → UPDATE no toca el flag en BD.
+        #   - Columna presente, celda vacía → False explícito.
+        #   - Columna presente, celda con valor → bool parseado.
+        # Detección "columna ausente" via `col_map`: si el header canónico no
+        # apareció en la primera fila, el HEADER_MAP no lo registró aquí.
+        # Sin esta política, correr el maestro V24 (sin las 3 columnas nuevas)
+        # destruiría el backfill de puedeSerEP aplicado por la migration 0006.
+        def _flag_v25(field: str) -> bool | None:
+            if field not in col_map:
+                return None
+            return _bool(_get(field))
+
         empresas_data.append(
             {
                 "nombre": nombre,
@@ -422,6 +450,10 @@ async def importar_empresas(
                 "turnoPreferido": _str(_get("turnoPreferido")),
                 "activa": _bool(_get("activa", "SI")),
                 "esNueva": _bool(_get("esNueva", "NO")),
+                # V25 Cambio C — None = no tocar BD (ver _flag_v25 arriba).
+                "esContratante": _flag_v25("esContratante"),
+                "puedeSerEP": _flag_v25("puedeSerEP"),
+                "puedeSerDoble": _flag_v25("puedeSerDoble"),
                 "notas": _str(_get("notas")),
                 "ciudades": ciudades,
                 # Frequency fields
@@ -480,19 +512,41 @@ async def importar_empresas(
         if existing:
             eid, old_name = existing
             # NOTE: scoreV3, semaforo, fiabilidadReciente NOT updated — auto-calculated
+            # V25 Cambio C: esContratante / puedeSerEP / puedeSerDoble usan
+            # semántica tripartita (ver `_flag_v25` arriba). Si el flag llega
+            # como None significa "columna ausente del Excel" y NO se incluye
+            # en el SET, preservando el valor en BD (entre otros, el backfill
+            # de puedeSerEP aplicado por la migration 0006). False explícito
+            # sí se aplica.
+            update_sets = [
+                "nombre = :nombre",
+                "tipo = :tipo",
+                '"esComodin" = :esComodin',
+                '"aceptaExtras" = :aceptaExtras',
+                '"maxExtrasTrimestre" = :maxExtrasTrimestre',
+                '"prioridadReduccion" = :prioridadReduccion',
+                '"tieneBolsa" = :tieneBolsa',
+                '"turnoPreferido" = :turnoPreferido',
+                "activa = :activa",
+                '"esNueva" = :esNueva',
+                "notas = :notas",
+                '"updatedAt" = NOW()',
+            ]
+            update_params = {**emp, "id": eid}
+
+            for flag in ("esContratante", "puedeSerEP", "puedeSerDoble"):
+                if emp[flag] is None:
+                    # Columna ausente del Excel — no tocar BD. Drop del dict
+                    # para que SQLAlchemy no se queje del bind sobrante.
+                    update_params.pop(flag, None)
+                else:
+                    update_sets.append(f'"{flag}" = :{flag}')
+
             await db.execute(
-                text("""
-                    UPDATE empresa SET
-                        nombre = :nombre, tipo = :tipo,
-                        "esComodin" = :esComodin, "aceptaExtras" = :aceptaExtras,
-                        "maxExtrasTrimestre" = :maxExtrasTrimestre,
-                        "prioridadReduccion" = :prioridadReduccion,
-                        "tieneBolsa" = :tieneBolsa, "turnoPreferido" = :turnoPreferido,
-                        activa = :activa, "esNueva" = :esNueva,
-                        notas = :notas, "updatedAt" = NOW()
-                    WHERE id = :id
-                """),
-                {**emp, "id": eid},
+                text(
+                    f"UPDATE empresa SET {', '.join(update_sets)} WHERE id = :id"
+                ),
+                update_params,
             )
             actualizadas += 1
             eid_map[key] = eid
@@ -500,21 +554,36 @@ async def importar_empresas(
                 warnings.append(f"'{old_name}' → '{emp['nombre']}'")
         else:
             # New empresa: set neutral scores (will be calculated after first quarter)
+            # V25 Cambio C: incluye esContratante / puedeSerEP / puedeSerDoble.
+            # Empresa NUEVA → no hay valor previo en BD que preservar, así que
+            # None (columna ausente del Excel) se trata como False, default de
+            # la columna. Backfill no aplica porque la empresa no tiene CT
+            # histórico todavía.
+            insert_params = {
+                **emp,
+                "esContratante": emp["esContratante"] or False,
+                "puedeSerEP": emp["puedeSerEP"] or False,
+                "puedeSerDoble": emp["puedeSerDoble"] or False,
+            }
             r = await db.execute(
                 text("""
                     INSERT INTO empresa (
                         nombre, tipo, semaforo, "scoreV3", "fiabilidadReciente",
                         "esComodin", "aceptaExtras", "maxExtrasTrimestre",
                         "prioridadReduccion", "tieneBolsa", "turnoPreferido",
-                        activa, "esNueva", notas, "updatedAt"
+                        activa, "esNueva",
+                        "esContratante", "puedeSerEP", "puedeSerDoble",
+                        notas, "updatedAt"
                     ) VALUES (
                         :nombre, :tipo, 'AMBAR', 50, 50,
                         :esComodin, :aceptaExtras, :maxExtrasTrimestre,
                         :prioridadReduccion, :tieneBolsa, :turnoPreferido,
-                        :activa, :esNueva, :notas, NOW()
+                        :activa, :esNueva,
+                        :esContratante, :puedeSerEP, :puedeSerDoble,
+                        :notas, NOW()
                     ) RETURNING id
                 """),
-                emp,
+                insert_params,
             )
             eid = r.scalar_one()
             creadas += 1

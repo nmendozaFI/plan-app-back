@@ -149,3 +149,243 @@ async def test_master_permite_extras_columna_ausente_default_false(client, db_se
     rec = row.mappings().first()
     assert rec is not None
     assert rec["permiteExtras"] is False
+
+
+# ── V25 Cambio C: 3 flags estructurales en empresa via importer maestro ──
+
+
+async def _fetch_empresa_flags(db_session, nombre: str) -> dict | None:
+    """DB cross-check helper para los 3 flags V25 a nivel empresa."""
+    row = await db_session.execute(
+        text(
+            'SELECT "esContratante", "puedeSerEP", "puedeSerDoble" '
+            "FROM empresa WHERE nombre = :n"
+        ),
+        {"n": nombre},
+    )
+    return row.mappings().first()
+
+
+@pytest.mark.asyncio
+async def test_master_importer_v25_flags_columnas_presentes(client, db_session):
+    """Excel con esContratante/puedeSerEP/puedeSerDoble → empresa con flags correctos."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_FLAGS_OK"
+    excel_bytes = _build_master_excel(
+        [
+            {
+                "nombre": nombre,
+                "tipo": "AMBAS",
+                "esContratante": "SI",
+                "puedeSerEP": "SI",
+                "puedeSerDoble": "NO",
+            }
+        ]
+    )
+
+    resp = await client.post(
+        "/api/importar/empresas",
+        files={
+            "file": (
+                "maestro_test.xlsx",
+                excel_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"trimestre": TEST_TRIMESTRE},
+    )
+    assert resp.status_code == 200, resp.text
+
+    rec = await _fetch_empresa_flags(db_session, nombre)
+    assert rec is not None, "Empresa no creada"
+    assert rec["esContratante"] is True
+    assert rec["puedeSerEP"] is True
+    assert rec["puedeSerDoble"] is False
+
+
+@pytest.mark.asyncio
+async def test_master_importer_v25_columnas_ausentes_no_toca_bd(
+    client, db_session
+):
+    """Excel sin las 3 columnas V25 (formato V24 viejo) NO debe sobrescribir
+    los flags V25 en BD. Esto preserva el backfill de puedeSerEP que aplicó
+    la migration 0006 si la planificadora corre el maestro V24 por inercia."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_FLAGS_ABSENT"
+
+    # Setup: empresa preexistente con flags V25 ya seteados en BD (simula
+    # estado post-Capa-1 + algún UPDATE manual previo).
+    await db_session.execute(
+        text(
+            "INSERT INTO empresa (nombre, tipo, semaforo, activa, \"esNueva\", "
+            '"esContratante", "puedeSerEP", "puedeSerDoble", "updatedAt") '
+            "VALUES (:n, 'EF', 'AMBAR', true, false, true, true, true, NOW())"
+        ),
+        {"n": nombre},
+    )
+    await db_session.commit()
+
+    # Excel formato V24: solo nombre + tipo, ninguna columna V25.
+    excel_bytes = _build_master_excel([{"nombre": nombre, "tipo": "EF"}])
+
+    resp = await client.post(
+        "/api/importar/empresas",
+        files={
+            "file": (
+                "maestro_test.xlsx",
+                excel_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"trimestre": TEST_TRIMESTRE},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Los 3 flags deben seguir en true: el importer NO los tocó porque la
+    # columna no estaba en el Excel.
+    rec = await _fetch_empresa_flags(db_session, nombre)
+    assert rec is not None
+    assert rec["esContratante"] is True, "esContratante destruido por import V24"
+    assert rec["puedeSerEP"] is True, "puedeSerEP destruido (backfill perdido)"
+    assert rec["puedeSerDoble"] is True, "puedeSerDoble destruido por import V24"
+
+    # No warning ruidoso sobre los flags V25.
+    warnings = resp.json().get("warnings", [])
+    for w in warnings:
+        wl = w.lower()
+        assert "escontratante" not in wl
+        assert "puedeserep" not in wl
+        assert "puedeserdoble" not in wl
+
+
+@pytest.mark.asyncio
+async def test_master_importer_v25_columna_presente_celda_vacia_setea_false(
+    client, db_session
+):
+    """Excel con la columna presente pero celda vacía → False explícito.
+    La planificadora vació la celda a propósito; el importer debe respetar
+    esa intención (distinta de "columna ausente")."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_CELDA_VACIA"
+
+    # Setup: empresa con esContratante=true en BD.
+    await db_session.execute(
+        text(
+            "INSERT INTO empresa (nombre, tipo, semaforo, activa, \"esNueva\", "
+            '"esContratante", "puedeSerEP", "puedeSerDoble", "updatedAt") '
+            "VALUES (:n, 'EF', 'AMBAR', true, false, true, false, false, NOW())"
+        ),
+        {"n": nombre},
+    )
+    await db_session.commit()
+
+    # Excel con columna esContratante presente pero celda vacía (None).
+    # _build_master_excel toma `emp.get(h)` → None → openpyxl escribe celda vacía.
+    excel_bytes = _build_master_excel(
+        [
+            {
+                "nombre": nombre,
+                "tipo": "EF",
+                "esContratante": None,
+            }
+        ]
+    )
+
+    resp = await client.post(
+        "/api/importar/empresas",
+        files={
+            "file": (
+                "maestro_test.xlsx",
+                excel_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"trimestre": TEST_TRIMESTRE},
+    )
+    assert resp.status_code == 200, resp.text
+
+    rec = await _fetch_empresa_flags(db_session, nombre)
+    assert rec is not None
+    assert rec["esContratante"] is False, (
+        "Columna presente con celda vacía debe setear False (intención explícita)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_master_importer_v25_columna_ausente_insert_nueva_empresa_default_false(
+    client, db_session
+):
+    """Empresa NUEVA (INSERT) sin las 3 columnas V25 → los flags quedan en
+    false (default de la columna). No hay valor previo en BD que preservar."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_INSERT_DEFAULT"
+
+    # Excel formato V24, empresa nueva (no existe en BD).
+    excel_bytes = _build_master_excel([{"nombre": nombre, "tipo": "AMBAS"}])
+
+    resp = await client.post(
+        "/api/importar/empresas",
+        files={
+            "file": (
+                "maestro_test.xlsx",
+                excel_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"trimestre": TEST_TRIMESTRE},
+    )
+    assert resp.status_code == 200, resp.text
+
+    rec = await _fetch_empresa_flags(db_session, nombre)
+    assert rec is not None, "Empresa no creada"
+    assert rec["esContratante"] is False
+    assert rec["puedeSerEP"] is False
+    assert rec["puedeSerDoble"] is False
+
+
+@pytest.mark.asyncio
+async def test_master_importer_v25_excel_overrides_backfill(client, db_session):
+    """Excel con puedeSerEP=false explícito sobre empresa con backfill true → false.
+    Diferencia con el test "columna ausente": aquí la columna SÍ está, con
+    valor explícito NO, así que el Excel manda."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_BACKFILL_OVERRIDE"
+
+    # Setup: empresa pre-existente con puedeSerEP=true (simula backfill aplicado).
+    await db_session.execute(
+        text(
+            "INSERT INTO empresa (nombre, tipo, semaforo, activa, \"esNueva\", "
+            '"puedeSerEP", "esContratante", "puedeSerDoble", "updatedAt") '
+            "VALUES (:n, 'EF', 'AMBAR', true, false, true, false, false, NOW())"
+        ),
+        {"n": nombre},
+    )
+    await db_session.commit()
+
+    # Pre-condición.
+    pre = await _fetch_empresa_flags(db_session, nombre)
+    assert pre is not None
+    assert pre["puedeSerEP"] is True, "setup falló: debería empezar con backfill true"
+
+    # Importer corre con NO explícito en puedeSerEP → debe sobreescribir.
+    excel_bytes = _build_master_excel(
+        [
+            {
+                "nombre": nombre,
+                "tipo": "EF",
+                "puedeSerEP": "NO",
+            }
+        ]
+    )
+    resp = await client.post(
+        "/api/importar/empresas",
+        files={
+            "file": (
+                "maestro_test.xlsx",
+                excel_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"trimestre": TEST_TRIMESTRE},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Excel manda: el flag queda en false aunque la BD lo tenía en true.
+    post = await _fetch_empresa_flags(db_session, nombre)
+    assert post is not None
+    assert post["puedeSerEP"] is False, "Excel debería haber sobreescrito el backfill"

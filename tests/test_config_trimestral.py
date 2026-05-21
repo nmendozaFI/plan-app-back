@@ -79,12 +79,34 @@ async def _set_config_trimestral(
     await db.commit()
 
 
+async def _set_puede_ser_ep(db, empresa_id: int, value: bool = True):
+    """V25 Cambio C (Capa 3): flag estructural en ficha de empresa.
+    Reemplaza el setup viejo `_set_config_trimestral(..., escuela_propia=True)`
+    para los tests del endpoint `/empresas-ep` (que ya no pasan por CT)."""
+    await db.execute(
+        text('UPDATE empresa SET "puedeSerEP" = :v WHERE id = :id'),
+        {"id": empresa_id, "v": value},
+    )
+    await db.commit()
+
+
+async def _set_puede_ser_doble(db, empresa_id: int, value: bool = True):
+    """V25 Cambio C (Capa 3): flag estructural Doble en ficha de empresa.
+    Usado por los tests nuevos del endpoint `/empresas-doble`."""
+    await db.execute(
+        text('UPDATE empresa SET "puedeSerDoble" = :v WHERE id = :id'),
+        {"id": empresa_id, "v": value},
+    )
+    await db.commit()
+
+
 # ── Tests ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_listar_empresas_ep_devuelve_solo_ep_activas(client, db_session):
-    """3 empresas: EP+activa, EP+inactiva, noEP+activa → solo la primera."""
+    """V25 Cambio C (Capa 3): el gate es `empresa.puedeSerEP`, no `CT.escuelaPropia`.
+    3 empresas: EP+activa, EP+inactiva, noEP+activa → solo la primera."""
     ep_activa_id = await _create_empresa(
         db_session, f"{TEST_EMPRESA_PREFIX}EP_F3A_OK", activa=True
     )
@@ -94,9 +116,9 @@ async def test_listar_empresas_ep_devuelve_solo_ep_activas(client, db_session):
     no_ep_id = await _create_empresa(
         db_session, f"{TEST_EMPRESA_PREFIX}EP_F3A_NOEP", activa=True
     )
-    await _set_config_trimestral(db_session, ep_activa_id, escuela_propia=True)
-    await _set_config_trimestral(db_session, ep_inactiva_id, escuela_propia=True)
-    await _set_config_trimestral(db_session, no_ep_id, escuela_propia=False)
+    await _set_puede_ser_ep(db_session, ep_activa_id)
+    await _set_puede_ser_ep(db_session, ep_inactiva_id)
+    # no_ep_id keeps default puedeSerEP=false.
 
     resp = await client.get(f"/api/config-trimestral/{TEST_TRIMESTRE}/empresas-ep")
     assert resp.status_code == 200, resp.text
@@ -135,7 +157,7 @@ async def test_listar_empresas_ep_orden_alfabetico(client, db_session):
     c_id = await _create_empresa(db_session, name_c)
 
     for eid in (b_id, a_id, c_id):
-        await _set_config_trimestral(db_session, eid, escuela_propia=True)
+        await _set_puede_ser_ep(db_session, eid)
 
     resp = await client.get(f"/api/config-trimestral/{TEST_TRIMESTRE}/empresas-ep")
     assert resp.status_code == 200, resp.text
@@ -149,21 +171,45 @@ async def test_listar_empresas_ep_orden_alfabetico(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_listar_empresas_ep_trimestre_inexistente(client):
-    """Bogus trimestre → 200 with empty list (NOT 404)."""
-    resp = await client.get(
-        "/api/config-trimestral/TEST-INEXISTENTE-9999/empresas-ep"
+async def test_listar_empresas_ep_trimestre_decorativo(client):
+    """V25 Cambio C (Capa 3): el `{trimestre}` del path es decorativo.
+    El filtro pasa por `empresa.puedeSerEP` (ficha estructural), no por CT.
+
+    Esto cambia la semántica del test anterior `_trimestre_inexistente`:
+    antes esperábamos lista vacía con un trimestre bogus; ahora el filtro
+    no depende del trimestre, así que dos trimestres distintos devuelven
+    la MISMA lista. La promesa que sigue intacta: 200 OK (NO 404) y el
+    trimestre del request se ecoa en la respuesta tal cual."""
+    bogus_tri = "TEST-INEXISTENTE-9999"
+    real_tri = TEST_TRIMESTRE
+
+    resp_bogus = await client.get(
+        f"/api/config-trimestral/{bogus_tri}/empresas-ep"
     )
-    assert resp.status_code == 200, resp.text
-    data = resp.json()
-    assert data["trimestre"] == "TEST-INEXISTENTE-9999"
-    assert data["total"] == 0
-    assert data["empresas"] == []
+    resp_real = await client.get(
+        f"/api/config-trimestral/{real_tri}/empresas-ep"
+    )
+    assert resp_bogus.status_code == 200, resp_bogus.text
+    assert resp_real.status_code == 200, resp_real.text
+
+    # El trimestre se ecoa.
+    assert resp_bogus.json()["trimestre"] == bogus_tri
+    assert resp_real.json()["trimestre"] == real_tri
+
+    # El filtro NO depende del trimestre — misma lista en ambos.
+    ids_bogus = sorted(e["id"] for e in resp_bogus.json()["empresas"])
+    ids_real = sorted(e["id"] for e in resp_real.json()["empresas"])
+    assert ids_bogus == ids_real
 
 
 @pytest.mark.asyncio
 async def test_listar_empresas_ep_q2_real(client, db_session):
-    """Smoke check on 2026-Q2 real data: should include the seeded 6 EP IDs.
+    """Smoke check on real data: should include empresas con `puedeSerEP=true`.
+
+    V25 Cambio C (Capa 3): el gate migró a `empresa.puedeSerEP`. La migration
+    0006 hizo backfill (empresa con CT.escuelaPropia=true en algún histórico
+    → puedeSerEP=true), así que las IDs históricamente EP en 2026-Q2 deberían
+    seguir presentes vía el nuevo filtro estructural.
 
     Skips when those IDs aren't present in this DB (e.g. local dev with
     different seed data) so the test stays portable.
@@ -171,15 +217,12 @@ async def test_listar_empresas_ep_q2_real(client, db_session):
     expected_ids = {42, 49, 55, 60, 78, 82}
 
     # Confirm the seeded fixtures are actually present before asserting.
+    # V25: chequeamos directamente el flag estructural en empresa.
     pre = await db_session.execute(
         text(
-            'SELECT e.id FROM "configTrimestral" ct '
-            "JOIN empresa e ON e.id = ct.\"empresaId\" "
-            "WHERE ct.trimestre = :tri "
-            'AND ct."escuelaPropia" = true '
-            "AND e.activa = true"
+            'SELECT id FROM empresa '
+            'WHERE "puedeSerEP" = true AND activa = true'
         ),
-        {"tri": "2026-Q2"},
     )
     real_ids = {row["id"] for row in pre.mappings().all()}
     if not expected_ids.issubset(real_ids):
@@ -200,6 +243,74 @@ async def test_listar_empresas_ep_q2_real(client, db_session):
     # Alphabetical order invariant on the real payload.
     nombres = [e["nombre"] for e in data["empresas"]]
     assert nombres == sorted(nombres)
+
+
+# ── V25 Cambio C (Capa 3): /empresas-doble ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_listar_empresas_doble_devuelve_solo_marcadas(client, db_session):
+    """GET /empresas-doble filtra por empresa.puedeSerDoble=true + activa=true.
+    3 empresas: 2 con flag true, 1 sin flag → endpoint devuelve las 2 marcadas."""
+    a_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_V25_A", activa=True,
+    )
+    b_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_V25_B", activa=True,
+    )
+    c_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_V25_C", activa=True,
+    )
+    await _set_puede_ser_doble(db_session, a_id)
+    await _set_puede_ser_doble(db_session, b_id)
+    # c_id keeps default puedeSerDoble=false.
+
+    resp = await client.get(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/empresas-doble"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    returned_ids = [e["id"] for e in data["empresas"]]
+    assert a_id in returned_ids
+    assert b_id in returned_ids
+    assert c_id not in returned_ids
+    assert data["total"] == len(data["empresas"])
+
+
+@pytest.mark.asyncio
+async def test_listar_empresas_doble_empresa_inactiva_excluida(client, db_session):
+    """Empresa inactiva con puedeSerDoble=true → no aparece en el listado."""
+    inactiva_id = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_V25_INACTIVA", activa=False,
+    )
+    await _set_puede_ser_doble(db_session, inactiva_id)
+
+    resp = await client.get(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/empresas-doble"
+    )
+    assert resp.status_code == 200, resp.text
+    returned_ids = [e["id"] for e in resp.json()["empresas"]]
+    assert inactiva_id not in returned_ids
+
+
+@pytest.mark.asyncio
+async def test_listar_empresas_doble_sin_marcadas_lista_vacia(client, db_session):
+    """Cuando ninguna empresa del test tiene puedeSerDoble=true → no aparece
+    ninguna del prefijo TEST_EMPRESA_PREFIX. (Otras empresas reales de la BD
+    pueden aparecer si tienen el flag activo — el assert solo checa que las
+    empresas test no estén.)"""
+    eid = await _create_empresa(
+        db_session, f"{TEST_EMPRESA_PREFIX}DOBLE_V25_NO_FLAG", activa=True,
+    )
+    # No `_set_puede_ser_doble` — queda con default false.
+
+    resp = await client.get(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/empresas-doble"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert eid not in [e["id"] for e in data["empresas"]]
 
 
 # ── V22 (Cambio A): permiteExtras ──────────────────────────────
