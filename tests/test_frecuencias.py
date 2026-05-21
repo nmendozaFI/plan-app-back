@@ -7,7 +7,7 @@ from sqlalchemy import text
 from .conftest import TEST_TRIMESTRE, TEST_EMPRESA_PREFIX, setup_test_config_trimestral
 
 # V24 Cambio B: real-format trimestre needed because /calcular parses
-# trimestre.split("-")[0] as int. TEST_TRIMESTRE="TEST-Q1" fails that parser.
+# trimestre.split("-")[0] as int. TEST_TRIMESTRE="2099-Q1" fails that parser.
 # Q3 2026 is fresh post-Cambio-A and has real talleres in SemanaConfig, so
 # max_ef/max_it capacity is real (no spurious recortes on small test setups).
 V24_TRIMESTRE_REAL = "2026-Q3"
@@ -256,12 +256,16 @@ async def test_calcular_omits_empresa_when_both_freq_null(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_calcular_treats_one_null_as_zero(client, db_session):
-    """V24 Cambio B decisión D3: un NULL se trata como 0. Empresa con freqEF=3,
-    freqIT=NULL entra al cálculo con EF=3, IT=0.
+async def test_calcular_omits_empresa_when_any_freq_null(client, db_session):
+    """V25 Cambio C (Capa 8, decisión C8): cualquier NULL en freqEF o freqIT
+    omite la empresa del cálculo. Reemplaza el comportamiento D3 V24
+    (que trataba "uno NULL" como 0) y extiende D2 V24 a "alguno NULL".
+
+    La empresa con uno solo NULL ya NO entra al cálculo — la frecuencia es
+    input explícito y ambos números deben estar definidos.
     """
     eid = await _create_test_empresa_madrid(
-        db_session, f"{TEST_EMPRESA_PREFIX}V24_ONE_NULL"
+        db_session, f"{TEST_EMPRESA_PREFIX}V25_ONE_NULL"
     )
     await _upsert_ct_v24(db_session, eid, freq_ef=3, freq_it=None)
 
@@ -272,37 +276,8 @@ async def test_calcular_treats_one_null_as_zero(client, db_session):
     assert resp.status_code == 200, resp.text
     empresas = resp.json()["empresas"]
     target = next((e for e in empresas if e["empresa_id"] == eid), None)
-    assert target is not None, "empresa con un solo NULL debería entrar"
-    assert target["talleres_ef"] == 3
-    assert target["talleres_it"] == 0
-
-
-@pytest.mark.asyncio
-async def test_redistribucion_respeta_tipo_participacion(client, db_session):
-    """V24 Cambio B decisión D4: el filtro de tipoParticipacion en
-    _redistribuir_slots_liberados garantiza que un slot IT liberado no termine
-    sumándole talleres_it a una empresa con tipoParticipacion=EF.
-
-    Verificación indirecta: una empresa con tipo=EF, freq_it=NULL (→0), tras
-    /calcular, debe seguir con talleres_it=0 (la redistribución no la elige
-    como receptora de slots IT liberados, si los hay).
-    """
-    eid = await _create_test_empresa_madrid(
-        db_session, f"{TEST_EMPRESA_PREFIX}V24_EF_ONLY"
-    )
-    await _upsert_ct_v24(db_session, eid, freq_ef=2, freq_it=None, tipo="EF")
-
-    resp = await client.post(
-        "/api/frecuencias/calcular",
-        json={"trimestre": V24_TRIMESTRE_REAL},
-    )
-    assert resp.status_code == 200, resp.text
-    empresas = resp.json()["empresas"]
-    target = next((e for e in empresas if e["empresa_id"] == eid), None)
-    assert target is not None
-    assert target["talleres_it"] == 0, (
-        f"empresa con tipo=EF tiene talleres_it={target['talleres_it']} — "
-        f"el filtro tipoParticipacion en redistribución no está bloqueando"
+    assert target is None, (
+        "empresa con freqIT=NULL debería omitirse (V25 Capa 8 — uno NULL → omit)"
     )
 
 

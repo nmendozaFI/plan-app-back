@@ -29,6 +29,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 from app.db import get_db
+from app.services.empresas.checks import check_empresa_activa
 
 router = APIRouter()
 
@@ -660,12 +661,18 @@ async def importar_excel(
             ),
         )
 
-    # ── Cargar empresas activas para matching ────────────────
+    # ── Cargar todas las empresas para matching ──────────────
+    # V25 Capa 9 — Decisión C2: cargamos activas e inactivas para distinguir
+    # "no existe" (warning genérico) de "existe pero inactiva en BD" (warning
+    # específico V25). Solo las activas se procesan; inactivas → fila se
+    # rechaza con mensaje claro, las demás siguen.
     emp_result = await db.execute(
-        text("SELECT id, nombre FROM empresa WHERE activa = true")
+        text("SELECT id, nombre, activa FROM empresa")
     )
     empresas = {
-        normalize_empresa_name(r["nombre"]): {"id": r["id"], "nombre": r["nombre"]}
+        normalize_empresa_name(r["nombre"]): {
+            "id": r["id"], "nombre": r["nombre"], "activa": r["activa"],
+        }
         for r in emp_result.mappings().all()
     }
 
@@ -700,6 +707,17 @@ async def importar_excel(
                     break
         if not match:
             warnings.append(f"Fila {row_idx}: Empresa '{empresa_name}' no encontrada")
+            continue
+
+        # V25 Capa 9 — Decisión C2: empresa inactiva → fila rechazada con
+        # warning específico (NO el genérico "no encontrada"). Las demás filas
+        # siguen procesándose; el batch no se aborta.
+        if not match["activa"]:
+            warnings.append(
+                f"Fila {row_idx}: empresa '{match['nombre']}' está inactiva "
+                f"en BD — fila rechazada. Reactívala en /planificacion/empresas "
+                f"antes de modificar su CT por Excel."
+            )
             continue
 
         # Parseo de campos.
@@ -1144,15 +1162,14 @@ async def actualizar_config(
     """
     Actualiza la configuración trimestral de una empresa.
     Si no existe, la crea con valores por defecto.
+
+    V25 Capa 9 — Decisión C2: guard explícito activa/inactiva. Empresa inactiva
+    no puede tener CT modificada (antes era filtrado solo implícitamente por
+    el solver y el cálculo de frecuencias). Levanta 422 con el nombre.
     """
-    # Verificar que la empresa existe
-    emp_check = await db.execute(
-        text("SELECT id, nombre FROM empresa WHERE id = :eid"),
-        {"eid": empresa_id},
-    )
-    empresa = emp_check.mappings().first()
-    if not empresa:
-        raise HTTPException(status_code=404, detail=f"Empresa {empresa_id} no encontrada")
+    # V25 Capa 9: 404 si no existe + 422 si inactiva. Reutiliza el helper
+    # central (mismo contrato que Doble/Extras).
+    await check_empresa_activa(db, empresa_id)
 
     # Verificar si existe la config
     cfg_check = await db.execute(

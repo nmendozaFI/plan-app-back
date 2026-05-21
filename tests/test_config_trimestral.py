@@ -1054,3 +1054,108 @@ async def test_export_excel_includes_freq_ef_it_ep_pe_columns(client, db_session
             found = True
             break
     assert found, "la empresa de test no aparece en el xlsx"
+
+
+# ─────────────────────────────────────────────────────────────
+# V25 Capa 9 — Guard explícito activa/inactiva (decisión C2)
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_put_ct_rechaza_empresa_inactiva(client, db_session):
+    """V25 Capa 9 (decisión C2): PUT /{tri}/{empresa_id} contra empresa
+    inactiva → 422 con el nombre en el mensaje. Antes pasaba silenciosamente
+    (solo era filtrado por el solver y /calcular). Ahora falla temprano.
+    """
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_CT_INACTIVA"
+    eid = await _create_empresa(db_session, nombre, activa=False)
+
+    resp = await client.put(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/{eid}",
+        json={"escuela_propia": True},
+    )
+    assert resp.status_code == 422, resp.text
+    assert nombre in resp.json()["detail"], (
+        f"el detail debería incluir el nombre de la empresa: {resp.json()}"
+    )
+
+    # BD cross-check: CT NO se creó.
+    row = await db_session.execute(
+        text(
+            'SELECT id FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": TEST_TRIMESTRE},
+    )
+    assert row.first() is None, "CT no debería existir para empresa inactiva"
+
+
+@pytest.mark.asyncio
+async def test_bulk_ct_importar_excel_skip_empresa_inactiva(client, db_session):
+    """V25 Capa 9: bulk /importar-excel rechaza por fila la empresa inactiva
+    con warning específico ('inactiva en BD'), las demás filas se procesan.
+    Batch NO aborta.
+    """
+    activa = f"{TEST_EMPRESA_PREFIX}V25_CT_BULK_ACTIVA"
+    inactiva = f"{TEST_EMPRESA_PREFIX}V25_CT_BULK_INACTIVA"
+    eid_a = await _create_empresa(db_session, activa, activa=True)
+    eid_i = await _create_empresa(db_session, inactiva, activa=False)
+
+    excel = _build_v24_ct_excel([
+        {
+            "empresa": activa,
+            "freq_ef": 3, "freq_it": 1, "tipo": "AMBAS",
+            "dias": "L,M,X,J,V", "turno": "M", "voluntarios": 1,
+            "escuela_propia": False, "permite_extras": False, "notas": None,
+        },
+        {
+            "empresa": inactiva,
+            "freq_ef": 2, "freq_it": 0, "tipo": "EF",
+            "dias": "L,M,X,J,V", "turno": "M", "voluntarios": 1,
+            "escuela_propia": False, "permite_extras": False, "notas": None,
+        },
+    ])
+
+    resp = await client.post(
+        f"/api/config-trimestral/{TEST_TRIMESTRE}/importar-excel",
+        files={
+            "file": (
+                "ct_v25_capa9.xlsx", excel,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        },
+        data={"dry_run": "false"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    # La activa sí se procesa, la inactiva NO.
+    assert data["aplicados"] == 1, (
+        f"esperaba 1 aplicado (solo la activa), hay {data['aplicados']}"
+    )
+    warnings_inactiva = [
+        w for w in data["warnings"] if inactiva in w and "inactiva" in w.lower()
+    ]
+    assert warnings_inactiva, (
+        f"warning específico para '{inactiva}' (inactiva) no encontrado: "
+        f"{data['warnings']}"
+    )
+
+    # BD cross-check.
+    row_a = await db_session.execute(
+        text(
+            'SELECT "frecuenciaEF" FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid_a, "tri": TEST_TRIMESTRE},
+    )
+    assert row_a.scalar() == 3, "la activa debería tener freq_ef=3"
+
+    row_i = await db_session.execute(
+        text(
+            'SELECT id FROM "configTrimestral" '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid_i, "tri": TEST_TRIMESTRE},
+    )
+    assert row_i.first() is None, "CT no debería existir para empresa inactiva"

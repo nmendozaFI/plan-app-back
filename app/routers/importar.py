@@ -28,6 +28,7 @@ class ImportEmpresasResult(BaseModel):
     total_empresas: int
     creadas: int
     actualizadas: int
+    rechazadas_inactivas: int = 0  # V25 Capa 9: filas con empresa inactiva en BD
     ciudades_creadas: list[str]
     empresa_ciudad_links: int
     config_trimestral_creadas: int
@@ -472,10 +473,17 @@ async def importar_empresas(
         raise HTTPException(400, "No se encontraron empresas en el Excel")
 
     # ── Cargar empresas existentes (CASE-INSENSITIVE) ────────
-    existing_rows = await db.execute(text("SELECT id, nombre FROM empresa"))
-    db_lookup: dict[str, tuple[int, str]] = {}
+    # V25 Capa 9 — Decisión C2: incluimos `activa` para distinguir update
+    # bloqueado (empresa existente inactiva) de creación nueva (Excel puede
+    # crear inactiva sin problema).
+    existing_rows = await db.execute(
+        text("SELECT id, nombre, activa FROM empresa")
+    )
+    db_lookup: dict[str, tuple[int, str, bool]] = {}
     for r in existing_rows.mappings().all():
-        db_lookup[r["nombre"].strip().upper()] = (r["id"], r["nombre"])
+        db_lookup[r["nombre"].strip().upper()] = (
+            r["id"], r["nombre"], r["activa"],
+        )
 
     # ── Cargar ciudades existentes (CASE-INSENSITIVE) ────────
     existing_cities = await db.execute(text("SELECT id, nombre FROM ciudad"))
@@ -501,8 +509,12 @@ async def importar_empresas(
             ciudades_creadas.append(cn)
 
     # ── 2. Upsert empresas ───────────────────────────────────
+    # V25 Capa 9 — Decisión C2: empresa existente con activa=false en BD se
+    # rechaza con warning específico; no se actualiza nada. Empresa nueva
+    # con activa=false en Excel sí se crea (origen marca inactiva legítimamente).
     creadas = 0
     actualizadas = 0
+    rechazadas_inactivas = 0
     eid_map: dict[str, int] = {}
 
     for emp in empresas_data:
@@ -510,7 +522,15 @@ async def importar_empresas(
         existing = db_lookup.get(key)
 
         if existing:
-            eid, old_name = existing
+            eid, old_name, activa_actual = existing
+            if not activa_actual:
+                warnings.append(
+                    f"Empresa '{old_name}' está inactiva en BD — fila "
+                    f"rechazada. Reactívala en /planificacion/empresas si "
+                    f"querés actualizarla por Excel."
+                )
+                rechazadas_inactivas += 1
+                continue
             # NOTE: scoreV3, semaforo, fiabilidadReciente NOT updated — auto-calculated
             # V25 Cambio C: esContratante / puedeSerEP / puedeSerDoble usan
             # semántica tripartita (ver `_flag_v25` arriba). Si el flag llega
@@ -593,7 +613,10 @@ async def importar_empresas(
     # ── 3. Sync empresaCiudad ────────────────────────────────
     ec_count = 0
     for emp in empresas_data:
-        eid = eid_map[emp["nombre"].upper()]
+        key = emp["nombre"].upper()
+        if key not in eid_map:
+            continue  # V25 Capa 9: empresa rechazada por inactiva en BD.
+        eid = eid_map[key]
         await db.execute(
             text('DELETE FROM "empresaCiudad" WHERE "empresaId" = :eid'),
             {"eid": eid},
@@ -617,7 +640,10 @@ async def importar_empresas(
     for emp in empresas_data:
         if not emp["activa"]:
             continue
-        eid = eid_map[emp["nombre"].upper()]
+        key = emp["nombre"].upper()
+        if key not in eid_map:
+            continue  # V25 Capa 9: empresa rechazada por inactiva en BD.
+        eid = eid_map[key]
 
         # Determine tipoParticipacion from EF/IT frequencies
         freq_ef = emp.get("frecuenciaEF") or 0
@@ -893,6 +919,7 @@ async def importar_empresas(
         total_empresas=len(empresas_data),
         creadas=creadas,
         actualizadas=actualizadas,
+        rechazadas_inactivas=rechazadas_inactivas,
         ciudades_creadas=ciudades_creadas,
         empresa_ciudad_links=ec_count,
         config_trimestral_creadas=cfg_created,

@@ -227,6 +227,10 @@ def _ejecutar_solver(
         "H4_filtered": 0,
         "H5_filtered": 0,
         "H6_constraints": 0,
+        "H_dispersion_constraints": 0,
+        "H_dispersion_empresas": 0,
+        "H_contratante_empresas": 0,
+        "H_contratante_target_total": 0,
         "H7_filtered": 0,
         "H8_filtered": 0,
         "H_franja_filtered": 0,  # V16
@@ -534,6 +538,91 @@ def _ejecutar_solver(
 
     # H4, H5, H7, H8 are handled implicitly by pre-filtering (no variables created)
     print(f"H4, H5, H7, H8: handled by pre-filtering ({debug_stats['vars_filtered_out']:,} vars eliminated)")
+
+    # H_dispersion. V25 Capa 6 — Decisión C4: dispersión hard derivada.
+    # Para cada empresa no-EP con frecuencia >= 2 los talleres asignados deben
+    # estar separados por un gap mínimo de floor(semanas / freq) semanas. La
+    # fórmula es derivada del modelo, NO configurable (V25 §10 C4): el solver
+    # la calcula al construir el modelo. No hay UI ni columna nueva. Esto es
+    # el refuerzo del caso INDRA freq alta no-EP (V25 §7.5 Caso 2) y de la
+    # regresión que dejó Capa 5 al eliminar la heurística `>=6`.
+    #
+    # gap_min = max(1, len(SEMANAS) // total_e). Con gap_min == 1 el loop
+    # interno `0 < s2-s1 < 1` es vacío (sin enteros) → no-op natural; el
+    # constraint coincide entonces con H6 (max 1/semana) y CP-SAT lo simplifica
+    # solo. Se conserva la rama por uniformidad y legibilidad.
+    #
+    # Implementación: para cada par (s1, s2) con 0 < s2-s1 < gap_min, la suma
+    # de assigns de la empresa en s1 y s2 debe ser <= 1. EP excluida (H6b
+    # concentra en una sola semana — no aplica dispersión).
+    for e in empresa_ids:
+        if escuela_propia_map.get(e, False):
+            continue  # EP concentra (H6b), no aplica dispersión.
+        total_e = int(empresas[e].get("totalAsignado", 0) or 0)
+        if total_e < 2:
+            continue  # freq < 2: una sola asignación, nada que dispersar.
+        gap_min = max(1, len(SEMANAS) // total_e)
+        debug_stats["H_dispersion_empresas"] += 1
+        for s1 in SEMANAS:
+            for s2 in SEMANAS:
+                if 0 < s2 - s1 < gap_min:
+                    vars_s1 = [
+                        assign[(e, s1, t)]
+                        for t in taller_ids
+                        if (e, s1, t) in possible
+                    ]
+                    vars_s2 = [
+                        assign[(e, s2, t)]
+                        for t in taller_ids
+                        if (e, s2, t) in possible
+                    ]
+                    if vars_s1 and vars_s2:
+                        model.add(sum(vars_s1) + sum(vars_s2) <= 1)
+                        debug_stats["H_dispersion_constraints"] += 1
+    print(
+        f"H_dispersion: {debug_stats['H_dispersion_constraints']} dispersion constraints "
+        f"({debug_stats['H_dispersion_empresas']} empresas no-EP con freq>=2)"
+    )
+
+    # H_contratante. V25 Capa 7 — Decisión C7: priorización contratante hard.
+    # Empresas con `empresa.esContratante=true` reciben todos sus talleres del
+    # catálogo de contratantes (talleres con `taller.esContratante=true`) hasta
+    # cubrirlo, y el resto del catálogo general. Orden libre dentro del catálogo
+    # (confirmado V25 Q2 — no hay prelación entre los 5 talleres del catálogo).
+    #
+    # Implementación: agregamos las asignaciones de la empresa sobre los
+    # talleres del catálogo y forzamos `sum == target_cat`, con
+    # `target_cat = min(freq, n_cat)`. Cuando `freq <= n_cat` la empresa gasta
+    # toda su frecuencia en el catálogo. Cuando `freq > n_cat` cubre n_cat del
+    # catálogo y H2/H3 reparten el resto en talleres generales por programa.
+    #
+    # Si en BD hay menos de 5 talleres con `esContratante=true` (porque Capa 10
+    # — seed catálogo — aún no se hizo), `target_cat` ajusta solo, sin
+    # romper feasibility.
+    talleres_contratantes = [
+        t for t in taller_ids if taller_contratante_map.get(t, False)
+    ]
+    n_cat = len(talleres_contratantes)
+    for e in empresa_ids:
+        if not empresa_contratante_map.get(e, False):
+            continue
+        total_e = int(empresas[e].get("totalAsignado", 0) or 0)
+        if total_e == 0:
+            continue
+        vars_catalogo = [
+            assign[(e, s, t)]
+            for s in SEMANAS
+            for t in talleres_contratantes
+            if (e, s, t) in possible
+        ]
+        target_cat = min(total_e, n_cat)
+        model.add(sum(vars_catalogo) == target_cat)
+        debug_stats["H_contratante_empresas"] += 1
+        debug_stats["H_contratante_target_total"] += target_cat
+    print(
+        f"H_contratante: {debug_stats['H_contratante_empresas']} empresas contratantes, "
+        f"target_total={debug_stats['H_contratante_target_total']} (n_cat={n_cat})"
+    )
 
     # H6. Max 1 taller por empresa por semana (planificación base).
     # V25 Cambio C (Capa 5): la excepción "varias por semana" la decide

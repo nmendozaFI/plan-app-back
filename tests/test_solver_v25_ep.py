@@ -9,7 +9,7 @@ concentraban; y empresas no-EP con freq >= 6 podían acumular varios en una
 semana sin pretenderlo. Ahora el flag CT.escuelaPropia es la única fuente.
 
 Cleanup manual (no se apoya en `_cleanup_test_data` del conftest, que limpia
-solo `TEST_TRIMESTRE='TEST-Q1'`). Trimestre artificial `2099-Q1` para
+solo `TEST_TRIMESTRE='2099-Q1'`). Trimestre artificial `2099-Q1` para
 aislamiento total.
 """
 
