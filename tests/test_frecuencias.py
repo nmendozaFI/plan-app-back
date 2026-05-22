@@ -230,18 +230,28 @@ async def _upsert_ct_v24(
 
 
 @pytest.mark.asyncio
-async def test_calcular_omits_empresa_when_both_freq_null(client, db_session):
-    """V24 Cambio B decisión D2: empresa con frecuenciaEF=NULL Y frecuenciaIT=NULL
-    se omite del cálculo (no aparece en la lista de empresas).
+async def test_calcular_incluye_empresas_con_freq_null(client, db_session):
+    """V26: la pantalla Fase 1 muestra TODAS las empresas activas con CT,
+    incluso si freqEF o freqIT son NULL. Los campos NULL se sugieren como 0
+    con el flag `sugerido_*=true` para que el wizard pinte el badge.
+
+    Reemplaza el comportamiento V25 Capa 8 ("alguno NULL → omit del cálculo")
+    que dejaba huérfanas a las empresas sin decisión todavía. El solver y
+    `confirmar_frecuencias` no cambian: siguen omitiendo solo cuando ambos
+    son 0 (D5 V24).
     """
-    eid_with = await _create_test_empresa_madrid(
-        db_session, f"{TEST_EMPRESA_PREFIX}V24_OMIT_WITH"
+    eid_explicit = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V26_EXPLICIT"
     )
-    eid_without = await _create_test_empresa_madrid(
-        db_session, f"{TEST_EMPRESA_PREFIX}V24_OMIT_WITHOUT"
+    eid_one_null = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V26_ONE_NULL"
     )
-    await _upsert_ct_v24(db_session, eid_with, freq_ef=2, freq_it=1)
-    await _upsert_ct_v24(db_session, eid_without, freq_ef=None, freq_it=None)
+    eid_both_null = await _create_test_empresa_madrid(
+        db_session, f"{TEST_EMPRESA_PREFIX}V26_BOTH_NULL"
+    )
+    await _upsert_ct_v24(db_session, eid_explicit, freq_ef=2, freq_it=1)
+    await _upsert_ct_v24(db_session, eid_one_null, freq_ef=None, freq_it=1)
+    await _upsert_ct_v24(db_session, eid_both_null, freq_ef=None, freq_it=None)
 
     resp = await client.post(
         "/api/frecuencias/calcular",
@@ -249,36 +259,71 @@ async def test_calcular_omits_empresa_when_both_freq_null(client, db_session):
     )
     assert resp.status_code == 200, resp.text
     empresas = resp.json()["empresas"]
-    ids = {e["empresa_id"] for e in empresas}
+    by_id = {e["empresa_id"]: e for e in empresas}
 
-    assert eid_with in ids, "empresa con freq explícita debería entrar"
-    assert eid_without not in ids, "empresa con ambos NULL debería omitirse"
+    # Las tres empresas aparecen en el preview (lo central de V26).
+    assert eid_explicit in by_id, "empresa con freq explícita debe entrar"
+    assert eid_one_null in by_id, "empresa con un NULL debe entrar (V26)"
+    assert eid_both_null in by_id, "empresa con ambos NULL debe entrar (V26)"
+
+    # Flags `sugerido_*` reflejan el estado del CT (no del recorte). El
+    # recorte automático puede bajar `talleres_ef`/`talleres_it` cuando el
+    # trimestre real excede capacidad — la promesa V26 es el flag, no el
+    # valor exacto.
+    e1 = by_id[eid_explicit]
+    assert e1["sugerido_ef"] is False
+    assert e1["sugerido_it"] is False
+
+    e2 = by_id[eid_one_null]
+    assert e2["sugerido_ef"] is True, "EF venía NULL → sugerido"
+    assert e2["sugerido_it"] is False, "IT venía explícito (1)"
+
+    e3 = by_id[eid_both_null]
+    assert e3["sugerido_ef"] is True
+    assert e3["sugerido_it"] is True
+    # Con ambos sugeridos no se aplica el invariante "mínimo 1": queda 0/0.
+    # El recorte no la toca (total bruto = 0, no contribuye al exceso).
+    assert e3["talleres_ef"] == 0
+    assert e3["talleres_it"] == 0
 
 
 @pytest.mark.asyncio
-async def test_calcular_omits_empresa_when_any_freq_null(client, db_session):
-    """V25 Cambio C (Capa 8, decisión C8): cualquier NULL en freqEF o freqIT
-    omite la empresa del cálculo. Reemplaza el comportamiento D3 V24
-    (que trataba "uno NULL" como 0) y extiende D2 V24 a "alguno NULL".
-
-    La empresa con uno solo NULL ya NO entra al cálculo — la frecuencia es
-    input explícito y ambos números deben estar definidos.
+async def test_confirmar_uno_cero_explicito_inserta(client, db_session):
+    """V26: confirmar con EF=3, IT=0 explícitos → INSERT con esos valores
+    (NO se omite por D5). La omisión D5 V24 dispara SOLO con AMBOS en 0.
     """
     eid = await _create_test_empresa_madrid(
-        db_session, f"{TEST_EMPRESA_PREFIX}V25_ONE_NULL"
+        db_session, f"{TEST_EMPRESA_PREFIX}V26_CONFIRM_ONE_ZERO"
     )
-    await _upsert_ct_v24(db_session, eid, freq_ef=3, freq_it=None)
+    await _upsert_ct_v24(db_session, eid, freq_ef=None, freq_it=None)
 
-    resp = await client.post(
-        "/api/frecuencias/calcular",
-        json={"trimestre": V24_TRIMESTRE_REAL},
-    )
+    body = {
+        "trimestre": V24_TRIMESTRE_REAL,
+        "empresas": [
+            {"empresa_id": eid, "talleres_ef": 3, "talleres_it": 0},
+        ],
+    }
+    resp = await client.post("/api/frecuencias/confirmar", json=body)
     assert resp.status_code == 200, resp.text
-    empresas = resp.json()["empresas"]
-    target = next((e for e in empresas if e["empresa_id"] == eid), None)
-    assert target is None, (
-        "empresa con freqIT=NULL debería omitirse (V25 Capa 8 — uno NULL → omit)"
+    data = resp.json()
+    assert data["empresas_omitidas"] == 0, (
+        f"EF=3 IT=0 explícito no debe contar como omitido: {data}"
     )
+
+    # BD cross-check: fila insertada con (3, 0, 3).
+    row = await db_session.execute(
+        text(
+            'SELECT "talleresEF", "talleresIT", "totalAsignado" '
+            'FROM frecuencia '
+            'WHERE "empresaId" = :eid AND trimestre = :tri'
+        ),
+        {"eid": eid, "tri": V24_TRIMESTRE_REAL},
+    )
+    rec = row.mappings().first()
+    assert rec is not None, "debió insertarse fila en `frecuencia`"
+    assert rec["talleresEF"] == 3
+    assert rec["talleresIT"] == 0
+    assert rec["totalAsignado"] == 3
 
 
 @pytest.mark.asyncio

@@ -74,6 +74,11 @@ class FrecuenciaEmpresa(BaseModel):
     prioridad_reduccion: str
     ciudades_activas: list[str]
     restricciones: list[dict]
+    # V26: marca el campo como sugerido (CT.frecuenciaEF o frecuenciaIT NULL).
+    # La planificadora ve un 0 con badge en el wizard; al confirmar el INSERT
+    # persiste lo que ella deje (0 explícito o el valor editado).
+    sugerido_ef: bool = False
+    sugerido_it: bool = False
 
 
 class FrecuenciaOutput(BaseModel):
@@ -303,28 +308,35 @@ async def calcular_frecuencias(
         es_nueva = bool(cfg.get("esNueva") or False)
 
         # ── Frecuencia base (SIN ajuste todavía) ──────────────
-        # V25 Cambio C (Capa 8, decisión C8): la frecuencia es input explícito.
-        # Sin NULLs implícitos: si la empresa no tiene AMBOS frecuenciaEF y
-        # frecuenciaIT como enteros en CT, queda fuera del cálculo. Esto
-        # elimina la ambigüedad D3 V24 ("uno NULL → 0") que ocultaba bugs.
-        # La omisión cuando falta cualquiera de los dos se extiende del antiguo
-        # D2 V24 ("ambos NULL → omitir") por consistencia del modelo nuevo.
+        # V26 (revisión Fase 1): la pantalla Frecuencias es el lienzo de
+        # trabajo de la planificadora. TODAS las empresas activas con CT
+        # entran al preview, incluso si freqEF o freqIT están en NULL — esos
+        # campos se sugieren como 0 con `sugerido_*=true` para que el wizard
+        # pinte el badge. La planificadora edita y, al confirmar, el INSERT
+        # persiste exactamente lo que ella deje (D5 V24 sigue: solo se omite
+        # del INSERT si AMBOS son 0).
+        #
+        # Diferencia con V25 Capa 8 (revertida solo para `/calcular`):
+        #   - V25 C8: "alguno NULL → omitir del cálculo" — escondía empresas.
+        #   - V26:    "alguno NULL → sugerir 0, mantener en el preview".
+        # El solver (`/api/calendario/generar`) SIGUE leyendo `frecuencia`
+        # como input explícito; allí no se calcula sugerencia.
         explicit_ef = cfg.get("frecuenciaEF")
         explicit_it = cfg.get("frecuenciaIT")
 
-        if explicit_ef is None or explicit_it is None:
-            logger.info(
-                f"[OMIT] {cfg['nombre']}: frecuenciaEF o frecuenciaIT NULL en CT — "
-                f"se omite del cálculo este trimestre"
-            )
-            continue
+        sugerido_ef = explicit_ef is None
+        sugerido_it = explicit_it is None
+        ambos_sugeridos = sugerido_ef and sugerido_it
 
-        ef = explicit_ef
-        it = explicit_it
+        ef = 0 if sugerido_ef else int(explicit_ef)
+        it = 0 if sugerido_it else int(explicit_it)
 
         # ── Reducción -50% a empresas esNueva ─────────────────
-        # Antes del ajuste por desempeño: empresa nueva recibe la mitad el primer año.
-        if es_nueva:
+        # V26: si ambos campos son sugeridos (CT con ambas freq NULL) no
+        # aplicamos ajustes ni invariantes — la planificadora ve 0/0 y
+        # decide. Si al menos uno es explícito, los ajustes corren normal
+        # sobre el total (la rama proporcional respeta el 0 sugerido).
+        if es_nueva and not ambos_sugeridos:
             ef = math.floor(ef * 0.5)
             it = math.floor(it * 0.5)
             # Preservar invariante: mínimo 1 total
@@ -347,7 +359,7 @@ async def calcular_frecuencias(
         #   > 0 → over-delivered (hicieron más de lo asignado)
         #   < 0 → under-delivered
         ajuste = 0
-        if eid in desempeno_anterior:
+        if eid in desempeno_anterior and not ambos_sugeridos:
             desv = desempeno_anterior[eid]
 
             if semaforo == "VERDE":
@@ -400,8 +412,11 @@ async def calcular_frecuencias(
                     else:
                         ef = max(0, ef + delta)
 
-        # Invariante mínimo: al menos 1 total si la empresa está activa
-        if ef + it < 1:
+        # Invariante mínimo: al menos 1 total si la empresa está activa.
+        # V26: si ambos campos son sugeridos no aplicamos el invariante — el
+        # 0/0 es deliberado para que la planificadora vea que no hay decisión
+        # todavía. Si alguno es explícito, mantenemos el invariante histórico.
+        if not ambos_sugeridos and ef + it < 1:
             if cfg["tipoParticipacion"] == "IT":
                 it = 1
             else:
@@ -456,6 +471,11 @@ async def calcular_frecuencias(
             "prioridad_reduccion": cfg["prioridadReduccion"],
             "ciudades_activas": ciudades_map.get(eid, []),
             "restricciones": restricciones_map.get(eid, []),
+            # V26: flags para el badge del wizard. Si el recorte automático
+            # mueve el campo, el flag se mantiene — sigue siendo un valor
+            # cuya base fue sugerencia, no decisión de la planificadora.
+            "sugerido_ef": sugerido_ef,
+            "sugerido_it": sugerido_it,
         })
 
     # ── 6. Recorte para encajar en modelo trimestral ─────────

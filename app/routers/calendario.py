@@ -27,6 +27,7 @@ from app.db import get_db
 from app.schemas.calendario import (
     CalendarioInput, CalendarioOutput, SlotCalendario, SugerenciaContingencia,
     SlotUpdateInput, SlotBatchUpdateItem, SlotBatchUpdateInput,
+    CrearSlotInput,
     ValidarAsignacionInput, ValidarAsignacionResult,
     EmpresaAnalisis, CambioSlot, AnalisisResumen, AnalisisResponse,
     CerrarTrimestreInput, CerrarTrimestreResult,
@@ -34,6 +35,9 @@ from app.schemas.calendario import (
     ImportarExcelBulkResult, FilaExtraInsertada, FilaDobleInsertada,
     ListaExtrasResponse, SlotExtraResponse,
     RecalcularScoresResult,
+)
+from app.services.empresas.checks import (
+    check_empresa_activa, check_empresa_permite_extras,
 )
 from app.services.calendario.solver import (
     _ejecutar_solver,
@@ -401,6 +405,34 @@ async def obtener_calendario(
         "cancelados": cancelados,
         "slots": rows,
     }
+
+
+@router.get("/{trimestre}/festivos")
+async def listar_festivos(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """V26 — Lista los festivos del trimestre para que la vista calendario
+    mensual los marque en la grilla.
+
+    Returns: lista de {semana, dia, motivo}. El frontend ya conoce el mapeo
+    (trimestre, semana, dia) → fecha real vía helpers existentes.
+    """
+    result = await db.execute(
+        text(
+            "SELECT semana, dia, motivo FROM festivo "
+            "WHERE trimestre = :trimestre "
+            "ORDER BY semana, "
+            "CASE dia WHEN 'L' THEN 1 WHEN 'M' THEN 2 WHEN 'X' THEN 3 "
+            "WHEN 'J' THEN 4 WHEN 'V' THEN 5 ELSE 9 END"
+        ),
+        {"trimestre": trimestre},
+    )
+    festivos = [
+        {"semana": r["semana"], "dia": r["dia"], "motivo": r["motivo"]}
+        for r in result.mappings().all()
+    ]
+    return {"trimestre": trimestre, "festivos": festivos}
 
 
 @router.post("/{trimestre}/validar-asignacion", response_model=ValidarAsignacionResult)
@@ -952,6 +984,31 @@ async def actualizar_slot(
         updates.append("notas = :notas")
         params["notas"] = body.notas
 
+    # V26: cambio de taller. Verifica que existe + activo; el JOIN del
+    # response devuelve programa/turno/nombre actualizados. NO toca empresa.
+    if body.taller_id is not None:
+        taller_row = await db.execute(
+            text(
+                'SELECT id, nombre, programa, activo FROM taller WHERE id = :id'
+            ),
+            {"id": body.taller_id},
+        )
+        taller = taller_row.mappings().first()
+        if taller is None:
+            raise HTTPException(
+                status_code=404, detail=f"Taller id={body.taller_id} no existe",
+            )
+        if not taller["activo"]:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Taller '{taller['nombre']}' está inactivo y no puede "
+                    f"asignarse al slot."
+                ),
+            )
+        updates.append('"tallerId" = :taller_id')
+        params["taller_id"] = body.taller_id
+
     # Handle motivo_cambio
     if body.motivo_cambio is not None:
         updates.append('"motivoCambio" = :motivo_cambio')
@@ -997,6 +1054,191 @@ async def actualizar_slot(
     )
     row = result.mappings().first()
     return {"slot": dict(row) if row else None}
+
+
+@router.delete("/{trimestre}/slots/{slot_id}")
+async def eliminar_slot(
+    trimestre: str,
+    slot_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """V26 — Eliminar un slot (BASE o EXTRA) de la planificación.
+
+    A diferencia de DELETE /planificacion/{slot_id}/extra (V20, solo EXTRA),
+    este endpoint borra cualquier tipoAsignacion. Guards:
+      - 404 si el slot no existe o pertenece a otro trimestre.
+      - 409 si el trimestre ya tiene fila(s) en historicoTaller (trimestre
+        cerrado) — el histórico es inmutable.
+    """
+    row = await db.execute(
+        text(
+            'SELECT id, "tipoAsignacion", confirmado, "motivoCambio" '
+            'FROM planificacion WHERE id = :id AND trimestre = :tri'
+        ),
+        {"id": slot_id, "tri": trimestre},
+    )
+    rec = row.mappings().first()
+    if rec is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Slot {slot_id} no existe en {trimestre}",
+        )
+
+    # Guard: si el trimestre ya tiene histórico, no se puede modificar
+    # la planificación (V17: el cierre del trimestre traslada a historicoTaller).
+    hist = await db.execute(
+        text(
+            'SELECT 1 FROM "historicoTaller" '
+            'WHERE trimestre = :tri LIMIT 1'
+        ),
+        {"tri": trimestre},
+    )
+    if hist.first() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Trimestre {trimestre} está cerrado (tiene histórico). "
+                f"No se puede eliminar el slot."
+            ),
+        )
+
+    await db.execute(
+        text("DELETE FROM planificacion WHERE id = :id"),
+        {"id": slot_id},
+    )
+    await db.commit()
+    return {
+        "deleted_id": slot_id,
+        "tipo_asignacion": rec["tipoAsignacion"],
+        "had_motivo_cambio": rec["motivoCambio"] is not None,
+        "was_confirmado": bool(rec["confirmado"]),
+    }
+
+
+@router.post("/{trimestre}/slots")
+async def crear_slot(
+    trimestre: str,
+    body: CrearSlotInput,
+    db: AsyncSession = Depends(get_db),
+):
+    """V26 — Crear un slot puntual (BASE o EXTRA) desde la UI Operación,
+    reemplazando el flujo Excel→bulk para empresas que confirman tarde o
+    cambios no planificados originalmente.
+
+    Validaciones:
+      1. Empresa existe + activa (404/422).
+      2. Taller existe + activo (404/422); programa coincide con el del
+         taller (422).
+      3. Franja (semana, día, horario) no tiene ya 2 slots de programas
+         distintos (409 "Franja ocupada").
+      4. Si `tipo_asignacion='EXTRA'`: la empresa debe tener
+         `permiteExtras=true` en este trimestre (422). Reusa el check
+         compartido con POST /api/planificacion/{tri}/extra.
+    """
+    # 1. Empresa activa.
+    empresa_nombre = await check_empresa_activa(db, body.empresa_id)
+
+    # 2. Taller activo.
+    taller_row = await db.execute(
+        text(
+            'SELECT id, nombre, programa, activo, turno FROM taller '
+            'WHERE id = :id'
+        ),
+        {"id": body.taller_id},
+    )
+    taller = taller_row.mappings().first()
+    if taller is None:
+        raise HTTPException(
+            status_code=404, detail=f"Taller id={body.taller_id} no existe",
+        )
+    if not taller["activo"]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Taller '{taller['nombre']}' está inactivo",
+        )
+    if (taller["programa"] or "").strip().upper() != body.programa.upper():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Programa '{body.programa}' no coincide con el del taller "
+                f"'{taller['nombre']}' ({taller['programa']})."
+            ),
+        )
+
+    # 3. Franja (sem, día, horario): a lo sumo un slot EF + un slot IT.
+    franja_rows = await db.execute(
+        text(
+            'SELECT p.id, t.programa FROM planificacion p '
+            'JOIN taller t ON t.id = p."tallerId" '
+            'WHERE p.trimestre = :tri AND p.semana = :sem '
+            'AND p.dia = :dia AND p.horario = :hora'
+        ),
+        {
+            "tri": trimestre,
+            "sem": body.semana,
+            "dia": body.dia,
+            "hora": body.horario,
+        },
+    )
+    franja_existentes = [dict(r) for r in franja_rows.mappings().all()]
+    programas_ya_ocupados = {
+        (r["programa"] or "").strip().upper() for r in franja_existentes
+    }
+    if len(franja_existentes) >= 2 or body.programa.upper() in programas_ya_ocupados:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Franja ocupada: ({trimestre}, S{body.semana}, {body.dia}, "
+                f"{body.horario}) ya tiene un slot del programa {body.programa}."
+            ),
+        )
+
+    # 4. Si EXTRA, gate `permiteExtras` para el trimestre.
+    if body.tipo_asignacion == "EXTRA":
+        await check_empresa_permite_extras(
+            db, body.empresa_id, empresa_nombre, trimestre,
+        )
+
+    # Insert. ciudadId queda NULL aquí; post_proceso/operación lo asigna
+    # cuando sea necesario (mismo patrón que crear_extra V21).
+    insert = await db.execute(
+        text(
+            'INSERT INTO planificacion '
+            '("empresaId", "empresaIdOriginal", "tallerId", trimestre, '
+            ' semana, dia, horario, turno, "tipoAsignacion", '
+            ' estado, confirmado, notas, "updatedAt") '
+            "VALUES (:eid, :eid, :tid, :tri, :sem, :dia, :hora, :turno, "
+            ":tipo, 'PLANIFICADO', false, :notas, NOW()) "
+            "RETURNING id"
+        ),
+        {
+            "eid": body.empresa_id,
+            "tid": body.taller_id,
+            "tri": trimestre,
+            "sem": body.semana,
+            "dia": body.dia,
+            "hora": body.horario,
+            "turno": taller["turno"],
+            "tipo": body.tipo_asignacion,
+            "notas": body.notas,
+        },
+    )
+    new_id = insert.scalar()
+    await db.commit()
+
+    return {
+        "id": new_id,
+        "tipo_asignacion": body.tipo_asignacion,
+        "trimestre": trimestre,
+        "semana": body.semana,
+        "dia": body.dia,
+        "horario": body.horario,
+        "empresa_id": body.empresa_id,
+        "empresa_nombre": empresa_nombre,
+        "taller_id": body.taller_id,
+        "taller_nombre": taller["nombre"],
+        "programa": body.programa,
+    }
 
 
 @router.patch("/{trimestre}/slots-batch")
