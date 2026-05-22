@@ -30,6 +30,10 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 from app.db import get_db
 from app.services.empresas.checks import check_empresa_activa
+from app.services.validacion_ct import (
+    ValidarCTResponse,
+    validar_configuracion_trimestral,
+)
 
 router = APIRouter()
 
@@ -453,6 +457,29 @@ async def listar_empresas_permite_extras(
         total=len(empresas),
         empresas=empresas,
     )
+
+
+@router.get("/{trimestre}/validar", response_model=ValidarCTResponse)
+async def validar_ct(
+    trimestre: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """V27 — Pre-validación de Config Trimestral.
+
+    Detecta inconsistencias en la CT del trimestre antes de invocar el solver
+    (que podría tardar segundos y devolver INFEASIBLE sin contexto). Tres
+    validaciones: frecuencia con días imposibles, tipoParticipacion
+    incoherente con frecuencias, empresa fantasma con CT pero sin frecuencia.
+
+    Empresas inactivas se excluyen. Trimestre inexistente o sin CTs → 200
+    con listas vacías + resumen "0 errores, 0 warnings detectados.". El
+    endpoint NO bloquea generación — es informativo; el caller decide.
+
+    Costo: ~13 queries para cargar el catálogo unión del trimestre (una por
+    semana via `cargar_talleres_semana`). Trivial para una operación
+    on-demand disparada por la planificadora.
+    """
+    return await validar_configuracion_trimestral(db, trimestre)
 
 
 @router.get("/{trimestre}/exportar-excel")
