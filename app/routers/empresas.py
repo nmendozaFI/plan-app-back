@@ -39,6 +39,10 @@ class EmpresaCreate(BaseModel):
     tieneBolsa: bool = False
     turnoPreferido: str | None = None
     esNueva: bool = False
+    # V25 Cambio C: 3 flags estructurales (migration 0006).
+    esContratante: bool = False
+    puedeSerEP: bool = False
+    puedeSerDoble: bool = False
     notas: str | None = None
 
 
@@ -55,6 +59,10 @@ class EmpresaUpdate(BaseModel):
     tieneBolsa: bool | None = None
     turnoPreferido: str | None = None
     esNueva: bool | None = None
+    # V25 Cambio C
+    esContratante: bool | None = None
+    puedeSerEP: bool | None = None
+    puedeSerDoble: bool | None = None
     notas: str | None = None
 
 
@@ -93,7 +101,9 @@ async def listar_empresas(
                "esComodin", "aceptaExtras",
                "maxExtrasTrimestre",
                "prioridadReduccion", "tieneBolsa",
-               "turnoPreferido", activa, "esNueva", notas
+               "turnoPreferido", activa, "esNueva",
+               "esContratante", "puedeSerEP", "puedeSerDoble",
+               notas
         FROM empresa
         WHERE 1=1
     """
@@ -135,7 +145,9 @@ async def detalle_empresa(
                    "esComodin", "aceptaExtras",
                    "maxExtrasTrimestre",
                    "prioridadReduccion", "tieneBolsa",
-                   "turnoPreferido", activa, "esNueva", notas,
+                   "turnoPreferido", activa, "esNueva",
+                   "esContratante", "puedeSerEP", "puedeSerDoble",
+                   notas,
                    "createdAt", "updatedAt"
             FROM empresa WHERE id = :id
         """),
@@ -211,17 +223,23 @@ async def crear_empresa(
                 nombre, tipo, semaforo, "scoreV3", "fiabilidadReciente",
                 "esComodin", "aceptaExtras", "maxExtrasTrimestre",
                 "prioridadReduccion", "tieneBolsa", "turnoPreferido",
-                activa, "esNueva", notas, "createdAt", "updatedAt"
+                activa, "esNueva",
+                "esContratante", "puedeSerEP", "puedeSerDoble",
+                notas, "createdAt", "updatedAt"
             ) VALUES (
                 :nombre, :tipo, :semaforo, :scoreV3, :fiabilidadReciente,
                 :esComodin, :aceptaExtras, :maxExtrasTrimestre,
                 :prioridadReduccion, :tieneBolsa, :turnoPreferido,
-                true, :esNueva, :notas, NOW(), NOW()
+                true, :esNueva,
+                :esContratante, :puedeSerEP, :puedeSerDoble,
+                :notas, NOW(), NOW()
             )
             RETURNING id, nombre, tipo, semaforo, "scoreV3",
                       "fiabilidadReciente", "esComodin", "aceptaExtras",
                       "maxExtrasTrimestre", "prioridadReduccion",
-                      "tieneBolsa", "turnoPreferido", activa, "esNueva", notas
+                      "tieneBolsa", "turnoPreferido", activa, "esNueva",
+                      "esContratante", "puedeSerEP", "puedeSerDoble",
+                      notas
         """),
         {
             "nombre": data.nombre.strip(),
@@ -236,6 +254,9 @@ async def crear_empresa(
             "tieneBolsa": data.tieneBolsa,
             "turnoPreferido": data.turnoPreferido,
             "esNueva": data.esNueva,
+            "esContratante": data.esContratante,
+            "puedeSerEP": data.puedeSerEP,
+            "puedeSerDoble": data.puedeSerDoble,
             "notas": data.notas,
         },
     )
@@ -284,6 +305,10 @@ async def editar_empresa(
         "tieneBolsa": '"tieneBolsa"',
         "turnoPreferido": '"turnoPreferido"',
         "esNueva": '"esNueva"',
+        # V25 Cambio C
+        "esContratante": '"esContratante"',
+        "puedeSerEP": '"puedeSerEP"',
+        "puedeSerDoble": '"puedeSerDoble"',
         "notas": "notas",
     }
 
@@ -310,7 +335,9 @@ async def editar_empresa(
             RETURNING id, nombre, tipo, semaforo, "scoreV3",
                       "fiabilidadReciente", "esComodin", "aceptaExtras",
                       "maxExtrasTrimestre", "prioridadReduccion",
-                      "tieneBolsa", "turnoPreferido", activa, "esNueva", notas
+                      "tieneBolsa", "turnoPreferido", activa, "esNueva",
+                      "esContratante", "puedeSerEP", "puedeSerDoble",
+                      notas
         """),
         params,
     )

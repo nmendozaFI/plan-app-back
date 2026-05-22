@@ -28,6 +28,7 @@ class ImportEmpresasResult(BaseModel):
     total_empresas: int
     creadas: int
     actualizadas: int
+    rechazadas_inactivas: int = 0  # V25 Capa 9: filas con empresa inactiva en BD
     ciudades_creadas: list[str]
     empresa_ciudad_links: int
     config_trimestral_creadas: int
@@ -125,6 +126,19 @@ HEADER_MAP = {
     "permiteextras": "permiteExtras",
     "permite_extras": "permiteExtras",
     "pe": "permiteExtras",
+    # V25 Cambio C: 3 flags estructurales en empresa (migration 0006).
+    # Si la columna falta en el Excel → default false (silent, sin warning).
+    # Si viene con valor explícito → la fuente de verdad es el Excel
+    # (sobreescribe lo que haya en BD, incluido el backfill de puedeSerEP).
+    "escontratante": "esContratante",
+    "es_contratante": "esContratante",
+    "contratante": "esContratante",
+    "puedeserep": "puedeSerEP",
+    "puede_ser_ep": "puedeSerEP",
+    "pep": "puedeSerEP",
+    "puedeserdoble": "puedeSerDoble",
+    "puede_ser_doble": "puedeSerDoble",
+    "pdoble": "puedeSerDoble",
     # disponibilidadDias (V18)
     "disponibilidaddias": "disponibilidadDias",
     "disponibilidad": "disponibilidadDias",
@@ -409,6 +423,21 @@ async def importar_empresas(
 
         # NOTE: scoreV3, semaforo, fiabilidadReciente are IGNORED from Excel
         # These fields are now auto-calculated from historical data
+
+        # V25 Cambio C: 3 flags estructurales empresa con semántica tripartita,
+        # igual al patrón histórico de escuelaPropia pre-V24 (V25 Capa 2 fix).
+        #   - Columna ausente del Excel → None → UPDATE no toca el flag en BD.
+        #   - Columna presente, celda vacía → False explícito.
+        #   - Columna presente, celda con valor → bool parseado.
+        # Detección "columna ausente" via `col_map`: si el header canónico no
+        # apareció en la primera fila, el HEADER_MAP no lo registró aquí.
+        # Sin esta política, correr el maestro V24 (sin las 3 columnas nuevas)
+        # destruiría el backfill de puedeSerEP aplicado por la migration 0006.
+        def _flag_v25(field: str) -> bool | None:
+            if field not in col_map:
+                return None
+            return _bool(_get(field))
+
         empresas_data.append(
             {
                 "nombre": nombre,
@@ -422,6 +451,10 @@ async def importar_empresas(
                 "turnoPreferido": _str(_get("turnoPreferido")),
                 "activa": _bool(_get("activa", "SI")),
                 "esNueva": _bool(_get("esNueva", "NO")),
+                # V25 Cambio C — None = no tocar BD (ver _flag_v25 arriba).
+                "esContratante": _flag_v25("esContratante"),
+                "puedeSerEP": _flag_v25("puedeSerEP"),
+                "puedeSerDoble": _flag_v25("puedeSerDoble"),
                 "notas": _str(_get("notas")),
                 "ciudades": ciudades,
                 # Frequency fields
@@ -440,10 +473,17 @@ async def importar_empresas(
         raise HTTPException(400, "No se encontraron empresas en el Excel")
 
     # ── Cargar empresas existentes (CASE-INSENSITIVE) ────────
-    existing_rows = await db.execute(text("SELECT id, nombre FROM empresa"))
-    db_lookup: dict[str, tuple[int, str]] = {}
+    # V25 Capa 9 — Decisión C2: incluimos `activa` para distinguir update
+    # bloqueado (empresa existente inactiva) de creación nueva (Excel puede
+    # crear inactiva sin problema).
+    existing_rows = await db.execute(
+        text("SELECT id, nombre, activa FROM empresa")
+    )
+    db_lookup: dict[str, tuple[int, str, bool]] = {}
     for r in existing_rows.mappings().all():
-        db_lookup[r["nombre"].strip().upper()] = (r["id"], r["nombre"])
+        db_lookup[r["nombre"].strip().upper()] = (
+            r["id"], r["nombre"], r["activa"],
+        )
 
     # ── Cargar ciudades existentes (CASE-INSENSITIVE) ────────
     existing_cities = await db.execute(text("SELECT id, nombre FROM ciudad"))
@@ -469,8 +509,12 @@ async def importar_empresas(
             ciudades_creadas.append(cn)
 
     # ── 2. Upsert empresas ───────────────────────────────────
+    # V25 Capa 9 — Decisión C2: empresa existente con activa=false en BD se
+    # rechaza con warning específico; no se actualiza nada. Empresa nueva
+    # con activa=false en Excel sí se crea (origen marca inactiva legítimamente).
     creadas = 0
     actualizadas = 0
+    rechazadas_inactivas = 0
     eid_map: dict[str, int] = {}
 
     for emp in empresas_data:
@@ -478,21 +522,51 @@ async def importar_empresas(
         existing = db_lookup.get(key)
 
         if existing:
-            eid, old_name = existing
+            eid, old_name, activa_actual = existing
+            if not activa_actual:
+                warnings.append(
+                    f"Empresa '{old_name}' está inactiva en BD — fila "
+                    f"rechazada. Reactívala en /planificacion/empresas si "
+                    f"querés actualizarla por Excel."
+                )
+                rechazadas_inactivas += 1
+                continue
             # NOTE: scoreV3, semaforo, fiabilidadReciente NOT updated — auto-calculated
+            # V25 Cambio C: esContratante / puedeSerEP / puedeSerDoble usan
+            # semántica tripartita (ver `_flag_v25` arriba). Si el flag llega
+            # como None significa "columna ausente del Excel" y NO se incluye
+            # en el SET, preservando el valor en BD (entre otros, el backfill
+            # de puedeSerEP aplicado por la migration 0006). False explícito
+            # sí se aplica.
+            update_sets = [
+                "nombre = :nombre",
+                "tipo = :tipo",
+                '"esComodin" = :esComodin',
+                '"aceptaExtras" = :aceptaExtras',
+                '"maxExtrasTrimestre" = :maxExtrasTrimestre',
+                '"prioridadReduccion" = :prioridadReduccion',
+                '"tieneBolsa" = :tieneBolsa',
+                '"turnoPreferido" = :turnoPreferido',
+                "activa = :activa",
+                '"esNueva" = :esNueva',
+                "notas = :notas",
+                '"updatedAt" = NOW()',
+            ]
+            update_params = {**emp, "id": eid}
+
+            for flag in ("esContratante", "puedeSerEP", "puedeSerDoble"):
+                if emp[flag] is None:
+                    # Columna ausente del Excel — no tocar BD. Drop del dict
+                    # para que SQLAlchemy no se queje del bind sobrante.
+                    update_params.pop(flag, None)
+                else:
+                    update_sets.append(f'"{flag}" = :{flag}')
+
             await db.execute(
-                text("""
-                    UPDATE empresa SET
-                        nombre = :nombre, tipo = :tipo,
-                        "esComodin" = :esComodin, "aceptaExtras" = :aceptaExtras,
-                        "maxExtrasTrimestre" = :maxExtrasTrimestre,
-                        "prioridadReduccion" = :prioridadReduccion,
-                        "tieneBolsa" = :tieneBolsa, "turnoPreferido" = :turnoPreferido,
-                        activa = :activa, "esNueva" = :esNueva,
-                        notas = :notas, "updatedAt" = NOW()
-                    WHERE id = :id
-                """),
-                {**emp, "id": eid},
+                text(
+                    f"UPDATE empresa SET {', '.join(update_sets)} WHERE id = :id"
+                ),
+                update_params,
             )
             actualizadas += 1
             eid_map[key] = eid
@@ -500,21 +574,36 @@ async def importar_empresas(
                 warnings.append(f"'{old_name}' → '{emp['nombre']}'")
         else:
             # New empresa: set neutral scores (will be calculated after first quarter)
+            # V25 Cambio C: incluye esContratante / puedeSerEP / puedeSerDoble.
+            # Empresa NUEVA → no hay valor previo en BD que preservar, así que
+            # None (columna ausente del Excel) se trata como False, default de
+            # la columna. Backfill no aplica porque la empresa no tiene CT
+            # histórico todavía.
+            insert_params = {
+                **emp,
+                "esContratante": emp["esContratante"] or False,
+                "puedeSerEP": emp["puedeSerEP"] or False,
+                "puedeSerDoble": emp["puedeSerDoble"] or False,
+            }
             r = await db.execute(
                 text("""
                     INSERT INTO empresa (
                         nombre, tipo, semaforo, "scoreV3", "fiabilidadReciente",
                         "esComodin", "aceptaExtras", "maxExtrasTrimestre",
                         "prioridadReduccion", "tieneBolsa", "turnoPreferido",
-                        activa, "esNueva", notas, "updatedAt"
+                        activa, "esNueva",
+                        "esContratante", "puedeSerEP", "puedeSerDoble",
+                        notas, "updatedAt"
                     ) VALUES (
                         :nombre, :tipo, 'AMBAR', 50, 50,
                         :esComodin, :aceptaExtras, :maxExtrasTrimestre,
                         :prioridadReduccion, :tieneBolsa, :turnoPreferido,
-                        :activa, :esNueva, :notas, NOW()
+                        :activa, :esNueva,
+                        :esContratante, :puedeSerEP, :puedeSerDoble,
+                        :notas, NOW()
                     ) RETURNING id
                 """),
-                emp,
+                insert_params,
             )
             eid = r.scalar_one()
             creadas += 1
@@ -524,7 +613,10 @@ async def importar_empresas(
     # ── 3. Sync empresaCiudad ────────────────────────────────
     ec_count = 0
     for emp in empresas_data:
-        eid = eid_map[emp["nombre"].upper()]
+        key = emp["nombre"].upper()
+        if key not in eid_map:
+            continue  # V25 Capa 9: empresa rechazada por inactiva en BD.
+        eid = eid_map[key]
         await db.execute(
             text('DELETE FROM "empresaCiudad" WHERE "empresaId" = :eid'),
             {"eid": eid},
@@ -548,7 +640,10 @@ async def importar_empresas(
     for emp in empresas_data:
         if not emp["activa"]:
             continue
-        eid = eid_map[emp["nombre"].upper()]
+        key = emp["nombre"].upper()
+        if key not in eid_map:
+            continue  # V25 Capa 9: empresa rechazada por inactiva en BD.
+        eid = eid_map[key]
 
         # Determine tipoParticipacion from EF/IT frequencies
         freq_ef = emp.get("frecuenciaEF") or 0
@@ -824,6 +919,7 @@ async def importar_empresas(
         total_empresas=len(empresas_data),
         creadas=creadas,
         actualizadas=actualizadas,
+        rechazadas_inactivas=rechazadas_inactivas,
         ciudades_creadas=ciudades_creadas,
         empresa_ciudad_links=ec_count,
         config_trimestral_creadas=cfg_created,

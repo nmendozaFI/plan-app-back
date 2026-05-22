@@ -70,6 +70,10 @@ class SlotUpdateInput(BaseModel):
     empresa_id: int | None = None  # Can be null to clear (make vacancy)
     notas: str | None = None
     motivo_cambio: str | None = None  # "EMPRESA_CANCELO" | "DECISION_PLANIFICADOR"
+    # V26 (edición unificada): permite cambiar el taller del slot. Al PATCH,
+    # se verifica que el taller existe y está activo; el response trae los
+    # campos derivados (`taller_nombre`, `programa`) actualizados vía JOIN.
+    taller_id: int | None = None
 
 
 class SlotBatchUpdateItem(BaseModel):
@@ -264,6 +268,24 @@ class ListaExtrasResponse(BaseModel):
     trimestre: str
     total: int
     extras: list[SlotExtraResponse]
+
+
+class CrearSlotInput(BaseModel):
+    """V26 — Input para POST /api/calendario/{trimestre}/slots.
+
+    Reemplaza el flujo Excel→bulk para añadir slots puntuales (BASE o EXTRA)
+    desde la UI Operación. El gate EXTRA (V21: `permiteExtras` + colisión)
+    sigue valiendo solo cuando `tipo_asignacion='EXTRA'`; los BASE no
+    requieren esas condiciones.
+    """
+    empresa_id: int
+    semana: int = Field(..., ge=1, le=13)
+    dia: str
+    horario: str
+    taller_id: int
+    programa: Literal["EF", "IT"]
+    tipo_asignacion: Literal["BASE", "EXTRA"] = "BASE"
+    notas: str | None = None
 
 
 class CrearSlotExtraInput(BaseModel):

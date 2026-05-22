@@ -80,10 +80,15 @@ def _generate_hints(
     taller_map: dict,
     taller_ids_ef: list[int],
     taller_ids_it: list[int],
+    escuela_propia_map: dict[int, bool],
 ) -> dict:
     """
     Generates a greedy initial solution to warm-start the solver.
     Returns dict of (empresa, semana, taller) -> 1 for hinted assignments.
+
+    V25 Cambio C (Capa 5): el modo "varias por semana" lo decide
+    `escuela_propia_map[e]` (lectura de `CT.escuelaPropia`), no la heurística
+    rota `total>=6` que confundía freq alta con EP (bug INDRA).
     """
     hints = {}
 
@@ -104,8 +109,8 @@ def _generate_hints(
         it_needed = int(empresas[e].get("talleresIT", 0) or 0)
         total_needed = int(empresas[e].get("totalAsignado", 0) or 0)
 
-        # Empresas with >= 6 talleres (escuela propia) can have multiple per week
-        max_per_week = 20 if total_needed >= 6 else 1
+        # V25 Cambio C (Capa 5): EP por CT, no por umbral de frecuencia.
+        max_per_week = 20 if escuela_propia_map.get(e, False) else 1
 
         # Collect available slots for this company
         available_ef = []
@@ -165,6 +170,9 @@ def _ejecutar_solver(
     semanas_excluidas: set[int],
     dias_excluidos: set[tuple[int, str]],
     params: CalendarioInput,
+    escuela_propia_map: dict[int, bool] | None = None,
+    empresa_contratante_map: dict[int, bool] | None = None,
+    taller_contratante_map: dict[int, bool] | None = None,
 ) -> dict:
     """
     Asigna empresas a slots fijos semanales.
@@ -172,7 +180,26 @@ def _ejecutar_solver(
 
     Variables: assign[empresa_id, semana, taller_id] ∈ {0,1}
     Solo se crean variables para combinaciones POSIBLES.
+
+    V25 Cambio C (Capa 5): `escuela_propia_map[empresa_id] -> bool` reemplaza
+    la heurística rota `totalAsignado>=6` en H6 (concentración) y S5 (variedad
+    apagada). El mapa lo construye el caller leyendo CT.escuelaPropia con
+    LEFT JOIN. Default None → dict vacío → toda empresa es no-EP (compat
+    defensiva si alguien invoca el solver sin pasar el mapa).
+
+    `empresa_contratante_map` y `taller_contratante_map` se reciben en Capa 5
+    pero NO se consumen aquí — se reservan para Capa 7 (priorización del
+    catálogo contratante, regla C7). Pasarlos ya evita romper la firma cuando
+    Capa 7 los active.
     """
+    if escuela_propia_map is None:
+        escuela_propia_map = {}
+    # V25 Capa 5: mapas reservados para Capa 7. No se usan en este archivo aún.
+    # Defaults vacíos por simetría con escuela_propia_map.
+    if empresa_contratante_map is None:
+        empresa_contratante_map = {}
+    if taller_contratante_map is None:
+        taller_contratante_map = {}
     from ortools.sat.python import cp_model
     import time
     import math
@@ -200,6 +227,10 @@ def _ejecutar_solver(
         "H4_filtered": 0,
         "H5_filtered": 0,
         "H6_constraints": 0,
+        "H_dispersion_constraints": 0,
+        "H_dispersion_empresas": 0,
+        "H_contratante_empresas": 0,
+        "H_contratante_target_total": 0,
         "H7_filtered": 0,
         "H8_filtered": 0,
         "H_franja_filtered": 0,  # V16
@@ -508,19 +539,161 @@ def _ejecutar_solver(
     # H4, H5, H7, H8 are handled implicitly by pre-filtering (no variables created)
     print(f"H4, H5, H7, H8: handled by pre-filtering ({debug_stats['vars_filtered_out']:,} vars eliminated)")
 
-    # H6. Max 1 taller por empresa por semana (planificación base)
-    # Excepción: empresas con escuela propia pueden tener hasta 20 (toda la semana)
+    # H_dispersion. V25 Capa 6 — Decisión C4: dispersión hard derivada.
+    # Para cada empresa no-EP con frecuencia >= 2 los talleres asignados deben
+    # estar separados por un gap mínimo de floor(semanas / freq) semanas. La
+    # fórmula es derivada del modelo, NO configurable (V25 §10 C4): el solver
+    # la calcula al construir el modelo. No hay UI ni columna nueva. Esto es
+    # el refuerzo del caso INDRA freq alta no-EP (V25 §7.5 Caso 2) y de la
+    # regresión que dejó Capa 5 al eliminar la heurística `>=6`.
+    #
+    # gap_min = max(1, len(SEMANAS) // total_e). Con gap_min == 1 el loop
+    # interno `0 < s2-s1 < 1` es vacío (sin enteros) → no-op natural; el
+    # constraint coincide entonces con H6 (max 1/semana) y CP-SAT lo simplifica
+    # solo. Se conserva la rama por uniformidad y legibilidad.
+    #
+    # Implementación: para cada par (s1, s2) con 0 < s2-s1 < gap_min, la suma
+    # de assigns de la empresa en s1 y s2 debe ser <= 1. EP excluida (H6b
+    # concentra en una sola semana — no aplica dispersión).
     for e in empresa_ids:
-        max_per_week = 1  # Default: regla inviolable
-        total_empresa = int(empresas[e].get("totalAsignado", 0) or 0)
-        if total_empresa >= 6:
-            max_per_week = 20  # Sin límite práctico (escuela propia)
+        if escuela_propia_map.get(e, False):
+            continue  # EP concentra (H6b), no aplica dispersión.
+        total_e = int(empresas[e].get("totalAsignado", 0) or 0)
+        if total_e < 2:
+            continue  # freq < 2: una sola asignación, nada que dispersar.
+        gap_min = max(1, len(SEMANAS) // total_e)
+        debug_stats["H_dispersion_empresas"] += 1
+        for s1 in SEMANAS:
+            for s2 in SEMANAS:
+                if 0 < s2 - s1 < gap_min:
+                    vars_s1 = [
+                        assign[(e, s1, t)]
+                        for t in taller_ids
+                        if (e, s1, t) in possible
+                    ]
+                    vars_s2 = [
+                        assign[(e, s2, t)]
+                        for t in taller_ids
+                        if (e, s2, t) in possible
+                    ]
+                    if vars_s1 and vars_s2:
+                        model.add(sum(vars_s1) + sum(vars_s2) <= 1)
+                        debug_stats["H_dispersion_constraints"] += 1
+    print(
+        f"H_dispersion: {debug_stats['H_dispersion_constraints']} dispersion constraints "
+        f"({debug_stats['H_dispersion_empresas']} empresas no-EP con freq>=2)"
+    )
+
+    # H_contratante. V25 Capa 7 — Decisión C7: priorización contratante hard.
+    # Empresas con `empresa.esContratante=true` reciben todos sus talleres del
+    # catálogo de contratantes (talleres con `taller.esContratante=true`) hasta
+    # cubrirlo, y el resto del catálogo general. Orden libre dentro del catálogo
+    # (confirmado V25 Q2 — no hay prelación entre los 5 talleres del catálogo).
+    #
+    # Implementación: agregamos las asignaciones de la empresa sobre los
+    # talleres del catálogo y forzamos `sum == target_cat`, con
+    # `target_cat = min(freq, n_cat)`. Cuando `freq <= n_cat` la empresa gasta
+    # toda su frecuencia en el catálogo. Cuando `freq > n_cat` cubre n_cat del
+    # catálogo y H2/H3 reparten el resto en talleres generales por programa.
+    #
+    # Si en BD hay menos de 5 talleres con `esContratante=true` (porque Capa 10
+    # — seed catálogo — aún no se hizo), `target_cat` ajusta solo, sin
+    # romper feasibility.
+    talleres_contratantes = [
+        t for t in taller_ids if taller_contratante_map.get(t, False)
+    ]
+    n_cat = len(talleres_contratantes)
+    for e in empresa_ids:
+        if not empresa_contratante_map.get(e, False):
+            continue
+        total_e = int(empresas[e].get("totalAsignado", 0) or 0)
+        if total_e == 0:
+            continue
+        vars_catalogo = [
+            assign[(e, s, t)]
+            for s in SEMANAS
+            for t in talleres_contratantes
+            if (e, s, t) in possible
+        ]
+        target_cat = min(total_e, n_cat)
+        model.add(sum(vars_catalogo) == target_cat)
+        debug_stats["H_contratante_empresas"] += 1
+        debug_stats["H_contratante_target_total"] += target_cat
+    print(
+        f"H_contratante: {debug_stats['H_contratante_empresas']} empresas contratantes, "
+        f"target_total={debug_stats['H_contratante_target_total']} (n_cat={n_cat})"
+    )
+
+    # H6. Max 1 taller por empresa por semana (planificación base).
+    # V25 Cambio C (Capa 5): la excepción "varias por semana" la decide
+    # `CT.escuelaPropia` (vía escuela_propia_map), no la heurística rota
+    # `totalAsignado>=6`. Esto es el fix del bug INDRA (V25 sec. 7.5 Caso 1):
+    # una empresa freq=10 sin EP ya NO puede meter varias por semana — el
+    # solver fuerza max_per_week=1 y respeta diversidad.
+    for e in empresa_ids:
+        max_per_week = 20 if escuela_propia_map.get(e, False) else 1
         for s in SEMANAS:
             week_vars = [assign[(e, s, t_id)] for t_id in taller_ids if (e, s, t_id) in possible]
             if week_vars:
                 model.add(sum(week_vars) <= max_per_week)
                 debug_stats["H6_constraints"] += 1
     print(f"H6: {debug_stats['H6_constraints']} max-per-week constraints")
+
+    # H6b. Concentración EP (V25 Cambio C, decisión C5).
+    # Para empresas con `CT.escuelaPropia=true`: TODAS las asignaciones deben
+    # caer en una sola semana ("escuela propia" = semana intensiva).
+    #
+    # Sin este constraint, H6 solo PERMITE hasta 20/semana, pero las penalties
+    # S1 (equilibrio mensual) y S2 (no consecutivas) empujan a dispersar. El
+    # warm-start de _generate_hints ya concentra, pero el solver lo descarta
+    # al minimizar. Resultado documentado en AUDITORIA_V25.md §5 Caso 1:
+    # 'el solver no tiene siquiera variable de "esta empresa es EP"'.
+    #
+    # Implementación: una bool var `ep_week_used[e][s]` por semana. Hard
+    # constraint: `sum_s ep_week_used[e][s] == 1`. Vinculación con `assign`:
+    # si la semana NO se usa, todas las assign[e,s,t] son 0; si SÍ se usa,
+    # puede llevar hasta `total_e` (que H2/H3 obligarán a cumplir exacto).
+    debug_stats["H6b_EP_constraints"] = 0
+    debug_stats["H6b_EP_empresas"] = 0
+    for e in empresa_ids:
+        if not escuela_propia_map.get(e, False):
+            continue
+        total_e = int(empresas[e].get("totalAsignado", 0) or 0)
+        if total_e == 0:
+            continue
+        debug_stats["H6b_EP_empresas"] += 1
+
+        ep_week_used: dict[int, "cp_model.IntVar"] = {}
+        for s in SEMANAS:
+            week_vars = [
+                assign[(e, s, t_id)]
+                for t_id in taller_ids
+                if (e, s, t_id) in possible
+            ]
+            wu = model.new_bool_var(f"ep_wu_{e}_{s}")
+            ep_week_used[s] = wu
+            if not week_vars:
+                # Sin slots posibles esta semana → forzar wu=0 explícitamente.
+                model.add(wu == 0)
+                continue
+            # Si wu=0 → suma=0 (no asignar nada). Si wu=1 → suma ≤ total_e.
+            model.add(sum(week_vars) <= total_e * wu)
+            # Si CUALQUIER assign[e,s,t]=1 → wu=1.
+            for v in week_vars:
+                model.add(wu >= v)
+            debug_stats["H6b_EP_constraints"] += 1
+
+        # Exactamente UNA semana usada para esta empresa EP.
+        model.add(sum(ep_week_used.values()) == 1)
+    print(
+        f"H6b: {debug_stats['H6b_EP_constraints']} concentración EP constraints "
+        f"({debug_stats['H6b_EP_empresas']} empresas EP)"
+    )
+    if debug_stats["H6b_EP_empresas"] > 0:
+        warnings.append(
+            f"H6b Concentración EP: {debug_stats['H6b_EP_empresas']} empresa(s) "
+            f"con CT.escuelaPropia=true → todos los talleres en una sola semana"
+        )
 
     # Log empresas nuevas warning (even though H7 is handled by pre-filter)
     empresas_nuevas = [e for e in empresa_ids if empresas[e].get("esNueva", False)]
@@ -563,11 +736,17 @@ def _ejecutar_solver(
 
     # S2. Penalizar semanas consecutivas para misma empresa
     # OPTIMIZED: Linear formulation, only for companies with >= 2 talleres
+    # V25 Cambio C (Capa 5): excluir EP — concentran por diseño (H6b). Sin
+    # esta exclusión la bound `[0, 2]` de `consec_penalty` rompe el modelo
+    # cuando una EP concentra >3 talleres (suma de dos semanas consecutivas
+    # puede superar la bound, → INFEASIBLE). Análogo al patrón de S5.
     s2_empresas = 0
     for e in empresa_ids:
         total = int(empresas[e].get("totalAsignado", 0) or 0)
         if total < 2:  # Can't have consecutives with 0-1 talleres
             continue
+        if escuela_propia_map.get(e, False):
+            continue  # EP concentra — S2 no aplica
         s2_empresas += 1
         for i in range(len(SEMANAS) - 1):
             s1 = SEMANAS[i]
@@ -649,14 +828,19 @@ def _ejecutar_solver(
 
     # S5. Diversidad de talleres — penalizar repetición del mismo taller
     # OPTIMIZED: Only check REACHABLE talleres for each company
+    # V25 Cambio C (Capa 5): la exclusión "repiten por diseño" es para
+    # escuelas propias (CT.escuelaPropia=true), no para "freq alta".
+    # Antes: heurística `total>=6` apagaba diversidad de cualquier empresa
+    # con frecuencia alta aunque no fuera EP — bug que dejaba caer la
+    # diversidad de INDRA freq=10 no-EP. Ahora la regla mira el flag real.
     empresas_diversidad = 0
     for e in empresa_ids:
         total = int(empresas[e].get("totalAsignado", 0) or 0)
         # Skip empresas with < 3 talleres (1-2 talleres can't meaningfully repeat anyway)
         if total < 3:
             continue
-        # Excluir escuelas propias / alta frecuencia (>=6 talleres) — repiten por diseño
-        if total >= 6:
+        # Excluir solo escuelas propias — concentran y repiten por diseño.
+        if escuela_propia_map.get(e, False):
             continue
 
         empresas_diversidad += 1
@@ -693,9 +877,9 @@ def _ejecutar_solver(
                 penalties.append(repeat * params.peso_diversidad_talleres)
                 debug_stats["S5_penalties"] += 1
 
-    print(f"S5: {debug_stats['S5_penalties']} diversidad penalties ({empresas_diversidad} empresas 3-5 talleres) [OPTIMIZED]")
+    print(f"S5: {debug_stats['S5_penalties']} diversidad penalties ({empresas_diversidad} empresas con freq>=3 no-EP) [OPTIMIZED]")
     if empresas_diversidad > 0:
-        warnings.append(f"S5 Diversidad talleres: {empresas_diversidad} empresas (excluye escuelas propias >=6 talleres)")
+        warnings.append(f"S5 Diversidad talleres: {empresas_diversidad} empresas (excluye escuelas propias por CT.escuelaPropia=true)")
 
     # ─── V16 ─ SOFT franja_horaria / franja_por_dia penalty ──
     # Mirrors S3 (turno preferido) magnitude — `peso_turno_preferido` —
@@ -753,6 +937,7 @@ def _ejecutar_solver(
         taller_map=taller_map,
         taller_ids_ef=taller_ids_ef,
         taller_ids_it=taller_ids_it,
+        escuela_propia_map=escuela_propia_map,
     )
     debug_stats["hints_generated"] = len(hints)
 

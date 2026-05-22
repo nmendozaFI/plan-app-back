@@ -28,43 +28,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _get_max_extras(empresa: dict, restricciones_empresa: list[dict]) -> int | None:
-    """
-    Returns the max extras cap for an empresa.
-    Priority: SOFT restriction 'max_extras' (trimestral override)
-              > empresa.maxExtrasTrimestre (baseline from maestro).
-    Semantics:
-      - None / NULL → no limit
-      - 0 → cap of 0 extras (receives none)
-      - N > 0 → receives up to N extras
-    """
-    override = next(
-        (
-            r for r in restricciones_empresa
-            if r.get("tipo") == "SOFT" and r.get("clave") == "max_extras"
-        ),
-        None,
-    )
-    if override and override.get("valor") not in (None, ""):
-        try:
-            return int(override["valor"])
-        except (ValueError, TypeError):
-            pass
-    return empresa.get("maxExtrasTrimestre")
-
-
-def _tiene_no_comodin(restricciones_empresa: list[dict]) -> bool:
-    """True si la empresa tiene SOFT no_comodin=true (case-insensitive)."""
-    for r in restricciones_empresa:
-        if (
-            r.get("tipo") == "SOFT"
-            and r.get("clave") == "no_comodin"
-            and str(r.get("valor", "")).strip().lower() == "true"
-        ):
-            return True
-    return False
-
-
 # ── Schemas ──────────────────────────────────────────────────
 
 class FrecuenciaInput(BaseModel):
@@ -111,6 +74,11 @@ class FrecuenciaEmpresa(BaseModel):
     prioridad_reduccion: str
     ciudades_activas: list[str]
     restricciones: list[dict]
+    # V26: marca el campo como sugerido (CT.frecuenciaEF o frecuenciaIT NULL).
+    # La planificadora ve un 0 con badge en el wizard; al confirmar el INSERT
+    # persiste lo que ella deje (0 explícito o el valor editado).
+    sugerido_ef: bool = False
+    sugerido_it: bool = False
 
 
 class FrecuenciaOutput(BaseModel):
@@ -340,29 +308,35 @@ async def calcular_frecuencias(
         es_nueva = bool(cfg.get("esNueva") or False)
 
         # ── Frecuencia base (SIN ajuste todavía) ──────────────
-        # V24 Cambio B (decisión D2): la matriz semáforo ya NO calcula frecuencia
-        # bruta por algoritmo ni reparte 70/30. Lee SOLO los números que la
-        # planificadora puso en CT (frecuenciaEF / frecuenciaIT). Empresa con
-        # AMBOS NULL → se omite del cálculo (decisión D2). Empresa con uno solo
-        # NULL → ese se trata como 0 (decisión D3).
+        # V26 (revisión Fase 1): la pantalla Frecuencias es el lienzo de
+        # trabajo de la planificadora. TODAS las empresas activas con CT
+        # entran al preview, incluso si freqEF o freqIT están en NULL — esos
+        # campos se sugieren como 0 con `sugerido_*=true` para que el wizard
+        # pinte el badge. La planificadora edita y, al confirmar, el INSERT
+        # persiste exactamente lo que ella deje (D5 V24 sigue: solo se omite
+        # del INSERT si AMBOS son 0).
+        #
+        # Diferencia con V25 Capa 8 (revertida solo para `/calcular`):
+        #   - V25 C8: "alguno NULL → omitir del cálculo" — escondía empresas.
+        #   - V26:    "alguno NULL → sugerir 0, mantener en el preview".
+        # El solver (`/api/calendario/generar`) SIGUE leyendo `frecuencia`
+        # como input explícito; allí no se calcula sugerencia.
         explicit_ef = cfg.get("frecuenciaEF")
         explicit_it = cfg.get("frecuenciaIT")
 
-        if explicit_ef is None and explicit_it is None:
-            # Decisión D2: ambos NULL → no entra a la matriz ni al solver.
-            logger.info(
-                f"[OMIT] {cfg['nombre']}: frecuenciaEF y frecuenciaIT NULL en CT — "
-                f"se omite del cálculo este trimestre"
-            )
-            continue
+        sugerido_ef = explicit_ef is None
+        sugerido_it = explicit_it is None
+        ambos_sugeridos = sugerido_ef and sugerido_it
 
-        # Decisión D3: uno NULL se trata como 0. `or 0` cubre tanto None como 0.
-        ef = (explicit_ef or 0)
-        it = (explicit_it or 0)
+        ef = 0 if sugerido_ef else int(explicit_ef)
+        it = 0 if sugerido_it else int(explicit_it)
 
         # ── Reducción -50% a empresas esNueva ─────────────────
-        # Antes del ajuste por desempeño: empresa nueva recibe la mitad el primer año.
-        if es_nueva:
+        # V26: si ambos campos son sugeridos (CT con ambas freq NULL) no
+        # aplicamos ajustes ni invariantes — la planificadora ve 0/0 y
+        # decide. Si al menos uno es explícito, los ajustes corren normal
+        # sobre el total (la rama proporcional respeta el 0 sugerido).
+        if es_nueva and not ambos_sugeridos:
             ef = math.floor(ef * 0.5)
             it = math.floor(it * 0.5)
             # Preservar invariante: mínimo 1 total
@@ -385,7 +359,7 @@ async def calcular_frecuencias(
         #   > 0 → over-delivered (hicieron más de lo asignado)
         #   < 0 → under-delivered
         ajuste = 0
-        if eid in desempeno_anterior:
+        if eid in desempeno_anterior and not ambos_sugeridos:
             desv = desempeno_anterior[eid]
 
             if semaforo == "VERDE":
@@ -438,19 +412,23 @@ async def calcular_frecuencias(
                     else:
                         ef = max(0, ef + delta)
 
-        # Invariante mínimo: al menos 1 total si la empresa está activa
-        if ef + it < 1:
+        # Invariante mínimo: al menos 1 total si la empresa está activa.
+        # V26: si ambos campos son sugeridos no aplicamos el invariante — el
+        # 0/0 es deliberado para que la planificadora vea que no hay decisión
+        # todavía. Si alguno es explícito, mantenemos el invariante histórico.
+        if not ambos_sugeridos and ef + it < 1:
             if cfg["tipoParticipacion"] == "IT":
                 it = 1
             else:
                 ef = 1
         freq_total = ef + it
 
-        # ── Fix: solo_taller fuerza programa ──────────────────
-        # Si la empresa tiene restricción solo_taller y ese taller
-        # pertenece a un programa específico, redirigir TODO al
-        # programa correcto. Los slots liberados se redistribuyen
-        # después del loop.
+        # ── solo_taller fuerza programa ───────────────────────
+        # Si la empresa tiene restricción solo_taller y ese taller pertenece
+        # a un programa específico, redirigir TODO al programa correcto.
+        # V25 Cambio C (Capa 8, decisión C8): eliminada la redistribución D4
+        # — los slots de la empresa restringida que no caben en el programa
+        # forzado simplemente quedan sin asignar; no se reparten a otras.
         restricciones_empresa = restricciones_map.get(eid, [])
         solo_taller_nombre = None
         for rest in restricciones_empresa:
@@ -458,32 +436,25 @@ async def calcular_frecuencias(
                 solo_taller_nombre = rest["valor"]
                 break
 
-        slots_it_liberados = 0
-        slots_ef_liberados = 0
         if solo_taller_nombre:
-            # Buscar el programa del taller forzado
             solo_taller_programa = _resolver_programa_taller(
                 solo_taller_nombre, talleres_catalogo,
             )
             if solo_taller_programa == "EF" and it > 0:
-                # Empresa solo puede hacer EF → mover IT a EF
-                slots_it_liberados = it
-                ef = ef + 0  # NO absorbe: se redistribuye a otras empresas
+                slots_it_descartados = it
                 it = 0
                 warnings.append(
                     f"{cfg['nombre']}: restricción solo_taller "
                     f"'{solo_taller_nombre}' es EF → talleresIT forzado a 0 "
-                    f"({slots_it_liberados} slot(s) IT liberados para redistribución)"
+                    f"({slots_it_descartados} slot(s) IT descartados)"
                 )
             elif solo_taller_programa == "IT" and ef > 0:
-                # Empresa solo puede hacer IT → mover EF a IT
-                slots_ef_liberados = ef
+                slots_ef_descartados = ef
                 ef = 0
-                it = it + 0
                 warnings.append(
                     f"{cfg['nombre']}: restricción solo_taller "
                     f"'{solo_taller_nombre}' es IT → talleresEF forzado a 0 "
-                    f"({slots_ef_liberados} slot(s) EF liberados para redistribución)"
+                    f"({slots_ef_descartados} slot(s) EF descartados)"
                 )
 
         empresas_bruto.append({
@@ -500,38 +471,12 @@ async def calcular_frecuencias(
             "prioridad_reduccion": cfg["prioridadReduccion"],
             "ciudades_activas": ciudades_map.get(eid, []),
             "restricciones": restricciones_map.get(eid, []),
-            # V24 Cambio B (decisión D4): tipoParticipacion necesario para filtrar
-            # receptores en _redistribuir_slots_liberados. None se trata como AMBAS
-            # (compat defensiva).
-            "_tipo_participacion": cfg["tipoParticipacion"],
-            # Metadata para redistribución
-            "_slots_it_liberados": slots_it_liberados,
-            "_slots_ef_liberados": slots_ef_liberados,
-            "_max_extras_trimestre": cfg.get("maxExtrasTrimestre"),
-            "_extras_asignados": 0,
+            # V26: flags para el badge del wizard. Si el recorte automático
+            # mueve el campo, el flag se mantiene — sigue siendo un valor
+            # cuya base fue sugerencia, no decisión de la planificadora.
+            "sugerido_ef": sugerido_ef,
+            "sugerido_it": sugerido_it,
         })
-
-    # ── 5b. Redistribuir slots liberados por solo_taller ──────
-    # Los slots IT/EF que no puede absorber la empresa restringida
-    # se reparten a candidatas elegibles, priorizando:
-    #   1. Contratantes (BAJA) — garantizar compromisos
-    #   2. Verde/Ámbar con comodín — fiabilidad + flexibilidad
-    #   3. Resto por score descendente
-    total_it_liberados = sum(e["_slots_it_liberados"] for e in empresas_bruto)
-    total_ef_liberados = sum(e["_slots_ef_liberados"] for e in empresas_bruto)
-
-    if total_it_liberados > 0 or total_ef_liberados > 0:
-        _redistribuir_slots_liberados(
-            empresas_bruto, total_it_liberados, total_ef_liberados, warnings,
-        )
-
-    # Limpiar metadata interna
-    for e in empresas_bruto:
-        e.pop("_slots_it_liberados", None)
-        e.pop("_slots_ef_liberados", None)
-        e.pop("_max_extras_trimestre", None)
-        e.pop("_extras_asignados", None)
-        e.pop("_tipo_participacion", None)  # V24 Cambio B
 
     # ── 6. Recorte para encajar en modelo trimestral ─────────
     # Límite = slots_por_semana × semanas_disponibles (no por semana)
@@ -881,107 +826,3 @@ def _resolver_programa_taller(
     return None
 
 
-def _redistribuir_slots_liberados(
-    empresas: list[dict],
-    it_libres: int,
-    ef_libres: int,
-    warnings: list[str],
-) -> None:
-    """
-    Redistribuye slots liberados por restricción solo_taller.
-
-    Pool de candidatos: empresas con esComodin=True AND sin SOFT no_comodin=true.
-    Dentro del pool se mantiene la prioridad anterior (BAJA → semáforo → score),
-    aplicando además el cap de _get_max_extras (SOFT max_extras > maxExtrasTrimestre).
-    """
-
-    def _tiene_solo_taller(emp: dict) -> bool:
-        return any(
-            r.get("clave") == "solo_taller"
-            for r in emp.get("restricciones", [])
-        )
-
-    def _cap(emp: dict) -> int | None:
-        """None = sin límite; 0 = no recibe nada."""
-        return _get_max_extras(
-            {"maxExtrasTrimestre": emp.get("_max_extras_trimestre")},
-            emp.get("restricciones", []),
-        )
-
-    def _puede_recibir(emp: dict, programa: str) -> bool:
-        """V24 Cambio B (decisión D4): añade filtro por tipoParticipacion.
-        Un slot EF liberado solo va a empresa con tipo ∈ {EF, AMBAS};
-        un slot IT solo va a empresa con tipo ∈ {IT, AMBAS}. tipoParticipacion
-        None/desconocido se trata como AMBAS por compat defensiva.
-        """
-        if not emp.get("es_comodin"):
-            return False
-        if _tiene_no_comodin(emp.get("restricciones", [])):
-            return False
-        if _tiene_solo_taller(emp):
-            return False
-        cap = _cap(emp)
-        if cap is not None and emp.get("_extras_asignados", 0) >= cap:
-            return False
-        tipo = emp.get("_tipo_participacion") or "AMBAS"
-        if programa == "EF" and tipo not in ("EF", "AMBAS"):
-            return False
-        if programa == "IT" and tipo not in ("IT", "AMBAS"):
-            return False
-        return True
-
-    # Prioridad dentro del pool de comodines elegibles:
-    #   BAJA contratantes → comodines → Verde/Ámbar → mayor score primero
-    PRIORIDAD_RECEPCION = {"BAJA": 0, "MEDIA": 1, "ALTA": 2}
-    SEMAFORO_ORDEN = {"VERDE": 0, "AMBAR": 1, "ROJO": 2}
-
-    candidatos = sorted(
-        empresas,
-        key=lambda e: (
-            PRIORIDAD_RECEPCION.get(e["prioridad_reduccion"], 2),
-            0 if e["es_comodin"] else 1,
-            SEMAFORO_ORDEN.get(e["semaforo"], 2),
-            -e["score"],
-        ),
-    )
-
-    def _asignar(programa: str, libres: int) -> int:
-        pendiente = libres
-        for emp in candidatos:
-            if pendiente <= 0:
-                break
-            if not _puede_recibir(emp, programa):
-                continue
-            cap = _cap(emp)
-            if cap is not None:
-                disponible = cap - emp.get("_extras_asignados", 0)
-                if disponible <= 0:
-                    continue
-            if programa == "IT":
-                emp["talleres_it"] += 1
-            else:
-                emp["talleres_ef"] += 1
-            emp["total"] = emp["talleres_ef"] + emp["talleres_it"]
-            emp["_extras_asignados"] = emp.get("_extras_asignados", 0) + 1
-            pendiente -= 1
-            warnings.append(
-                f"{emp['nombre']}: recibe +1 {programa} redistribuido "
-                f"(slot liberado por restricción solo_taller)"
-            )
-        return pendiente
-
-    it_pendiente = _asignar("IT", it_libres)
-    if it_pendiente > 0:
-        warnings.append(
-            f"⚠ No se pudieron redistribuir {it_pendiente} slot(s) IT "
-            f"(pool de comodines elegibles agotado o max_extras alcanzado). "
-            "Requiere ajuste manual."
-        )
-
-    ef_pendiente = _asignar("EF", ef_libres)
-    if ef_pendiente > 0:
-        warnings.append(
-            f"⚠ No se pudieron redistribuir {ef_pendiente} slot(s) EF "
-            f"(pool de comodines elegibles agotado o max_extras alcanzado). "
-            "Requiere ajuste manual."
-        )

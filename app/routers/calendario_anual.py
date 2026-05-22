@@ -163,9 +163,14 @@ async def cargar_talleres_semana(
     tipo = config_row["tipo"] if config_row else "normal"
 
     # 2. Load all active base talleres
+    # V25 Cambio C (Capa 5): incluye `esContratante` para la regla nueva del
+    # solver (priorización catálogo contratante — Capa 7). Campo añadido en
+    # SELECT y propagado a todos los talleres efectivos (base + intensiva +
+    # extra slots). Consumidores que no lo usen lo ignoran sin romper.
     result = await db.execute(
         text("""
-            SELECT id, nombre, programa, "diaSemana", horario, turno
+            SELECT id, nombre, programa, "diaSemana", horario, turno,
+                   "esContratante"
             FROM taller
             WHERE activo = true
             ORDER BY id
@@ -190,6 +195,7 @@ async def cargar_talleres_semana(
                     "dia_semana": "X",           # Wednesday
                     "horario": "09:30-11:30",    # Morning
                     "turno": "M",
+                    "es_contratante": t["esContratante"],
                     "es_extra": False,
                     "extra_id": None,
                     "override": True,
@@ -204,6 +210,7 @@ async def cargar_talleres_semana(
             "dia_semana": t["diaSemana"],
             "horario": t["horario"],
             "turno": t["turno"],
+            "es_contratante": t["esContratante"],
             "es_extra": False,
             "extra_id": None,
             "override": False,
@@ -214,7 +221,8 @@ async def cargar_talleres_semana(
         result = await db.execute(
             text("""
                 SELECT ses.id, ses."tallerId", ses."diaSemana", ses.horario, ses.notas,
-                       t.nombre, t.programa, t."diaSemana" AS taller_dia, t.horario AS taller_horario, t.turno
+                       t.nombre, t.programa, t."diaSemana" AS taller_dia,
+                       t.horario AS taller_horario, t.turno, t."esContratante"
                 FROM semana_extra_slot ses
                 JOIN taller t ON t.id = ses."tallerId"
                 WHERE ses."semanaConfigId" = :config_id
@@ -232,6 +240,7 @@ async def cargar_talleres_semana(
                 "dia_semana": eff_dia,
                 "horario": eff_horario,
                 "turno": r["turno"],
+                "es_contratante": r["esContratante"],  # V25 Cambio C (Capa 5)
                 "es_extra": True,
                 "extra_id": r["id"],
                 "override": (eff_dia != r["taller_dia"]) or (eff_horario != r["taller_horario"]),

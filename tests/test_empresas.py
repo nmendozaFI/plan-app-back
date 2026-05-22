@@ -3,6 +3,7 @@ Tests for Empresa CRUD endpoints.
 """
 
 import pytest
+from sqlalchemy import text
 from .conftest import TEST_EMPRESA_PREFIX
 
 
@@ -147,3 +148,129 @@ async def test_toggle_empresa(client, db_session):
     # Toggle back
     response2 = await client.patch(f"/api/empresas/{empresa_id}/toggle")
     assert response2.json()["activa"] == original_status
+
+
+# ── V25 Cambio C: 3 flags estructurales (esContratante, puedeSerEP, puedeSerDoble) ──
+
+
+@pytest.mark.asyncio
+async def test_crear_empresa_con_flags_v25(client, db_session):
+    """POST /empresas con esContratante/puedeSerEP/puedeSerDoble en true persiste."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_FLAGS_TRUE"
+    payload = {
+        "nombre": nombre,
+        "tipo": "AMBAS",
+        "esContratante": True,
+        "puedeSerEP": True,
+        "puedeSerDoble": True,
+    }
+    response = await client.post("/api/empresas/", json=payload)
+    assert response.status_code in (200, 201), response.text
+
+    emp = response.json()["empresa"]
+    assert emp["esContratante"] is True
+    assert emp["puedeSerEP"] is True
+    assert emp["puedeSerDoble"] is True
+
+    # DB cross-check para asegurar persistencia real.
+    row = await db_session.execute(
+        text(
+            'SELECT "esContratante", "puedeSerEP", "puedeSerDoble" '
+            "FROM empresa WHERE id = :id"
+        ),
+        {"id": emp["id"]},
+    )
+    rec = row.mappings().first()
+    assert rec["esContratante"] is True
+    assert rec["puedeSerEP"] is True
+    assert rec["puedeSerDoble"] is True
+
+
+@pytest.mark.asyncio
+async def test_crear_empresa_sin_flags_default_false(client, db_session):
+    """POST /empresas sin pasar los 3 flags → defaults false."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_FLAGS_DEFAULT"
+    payload = {"nombre": nombre, "tipo": "EF"}
+    response = await client.post("/api/empresas/", json=payload)
+    assert response.status_code in (200, 201), response.text
+
+    emp = response.json()["empresa"]
+    assert emp["esContratante"] is False
+    assert emp["puedeSerEP"] is False
+    assert emp["puedeSerDoble"] is False
+
+
+@pytest.mark.asyncio
+async def test_actualizar_solo_es_contratante_no_toca_otros_flags(client, db_session):
+    """PUT /empresas con solo esContratante=true deja puedeSerEP/Doble intactos."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_PARTIAL_UPDATE"
+    create = await client.post(
+        "/api/empresas/",
+        json={
+            "nombre": nombre,
+            "tipo": "EF",
+            # Empezamos con puedeSerEP=true para verificar que NO se borre.
+            "puedeSerEP": True,
+        },
+    )
+    assert create.status_code in (200, 201)
+    eid = create.json()["empresa"]["id"]
+
+    # Update parcial: solo esContratante.
+    upd = await client.put(
+        f"/api/empresas/{eid}",
+        json={"esContratante": True},
+    )
+    assert upd.status_code == 200
+    emp = upd.json()["empresa"]
+    assert emp["esContratante"] is True
+    assert emp["puedeSerEP"] is True  # NO debe haberse tocado.
+    assert emp["puedeSerDoble"] is False
+
+
+@pytest.mark.asyncio
+async def test_detalle_empresa_devuelve_flags_v25(client, db_session):
+    """GET /empresas/{id} expone los 3 flags nuevos en el campo `empresa`."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_DETAIL_FLAGS"
+    create = await client.post(
+        "/api/empresas/",
+        json={
+            "nombre": nombre,
+            "tipo": "AMBAS",
+            "esContratante": True,
+            "puedeSerEP": False,
+            "puedeSerDoble": True,
+        },
+    )
+    eid = create.json()["empresa"]["id"]
+
+    response = await client.get(f"/api/empresas/{eid}")
+    assert response.status_code == 200
+    emp = response.json()["empresa"]
+    assert emp["esContratante"] is True
+    assert emp["puedeSerEP"] is False
+    assert emp["puedeSerDoble"] is True
+
+
+@pytest.mark.asyncio
+async def test_listar_empresas_devuelve_flags_v25(client, db_session):
+    """GET /empresas (list) expone los 3 flags nuevos en cada fila."""
+    nombre = f"{TEST_EMPRESA_PREFIX}V25_LIST_FLAGS"
+    await client.post(
+        "/api/empresas/",
+        json={
+            "nombre": nombre,
+            "tipo": "EF",
+            "esContratante": True,
+        },
+    )
+
+    response = await client.get("/api/empresas/", params={"search": "V25_LIST_FLAGS"})
+    assert response.status_code == 200
+    empresas = response.json()["empresas"]
+    target = next((e for e in empresas if e["nombre"] == nombre), None)
+    assert target is not None, f"Empresa {nombre} no encontrada en listado"
+    assert "esContratante" in target
+    assert "puedeSerEP" in target
+    assert "puedeSerDoble" in target
+    assert target["esContratante"] is True

@@ -2,7 +2,7 @@
 Shared fixtures for Planificador de Talleres test suite.
 
 Uses the REAL database (Neon PostgreSQL) with test-safe data.
-Test trimestre: "TEST-Q1" - cleaned up after each test.
+Test trimestre: "2099-Q1" - cleaned up after each test.
 """
 
 import pytest
@@ -20,7 +20,7 @@ from app.db import AsyncSessionLocal
 
 # ── Constants ────────────────────────────────────────────────
 
-TEST_TRIMESTRE = "TEST-Q1"
+TEST_TRIMESTRE = "2099-Q1"
 TEST_EMPRESA_PREFIX = "TEST_EMPRESA_"
 
 

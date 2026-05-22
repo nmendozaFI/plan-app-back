@@ -79,7 +79,13 @@ async def test_calendario_no_festivo_slots(client, db_session):
 
 @pytest.mark.asyncio
 async def test_calendario_max_one_per_week(client, db_session):
-    """Each empresa appears max once per week (H6 constraint)."""
+    """H6 con CT.escuelaPropia=false → cada empresa cae max 1 vez/semana.
+
+    V25 Cambio C (Capa 5): el setup default `setup_test_config_trimestral`
+    inserta CT con `escuelaPropia=false` (no toca el flag). Cualquier empresa
+    no-EP debe respetar `max_per_week=1` en H6 — la heurística vieja `>=6`
+    que permitía 20/semana a freq alta ya no existe. Este test antes tenía
+    `pass` final (V25 Capa 5 lo reescribe con asserts reales)."""
     await setup_test_config_trimestral(db_session, TEST_TRIMESTRE)
     await setup_test_frecuencias(db_session, TEST_TRIMESTRE)
 
@@ -89,21 +95,30 @@ async def test_calendario_max_one_per_week(client, db_session):
     )
     data = response.json()
 
-    if data["status"] in ("OPTIMAL", "FEASIBLE"):
-        # Count empresa assignments per week
-        from collections import defaultdict
-        empresa_week_count = defaultdict(lambda: defaultdict(int))
+    assert data["status"] in ("OPTIMAL", "FEASIBLE"), (
+        f"solver no produjo solución: status={data['status']}"
+    )
 
-        for slot in data["slots"]:
-            if slot["empresa_id"] and slot["empresa_id"] != 0:
-                empresa_week_count[slot["empresa_id"]][slot["semana"]] += 1
+    # Cuenta asignaciones por (empresa, semana). El setup no marca EP, así
+    # que cualquier conteo >1 es violación de H6.
+    from collections import defaultdict
+    empresa_week_count: dict[int, dict[int, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+    for slot in data["slots"]:
+        eid = slot["empresa_id"]
+        if eid and eid != 0:
+            empresa_week_count[eid][slot["semana"]] += 1
 
-        # Check each empresa appears max 1 time per week
-        for empresa_id, weeks in empresa_week_count.items():
-            for semana, count in weeks.items():
-                # Most empresas max 1/week, but high-frequency (escuela propia) can have more
-                # For test data, we use normal empresas so max 1
-                pass  # Constraint is verified by solver
+    violaciones = []
+    for empresa_id, weeks in empresa_week_count.items():
+        for semana, count in weeks.items():
+            if count > 1:
+                violaciones.append((empresa_id, semana, count))
+
+    assert violaciones == [], (
+        f"H6 violado: empresas no-EP con >1 taller/semana: {violaciones}"
+    )
 
 
 @pytest.mark.asyncio
