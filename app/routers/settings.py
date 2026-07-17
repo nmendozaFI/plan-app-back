@@ -238,7 +238,7 @@ async def get_planning_status(db: AsyncSession = Depends(get_db)):
 
     # Decision logic:
     # If activo has no frecuencias or no calendario, it needs planning first
-    activo_necesita = not has_freq_activo or not has_cal_activo
+    activo_necesita = not has_cal_activo
 
     # Which trimestre to plan?
     if activo_necesita:
